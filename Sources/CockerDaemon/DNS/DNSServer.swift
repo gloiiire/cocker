@@ -139,32 +139,30 @@ actor DNSServer {
         guard Self.readAll(fd: fd, into: &msgBuf, count: msgLen) else { return }
         let query = Data(msgBuf)
 
-        guard query.count > DNSHeader.size else { return }
-        let header = DNSHeader(data: query)
-        guard header.isQuery, header.opcode == 0 else { return }
+        let containers = await state.allContainers(includeAll: false)
+        let upstream = Self.upstreamDNS
+        guard let result = DNSQueryProcessor.process(
+            query: query,
+            containers: containers,
+            forwardUpstream: { q in forwardToUpstream(q, upstream: upstream) }
+        ) else { return }
 
-        let (questions, _) = parseDNSQuestions(from: query, count: Int(header.qdCount))
-        guard let question = questions.first else { return }
+        logResult(result.kind)
 
-        let response: Data
-        if let ip = await resolve(name: question.name), (question.isA || question.isAny) {
-            response = buildAResponse(header: header, question: question, ip: ip)
-            logDNS(question.name, result: ip, authoritative: true)
-        } else if question.isAAAA {
-            if let ipv6 = await resolveIPv6(name: question.name) {
-                response = buildAAAAResponse(header: header, question: question, ipv6: ipv6)
-            } else {
-                response = buildEmptyResponse(header: header, question: question)
-            }
-        } else {
-            response = forwardToUpstream(query, upstream: Self.upstreamDNS)
-                ?? buildNXDomain(header: header, question: question)
-            logDNS(question.name, result: "upstream", authoritative: false)
-        }
-
+        let response = result.response
         let prefix: [UInt8] = [UInt8((response.count >> 8) & 0xFF), UInt8(response.count & 0xFF)]
         _ = prefix.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, 2) }
         _ = response.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, response.count) }
+    }
+
+    private func logResult(_ kind: DNSQueryAnswerKind) {
+        switch kind {
+        case .authoritativeA(let n, let ip):     logDNS(n, result: ip, authoritative: true)
+        case .authoritativeAAAA(let n, let ip6): logDNS(n, result: ip6, authoritative: true)
+        case .empty(let n):                       logDNS(n, result: "empty", authoritative: true)
+        case .upstream(let n):                    logDNS(n, result: "upstream", authoritative: false)
+        case .nxdomain(let n):                    logDNS(n, result: "NXDOMAIN", authoritative: true)
+        }
     }
 
     private static func readAll(fd: Int32, into buf: inout [UInt8], count: Int) -> Bool {
@@ -263,105 +261,16 @@ actor DNSServer {
     // MARK: - Packet handler
 
     private func handlePacket(_ data: Data, clientIP: String, clientPort: UInt16, viaFD: Int32) async {
-        let header = DNSHeader(data: data)
-        guard header.isQuery, header.opcode == 0 else { return }  // Standard query only
-
-        let (questions, _) = parseDNSQuestions(from: data, count: Int(header.qdCount))
-        guard let question = questions.first else { return }
-
-        // Résolution
-        let response: Data
-
-        if let ip = await resolve(name: question.name), (question.isA || question.isAny) {
-            // Réponse authoritative avec l'IP du container
-            response = buildAResponse(header: header, question: question, ip: ip)
-            logDNS(question.name, result: ip, authoritative: true)
-        } else if question.isAAAA {
-            // AAAA → chercher l'adresse IPv6 du container si elle existe
-            if let ipv6 = await resolveIPv6(name: question.name) {
-                response = buildAAAAResponse(header: header, question: question, ipv6: ipv6)
-                logDNS(question.name, result: ipv6, authoritative: true)
-            } else {
-                response = buildEmptyResponse(header: header, question: question)
-            }
-        } else {
-            // Forwarding vers upstream DNS
-            response = forwardToUpstream(data, upstream: Self.upstreamDNS) ?? buildNXDomain(header: header, question: question)
-            logDNS(question.name, result: "upstream", authoritative: false)
-        }
-
-        sendResponse(response, toIP: clientIP, port: clientPort, viaFD: viaFD)
-    }
-
-    // MARK: - Name resolution
-
-    private func resolve(name: String) async -> String? {
-        // Cache hit
-        if let cached = cache[name] { return cached }
-
-        let ip = await lookupInState(name: name)
-        if let ip { cache[name] = ip }
-        return ip
-    }
-
-    private func lookupInState(name: String) async -> String? {
         let containers = await state.allContainers(includeAll: false)
-        return DNSNameResolver.resolveA(name: name, in: containers)
-    }
+        let upstream = Self.upstreamDNS
+        guard let result = DNSQueryProcessor.process(
+            query: data,
+            containers: containers,
+            forwardUpstream: { q in forwardToUpstream(q, upstream: upstream) }
+        ) else { return }
 
-    // MARK: - IPv6 resolution
-
-    private func resolveIPv6(name: String) async -> String? {
-        let containers = await state.allContainers(includeAll: false)
-        return DNSNameResolver.resolveAAAA(name: name, in: containers)
-    }
-
-    // MARK: - Response builders
-
-    private func buildAResponse(header: DNSHeader, question: DNSQuestion, ip: String) -> Data {
-        var responseHeader = header
-        responseHeader.flags = header.responseFlags(rcode: 0, authoritative: true)
-        responseHeader.anCount = 1
-
-        var builder = DNSResponseBuilder()
-        builder.appendHeader(responseHeader)
-        builder.appendQuestion(question)
-        builder.appendARecord(ip: ip, ttl: 10)  // TTL court → cohérence après restart container
-        return builder.build()
-    }
-
-    private func buildEmptyResponse(header: DNSHeader, question: DNSQuestion) -> Data {
-        var responseHeader = header
-        responseHeader.flags = header.responseFlags(rcode: 0, authoritative: true)
-        responseHeader.anCount = 0
-
-        var builder = DNSResponseBuilder()
-        builder.appendHeader(responseHeader)
-        builder.appendQuestion(question)
-        return builder.build()
-    }
-
-    private func buildAAAAResponse(header: DNSHeader, question: DNSQuestion, ipv6: String) -> Data {
-        var responseHeader = header
-        responseHeader.flags = header.responseFlags(rcode: 0, authoritative: true)
-        responseHeader.anCount = 1
-
-        var builder = DNSResponseBuilder()
-        builder.appendHeader(responseHeader)
-        builder.appendQuestion(question)
-        builder.appendAAAARecord(ip: ipv6, ttl: 10)
-        return builder.build()
-    }
-
-    private func buildNXDomain(header: DNSHeader, question: DNSQuestion) -> Data {
-        var responseHeader = header
-        responseHeader.flags = header.responseFlags(rcode: 3, authoritative: true)  // NXDOMAIN
-        responseHeader.anCount = 0
-
-        var builder = DNSResponseBuilder()
-        builder.appendHeader(responseHeader)
-        builder.appendQuestion(question)
-        return builder.build()
+        logResult(result.kind)
+        sendResponse(result.response, toIP: clientIP, port: clientPort, viaFD: viaFD)
     }
 
     // MARK: - Send response
