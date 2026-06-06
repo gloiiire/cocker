@@ -49,7 +49,7 @@ final class VMRuntime: NSObject {
 
     // MARK: - VM creation
 
-    func createVM(for container: Container, rootfsPath: URL) throws -> VZVirtualMachine {
+    func createVM(for container: Container, rootfsPath: URL, stdoutPipe: Pipe) throws -> VZVirtualMachine {
         fputs("[vm] createVM enter\n", stderr); fflush(stderr)
         let config = VZVirtualMachineConfiguration()
 
@@ -75,12 +75,17 @@ final class VMRuntime: NSObject {
         // Memory balloon (allows host to reclaim memory)
         config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 
-        // Serial console — capture stdout/stderr from the VM
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
+        // Serial console — branche le stdout du VM (kernel + cocker-init + container)
+        // sur un Pipe qu'on lit côté hôte pour alimenter le log buffer.
+        // /dev/null en lecture car la VM n'a pas besoin d'input pour l'instant.
+        let nullDev = FileHandle(forReadingAtPath: "/dev/null") ?? FileHandle.standardInput
         let consoleDevice = VZVirtioConsoleDeviceConfiguration()
         let port0 = VZVirtioConsolePortConfiguration()
         port0.isConsole = true
+        port0.attachment = VZFileHandleSerialPortAttachment(
+            fileHandleForReading: nullDev,
+            fileHandleForWriting: stdoutPipe.fileHandleForWriting
+        )
         consoleDevice.ports[0] = port0
         config.consoleDevices = [consoleDevice]
 
@@ -225,10 +230,12 @@ final class VMRuntime: NSObject {
         try writeResolvConf(to: rootfsPath, container: container)
         fputs("[vm] resolv.conf OK\n", stderr); fflush(stderr)
 
-        let vm = try createVM(for: container, rootfsPath: rootfsPath)
-        fputs("[vm] createVM OK\n", stderr); fflush(stderr)
+        // Pipes pour capturer console (stdout) du VM
         let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
+        let stderrPipe = Pipe()  // réservé pour usage futur
+
+        let vm = try createVM(for: container, rootfsPath: rootfsPath, stdoutPipe: stdoutPipe)
+        fputs("[vm] createVM OK\n", stderr); fflush(stderr)
 
         let runningVM = RunningVM(
             vm: vm,
@@ -238,6 +245,9 @@ final class VMRuntime: NSObject {
         )
         runningVMs[container.id] = runningVM
 
+        // Démarre la lecture asynchrone du pipe console → log buffer
+        startConsoleReader(containerID: container.id, pipe: stdoutPipe)
+
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             vm.start { result in
                 switch result {
@@ -246,6 +256,22 @@ final class VMRuntime: NSObject {
                 case .failure(let error):
                     continuation.resume(throwing: CockerError.vmStartFailed(error.localizedDescription))
                 }
+            }
+        }
+    }
+
+    // Lit en continu la console série du VM (kernel + cocker-init + container)
+    // et alimente le ring buffer logBuffer du RunningVM. Le handler tourne sur
+    // une queue dédiée fournie par FileHandle.
+    private func startConsoleReader(containerID: String, pipe: Pipe) {
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if data.isEmpty { return }
+            guard let text = String(data: data, encoding: .utf8) else { return }
+            // Le handler est appelé hors main actor — on relaie via Task @MainActor
+            let id = containerID
+            Task { @MainActor [weak self] in
+                self?.appendLog(containerID: id, event: StreamEvent(stream: .stdout, data: text))
             }
         }
     }

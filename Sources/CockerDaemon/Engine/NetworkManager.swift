@@ -62,7 +62,7 @@ actor NetworkManager {
         await store.allNetworks()
     }
 
-    func remove(_ id: String) async throws {
+    func remove(_ id: String, force: Bool = false) async throws {
         let net = try await get(id)
 
         // Prevent deletion of default networks
@@ -70,9 +70,26 @@ actor NetworkManager {
             throw CockerError.networkInUse(id)
         }
 
-        // Check if any container is connected
-        guard net.containers.isEmpty else {
-            throw CockerError.networkInUse(net.name)
+        // Si force=true, on disconnect tous les containers (utile pour `compose down`
+        // où les containers ont été stoppés/supprimés mais leur référence dans
+        // network.containers persiste).
+        if force {
+            var cleaned = net
+            cleaned.containers.removeAll()
+            try await store.store(network: cleaned)
+        } else {
+            // Mode strict : on filtre les containers qui n'existent plus
+            let stillExisting = await store.allContainers(includeAll: true)
+                .compactMap { $0.id }
+            let activeRefs = net.containers.filter { stillExisting.contains($0) }
+            guard activeRefs.isEmpty else {
+                throw CockerError.networkInUse(net.name)
+            }
+            if activeRefs.count != net.containers.count {
+                var cleaned = net
+                cleaned.containers = activeRefs
+                try await store.store(network: cleaned)
+            }
         }
 
         try await store.removeNetwork(id: net.id)
