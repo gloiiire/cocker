@@ -11,7 +11,7 @@ final class ContainerEngine {
     let state: StateStore
     let vmRuntime: VMRuntime
     let portForwarder: PortForwarder
-    let l2Switch: L2Switch
+    let l2Switch: any L2Switching
     private let rootDir: URL
     var dnsServer: DNSServer?  // injecté par main après init
 
