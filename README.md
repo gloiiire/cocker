@@ -115,12 +115,6 @@ A proper fix would require either a privileged `pf` rule helper installed
 via `sudo`, or the `com.apple.vm.networking` entitlement (which needs a
 paid Apple Developer account and a provisioning profile).
 
-### `RUN` directives in Dockerfiles
-
-`COPY`, `ADD`, `ENV`, `WORKDIR`, `CMD`, `ENTRYPOINT`, `LABEL`, `EXPOSE`,
-and `ARG` build correctly. `RUN` is parsed but currently logs a warning
-instead of executing inside a temporary VM — coming in a follow-up release.
-
 ## Usage
 
 ```bash
