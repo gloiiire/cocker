@@ -330,6 +330,14 @@ actor ComposeEngine {
                 try? await containerEngine.remove(id: container.id, force: true)
             }
         }
+
+        // Supprime aussi les networks créés par ce projet (préfixés par projectName_)
+        if let networks = compose.networks {
+            for (name, netSpec) in networks where netSpec.external != true {
+                let fullName = "\(projectName)_\(name)"
+                try? await containerEngine.networks.remove(fullName)
+            }
+        }
     }
 
     // MARK: - Helpers
