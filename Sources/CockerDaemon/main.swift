@@ -32,7 +32,7 @@ func main() async {
         case "--help", "-h":
             printUsage()
             return
-        case "--version":
+        case "--version", "-v":
             print("cockerd \(CockerVersion.version)")
             return
         default:
@@ -176,6 +176,21 @@ func main() async {
         }
     }
 
+    // Welcome banner + "Ready" message — shown after all listeners are
+    // configured. The structured log records above stay greppable, this is
+    // the human-friendly summary.
+    Task { @MainActor in
+        // Tiny delay so the structured log lines flush first.
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        Banner.printCockerdBanner(
+            version: CockerVersion.version,
+            rootDir: rootDir,
+            ipcSocket: socketPath,
+            dockerSocket: dockerSocketPath,
+            dnsPort: dnsPort
+        )
+    }
+
     do {
         try await server.start()
     } catch {
@@ -195,21 +210,46 @@ func printUsage() {
     Options:
       --root <path>     Data directory (default: ~/.cocker)
       --socket <path>   Unix socket path (default: ~/.cocker/cocker.sock)
-      --version         Show version
+      --version, -v     Show version
       --help, -h        Show this help
 
     Commands:
       setup             Download and configure the Linux kernel for VM containers
 
+    How to run cockerd
+    ──────────────────
+    cockerd is a long-running daemon (like dockerd). It listens on three
+    sockets and never exits on its own. Pick one of three ways to run it :
+
+      1. Foreground (development / debugging)
+         $ cockerd
+         # ← stays in your terminal, Ctrl-C to stop.
+         # Open another terminal for `cocker run`, `cocker ps`, etc.
+
+      2. Background in the current shell
+         $ cockerd > ~/cockerd.log 2>&1 &
+         $ cocker ps                       # ← back to a prompt, daemon runs
+         $ kill %1                         # ← stop the daemon
+
+      3. As a managed service (recommended)
+         $ brew services start cocker     # ← auto-restarts at login
+         $ brew services stop cocker
+         $ brew services list             # ← status
+         # Logs : /opt/homebrew/var/log/cockerd.log
+         # Auto-rotated at 10 MiB, last 5 kept.
+
     Environment:
       COCKER_ROOT       Override data directory
       COCKER_SOCKET     Override socket path
+      COCKER_LOG_LEVEL  debug | info | warn | error (default: info)
+      COCKER_LOG_FORMAT text | json
+      COCKER_TRACE      stderr  — emit OTLP-compatible JSON spans
+      COCKER_DNS_PORT   Override DNS server port (default: 5300)
 
     Entitlements required:
       com.apple.security.virtualization
-      com.apple.vm.networking
 
-    The daemon must be code-signed with the above entitlements to start VMs.
+    The daemon must be code-signed with the above entitlement to start VMs.
     See: codesign -s "Your Dev ID" --entitlements entitlements/cockerd.entitlements .build/release/cockerd
     """)
 }

@@ -88,6 +88,7 @@ struct CockerCLI: AsyncParsableCommand {
         // because the outer catch only got error.localizedDescription. Show
         // the help text instead — that's what users (and `docker` itself) expect.
         if CommandLine.arguments.count <= 1 {
+            Banner.printCockerWelcome(version: CockerVersion.version)
             print(Self.helpMessage())
             return
         }
