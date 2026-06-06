@@ -11,6 +11,7 @@ final class ContainerEngine {
     let state: StateStore
     let vmRuntime: VMRuntime
     let portForwarder: PortForwarder
+    let l2Switch: L2Switch
     private let rootDir: URL
     var dnsServer: DNSServer?  // injecté par main après init
 
@@ -23,7 +24,8 @@ final class ContainerEngine {
         self.images = try ImageManager(rootDir: rootDir)
         self.networks = try await NetworkManager(store: state)
         self.volumes = VolumeManager(store: state, rootDir: rootDir)
-        self.vmRuntime = try VMRuntime(rootDir: rootDir)
+        self.l2Switch = L2Switch()
+        self.vmRuntime = try VMRuntime(rootDir: rootDir, l2Switch: self.l2Switch)
 
         // Cherche cocker-portfwd : à côté de cockerd dans le bundle,
         // ou dans le même PREFIX bin/ (cas Homebrew + install.sh).
@@ -118,6 +120,11 @@ final class ContainerEngine {
         fputs("[eng] ipv4=\(container.ip ?? "?")\n", stderr); fflush(stderr)
         container.ipv6 = await networks.allocateIPv6(for: id)
         fputs("[eng] ipv6=\(container.ipv6 ?? "?")\n", stderr); fflush(stderr)
+        // Allocate IP+MAC on the cocker L2 switch (inter-container fabric)
+        let (cIP, cMAC) = await networks.allocateCockerIPAndMAC(for: id)
+        container.cockerIP = cIP
+        container.cockerMAC = cMAC
+        fputs("[eng] cocker switch ip=\(cIP) mac=\(cMAC)\n", stderr); fflush(stderr)
         try await state.store(container: container)
         fputs("[eng] state stored\n", stderr); fflush(stderr)
         emitEvent("container", action: "create", id: id)

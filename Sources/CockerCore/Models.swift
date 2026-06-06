@@ -15,6 +15,10 @@ public struct Container: Codable, Sendable, Identifiable {
     public var networkMode: NetworkMode
     public var networkName: String?
     public var ip: String?
+    /// IP on the cocker L2 switch network (10.42.0.0/16) used for inter-container traffic
+    public var cockerIP: String?
+    /// MAC assigned to the container's switch-side NIC (02:42:0A:2A:xx:xx)
+    public var cockerMAC: String?
     public var cpuCount: Int
     public var memoryMB: UInt64
     public var createdAt: Date

@@ -9,6 +9,8 @@ actor NetworkManager {
     private let store: StateStore
     private var allocatedIPs: [String: String] = [:]    // containerID -> IPv4
     private var allocatedIPv6s: [String: String] = [:]  // containerID -> IPv6
+    private var allocatedCockerIPs: [String: String] = [:]  // containerID -> 10.42.x.x
+    private var cockerHostCounter: UInt16 = 2  // Next free host on 10.42.0.0/16 (skip .0 and .1=gateway)
 
     // Préfixe IPv6 pour les réseaux cocker : fd00:c0c4::/48
     private static let ipv6Prefix = "fd00:c0c4::"
@@ -130,7 +132,41 @@ actor NetworkManager {
     func releaseIP(for containerID: String) {
         allocatedIPs.removeValue(forKey: containerID)
         allocatedIPv6s.removeValue(forKey: containerID)
+        allocatedCockerIPs.removeValue(forKey: containerID)
     }
+
+    // MARK: - Cocker switch network (10.42.0.0/16)
+    //
+    // Each container gets a second NIC plugged into the userspace L2 switch
+    // running inside cockerd. IPs are allocated linearly from 10.42.0.2.
+    // The MAC encodes the same 2-byte host id in its last two bytes:
+    //   IP  = 10.42.HI.LO
+    //   MAC = 02:42:0A:2A:HI:LO
+    // (locally-administered, similar to Docker's 02:42:* range)
+
+    func allocateCockerIPAndMAC(for containerID: String) -> (ip: String, mac: String) {
+        if let ip = allocatedCockerIPs[containerID] {
+            return (ip, Self.cockerMAC(forIP: ip))
+        }
+        // Cap at 254 hosts per /24 segment, wrap to next segment up to 10.42.255.254
+        let host = cockerHostCounter
+        cockerHostCounter = (cockerHostCounter < 65534) ? cockerHostCounter + 1 : 2
+        let hi = UInt8((host >> 8) & 0xFF)
+        let lo = UInt8(host & 0xFF)
+        let ip = "10.42.\(hi).\(lo)"
+        allocatedCockerIPs[containerID] = ip
+        return (ip, Self.cockerMAC(forIP: ip))
+    }
+
+    static func cockerMAC(forIP ip: String) -> String {
+        // "10.42.HI.LO" → "02:42:0a:2a:HI:LO"
+        let octets = ip.split(separator: ".").compactMap { UInt8($0) }
+        guard octets.count == 4 else { return "02:42:0a:2a:00:00" }
+        return String(format: "02:42:0a:2a:%02x:%02x", octets[2], octets[3])
+    }
+
+    static let cockerSwitchSubnet = "10.42.0.0/16"
+    static let cockerSwitchGateway = "10.42.0.1"  // virtual, no host actually answers
 
     func allocateIPv6(for containerID: String, networkName: String = "bridge") -> String {
         if let existing = allocatedIPv6s[containerID] { return existing }
