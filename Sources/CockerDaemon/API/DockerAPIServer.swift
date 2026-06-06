@@ -759,7 +759,7 @@ final class DockerAPIServer {
         config.dockerfile = dockerfile
 
         do {
-            _ = try await engine.images.build(config: config) { event in
+            _ = try await engine.images.build(config: config, vmRuntime: engine.vmRuntime) { event in
                 struct BuildOutput: Encodable { let stream: String }
                 if let data = try? JSONEncoder().encode(BuildOutput(stream: event.data)) {
                     writer.writeChunk(data + Data("\n".utf8))

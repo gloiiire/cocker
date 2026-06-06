@@ -187,7 +187,7 @@ final class DaemonServer {
             case .build:
                 let req = try JSONDecoder().decode(BuildRequest.self, from: request.payload)
                 try await sendStreamingOperation(requestId: request.id, to: fd) { send in
-                    _ = try await self.engine.images.build(config: req.config) { event in
+                    _ = try await self.engine.images.build(config: req.config, vmRuntime: self.engine.vmRuntime) { event in
                         send(event)
                     }
                 }
