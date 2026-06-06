@@ -17,19 +17,31 @@ public struct CredentialStore: Codable, Sendable {
     }
 
     public static func load() -> CredentialStore {
-        guard let data = try? Data(contentsOf: storeURL),
+        load(from: storeURL)
+    }
+
+    /// Load a store from an arbitrary URL. Returns an empty store if the file
+    /// doesn't exist or fails to decode (no error surfaced — credentials are
+    /// optional, missing file is normal on first run).
+    public static func load(from url: URL) -> CredentialStore {
+        guard let data = try? Data(contentsOf: url),
               let store = try? JSONDecoder().decode(CredentialStore.self, from: data)
         else { return CredentialStore() }
         return store
     }
 
     public func save() throws {
-        let dir = Self.storeURL.deletingLastPathComponent()
+        try save(to: Self.storeURL)
+    }
+
+    /// Atomic write with 0o600 perms (owner read/write only). Creates parent
+    /// dir if needed. Same secrecy contract as ~/.docker/config.json.
+    public func save(to url: URL) throws {
+        let dir = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let data = try JSONEncoder().encode(self)
-        try data.write(to: Self.storeURL, options: .atomic)
-        // Restrict permissions to owner-only
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.storeURL.path)
+        try data.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
     }
 
     public func get(for registry: String) -> Credential? {
