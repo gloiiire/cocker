@@ -22,14 +22,14 @@ final class VMRuntime: NSObject {
     private let kernelPath: URL
     private let initrdPath: URL
     private let rootDir: URL
-    let l2Switch: L2Switch
+    let l2Switch: any L2Switching
     // Injected by ContainerEngine after DNSServer exists. Registered on each
     // VM's socket device right after the VM boots so the in-VM DNS proxy
     // can reach cockerd over vsock instead of UDP/TCP via vmnet (which the
     // App Sandbox blocks for user-signed daemons).
     var dnsVsockListener: VZVirtioSocketListener?
 
-    init(rootDir: URL, l2Switch: L2Switch) throws {
+    init(rootDir: URL, l2Switch: any L2Switching) throws {
         self.rootDir = rootDir
         self.kernelPath = rootDir.appendingPathComponent("kernel/vmlinuz")
         self.initrdPath = rootDir.appendingPathComponent("kernel/initrd.img")
@@ -196,59 +196,13 @@ final class VMRuntime: NSObject {
     // MARK: - Kernel command line
 
     private func buildKernelCommandLine(for container: Container, rootfsPath: URL) -> String {
-        // Injecte l'IP du DNS interne de cockerd dans chaque VM
-        let dnsIP = DNSServer.hostIP()
-        let dnsPort = DNSServer.defaultPort
-
-        var parts = [
-            "console=hvc0",
-            "root=virtiofs",
-            "rootfstype=virtiofs",
-            "rw",
-            "quiet",
-            "cocker.id=\(container.id)",
-            "cocker.name=\(container.name)",
-            "cocker.dns=\(dnsIP)",
-            "cocker.dns_port=\(dnsPort)",
-            "cocker.dns_vsock_port=5353",
-        ]
-
-        if let hostname = container.hostname.isEmpty ? nil : container.hostname {
-            parts.append("cocker.hostname=\(hostname)")
-        }
-
-        // L2 switch (eth1) — inter-container fabric. cocker-init brings up
-        // eth1 statically with this IP. Gateway is virtual (no host answers
-        // ARP for it) but Linux needs one to consider the subnet usable.
-        if let cIP = container.cockerIP, let cMAC = container.cockerMAC {
-            parts.append("cocker.cnet_ip=\(cIP)/16")
-            parts.append("cocker.cnet_gw=\(NetworkManager.cockerSwitchGateway)")
-            parts.append("cocker.cnet_mac=\(cMAC)")
-        }
-
-        // La commande container et les env vars sont écrites dans /cocker-spec
-        // au lieu de la kernel cmdline (qui ne supporte pas les espaces / quotes
-        // dans les valeurs). Voir writeContainerSpec().
-
-        // Port forward info (handled by host-side vmnet, but pass info to init)
-        for port in container.ports {
-            parts.append("cocker.port.\(port.containerPort)=\(port.hostPort)/\(port.proto.rawValue)")
-        }
-
-        // Volume mounts
-        for (i, mount) in container.volumes.enumerated() {
-            parts.append("cocker.vol\(i)=vol\(i):\(mount.destination)")
-        }
-
-        if let workdir = container.config_workdir {
-            parts.append("cocker.workdir=\(workdir)")
-        }
-
-        if let user = container.config_user {
-            parts.append("cocker.user=\(user)")
-        }
-
-        return parts.joined(separator: " ")
+        KernelCommandLine.build(KernelCommandLineParams(
+            container: container,
+            dnsIP: DNSServer.hostIP(),
+            dnsPort: DNSServer.defaultPort,
+            dnsVsockPort: 5353,
+            cockerSwitchGateway: NetworkManager.cockerSwitchGateway
+        ))
     }
 
     // MARK: - Start/Stop
@@ -505,88 +459,22 @@ final class VMRuntime: NSObject {
     //   <env0>\0<env1>\0...\n
     //   <workdir>\n
     private func writeContainerSpec(to rootfsPath: URL, container: Container) throws {
-        let specPath = rootfsPath.appendingPathComponent("cocker-spec")
-
-        var data = Data()
-
-        // Ligne 1 : argv (NUL séparé)
-        for (i, arg) in container.command.enumerated() {
-            if i > 0 { data.append(0) }
-            data.append(arg.data(using: .utf8) ?? Data())
-        }
-        data.append(0x0A)  // \n
-
-        // Ligne 2 : env (KEY=VALUE NUL séparé)
-        var envEntries: [String] = []
-        // Default PATH/HOME/TERM si absents
-        if container.env["PATH"] == nil {
-            envEntries.append("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-        }
-        if container.env["HOME"] == nil {
-            envEntries.append("HOME=/root")
-        }
-        if container.env["TERM"] == nil {
-            envEntries.append("TERM=xterm")
-        }
-        for (k, v) in container.env {
-            envEntries.append("\(k)=\(v)")
-        }
-        for (i, entry) in envEntries.enumerated() {
-            if i > 0 { data.append(0) }
-            data.append(entry.data(using: .utf8) ?? Data())
-        }
-        data.append(0x0A)  // \n
-
-        // Ligne 3 : workdir
-        let workdir = container.env["WORKDIR"] ?? "/"
-        data.append(workdir.data(using: .utf8) ?? Data())
-        data.append(0x0A)  // \n
-
-        try data.write(to: specPath, options: .atomic)
+        try RootfsBootstrap.writeSpec(
+            to: rootfsPath,
+            command: container.command,
+            env: container.env,
+            workdir: container.config_workdir
+        )
     }
 
     private func writeResolvConf(to rootfsPath: URL, container: Container) throws {
-        let etcDir = rootfsPath.appendingPathComponent("etc")
-        try? FileManager.default.createDirectory(at: etcDir, withIntermediateDirectories: true)
-
-        let hostIP = DNSServer.hostIP()
-        let dnsPort = DNSServer.defaultPort
-
-        // Port 53 standard → on utilise socat/iptables dans init si dnsPort != 53
-        // Pour l'instant on écrit l'IP host + un search domain
-        let resolvConf = """
-        # Generated by cockerd
-        nameserver \(hostIP)
-        nameserver ::1
-        search cocker
-        options ndots:1
-        options timeout:1
-        options attempts:2
-
-        """
-
-        // Fichier resolv.conf dans le rootfs
-        let resolvPath = etcDir.appendingPathComponent("resolv.conf")
-        try resolvConf.write(to: resolvPath, atomically: true, encoding: .utf8)
-
-        // Aussi hosts pour les entrées statiques connues
-        let hostsPath = etcDir.appendingPathComponent("hosts")
-        var hosts = """
-        127.0.0.1   localhost
-        ::1         localhost
-
-        """
-        // Ajoute l'IP du container lui-même
-        if let ip = container.ip {
-            hosts += "\(ip)   \(container.name) \(container.hostname)\n"
-        }
-
-        // N'écrase pas un hosts existant qui a du contenu important
-        if !FileManager.default.fileExists(atPath: hostsPath.path) {
-            try hosts.write(to: hostsPath, atomically: true, encoding: .utf8)
-        }
-
-        print("[dns] resolv.conf → \(resolvPath.path) (nameserver \(hostIP):\(dnsPort))")
+        try RootfsBootstrap.writeResolvConf(to: rootfsPath, dnsIP: DNSServer.hostIP())
+        try RootfsBootstrap.writeHostsIfAbsent(
+            to: rootfsPath,
+            containerName: container.name,
+            hostname: container.hostname,
+            ip: container.ip
+        )
     }
 
     // MARK: - Logs

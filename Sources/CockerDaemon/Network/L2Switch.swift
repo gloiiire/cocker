@@ -24,7 +24,7 @@ import CockerCore
 // Frame size is capped at 1518 bytes (standard Ethernet MTU + headers); we
 // configure the VZ attachment with MTU=1500.
 
-actor L2Switch {
+actor L2Switch: L2Switching {
     static let mtu = 1500
     private static let maxFrame = 1518  // MTU + 14-byte Ethernet header + 4-byte FCS slack
 

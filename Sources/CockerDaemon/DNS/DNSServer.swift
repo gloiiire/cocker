@@ -305,82 +305,15 @@ actor DNSServer {
     }
 
     private func lookupInState(name: String) async -> String? {
-        let containers = await state.allContainers(includeAll: false)  // running only
-
-        // Nom à tester après normalisation (retire le domaine .cocker si présent)
-        let candidates = normalizedNames(from: name)
-
-        for container in containers {
-            // Prefer the cocker switch IP (10.42.x.x) when present : container-to-
-            // container traffic goes through the userspace L2 switch and that IP
-            // is the only one reachable from peer VMs. Fall back to the legacy
-            // vmnet IP for installs that haven't yet been migrated.
-            guard let ip = container.cockerIP ?? container.ip else { continue }
-
-            // Match direct sur le nom du container
-            if candidates.contains(container.name) { return ip }
-
-            // Match sur le service compose (label com.cocker.service)
-            if let service = container.labels["com.cocker.service"],
-               candidates.contains(service) { return ip }
-
-            // Match sur le short ID
-            if candidates.contains(String(container.id.prefix(12))) { return ip }
-
-            // Match sur le hostname
-            if candidates.contains(container.hostname) { return ip }
-
-            // Match sur les aliases réseau (label com.cocker.aliases)
-            if let aliases = container.labels["com.cocker.aliases"]?.split(separator: ",") {
-                for alias in aliases {
-                    if candidates.contains(String(alias).trimmingCharacters(in: .whitespaces)) {
-                        return ip
-                    }
-                }
-            }
-        }
-
-        return nil
-    }
-
-    // Génère toutes les variantes d'un nom DNS à tester
-    // "web.myproject_default.cocker" → ["web", "web.myproject_default", ...]
-    private func normalizedNames(from name: String) -> Set<String> {
-        var candidates = Set<String>()
-        candidates.insert(name)
-
-        // Retire le domaine .cocker
-        let withoutCocker = name.hasSuffix(".\(Self.cockerDomain)")
-            ? String(name.dropLast(Self.cockerDomain.count + 1))
-            : name
-
-        candidates.insert(withoutCocker)
-
-        // Premier segment uniquement ("web.default" → "web")
-        let firstPart = withoutCocker.split(separator: ".").first.map(String.init) ?? withoutCocker
-        candidates.insert(firstPart)
-
-        // Sans le trailing dot DNS (FQDN)
-        let withoutDot = name.hasSuffix(".") ? String(name.dropLast()) : name
-        candidates.insert(withoutDot)
-
-        return candidates
+        let containers = await state.allContainers(includeAll: false)
+        return DNSNameResolver.resolveA(name: name, in: containers)
     }
 
     // MARK: - IPv6 resolution
 
     private func resolveIPv6(name: String) async -> String? {
-        let candidates = normalizedNames(from: name)
         let containers = await state.allContainers(includeAll: false)
-        for container in containers {
-            guard let ipv6 = container.ipv6 else { continue }
-            if candidates.contains(container.name) { return ipv6 }
-            if let service = container.labels["com.cocker.service"],
-               candidates.contains(service) { return ipv6 }
-            if candidates.contains(String(container.id.prefix(12))) { return ipv6 }
-            if candidates.contains(container.hostname) { return ipv6 }
-        }
-        return nil
+        return DNSNameResolver.resolveAAAA(name: name, in: containers)
     }
 
     // MARK: - Response builders
