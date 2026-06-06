@@ -25,6 +25,11 @@
 #include <sys/wait.h>
 #include <sys/reboot.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
 #include <errno.h>
 
 #define die(fmt, ...) do { \
@@ -223,6 +228,88 @@ int main(int argc, char **argv) {
 
     /* Mount any volume shares */
     mount_volumes(cmdline);
+
+    /* IP discovery :
+     *   1. up de l'interface eth0
+     *   2. démarrer udhcpc (DHCP client) pour obtenir une IP DHCP de vmnet
+     *   3. récupérer l'IP via ioctl + écrire dans /cocker-ip
+     * Le daemon poll ce fichier via virtiofs pour configurer le port
+     * forwarding TCP host → container.
+     */
+    {
+        /* Up de eth0 (ifconfig eth0 up) */
+        int up_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (up_sock >= 0) {
+            struct ifreq ifr;
+            memset(&ifr, 0, sizeof(ifr));
+            strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
+            if (ioctl(up_sock, SIOCGIFFLAGS, &ifr) == 0) {
+                ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+                if (ioctl(up_sock, SIOCSIFFLAGS, &ifr) != 0)
+                    info("ifup eth0: %s", strerror(errno));
+            }
+            close(up_sock);
+        }
+
+        /* Lance udhcpc en background. Plusieurs chemins possibles selon
+         * la distro : busybox dans Alpine, dhclient ailleurs. */
+        const char *dhcp_clients[] = {
+            "/sbin/udhcpc", "/usr/sbin/udhcpc",
+            "/sbin/dhclient", "/usr/sbin/dhclient",
+            NULL
+        };
+        pid_t dhcp_pid = -1;
+        for (int i = 0; dhcp_clients[i]; i++) {
+            if (access(dhcp_clients[i], X_OK) != 0) continue;
+            dhcp_pid = fork();
+            if (dhcp_pid == 0) {
+                if (strstr(dhcp_clients[i], "udhcpc")) {
+                    execl(dhcp_clients[i], "udhcpc", "-i", "eth0",
+                          "-t", "3", "-n", "-q", "-f", (char *)NULL);
+                } else {
+                    execl(dhcp_clients[i], "dhclient", "-1", "eth0", (char *)NULL);
+                }
+                _exit(127);
+            }
+            info("started DHCP client %s (pid %d)", dhcp_clients[i], dhcp_pid);
+            break;
+        }
+        if (dhcp_pid > 0) {
+            int dhcp_status;
+            waitpid(dhcp_pid, &dhcp_status, 0);
+        } else {
+            info("no DHCP client found (udhcpc/dhclient), trying static IP read");
+        }
+
+        /* Lit l'IP eth0 — retry rapide au cas où DHCP en cours */
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            char ip_str[INET_ADDRSTRLEN] = {0};
+            for (int try = 0; try < 20; try++) {
+                struct ifreq ifr;
+                memset(&ifr, 0, sizeof(ifr));
+                strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
+                if (ioctl(sock, SIOCGIFADDR, &ifr) == 0) {
+                    struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+                    if (inet_ntop(AF_INET, &ipaddr->sin_addr, ip_str, sizeof(ip_str)))
+                        break;
+                }
+                usleep(100000);  /* 100ms */
+            }
+            close(sock);
+            if (ip_str[0]) {
+                info("eth0 IP=%s", ip_str);
+                int ip_fd = open("/cocker-ip", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (ip_fd >= 0) {
+                    write(ip_fd, ip_str, strlen(ip_str));
+                    fsync(ip_fd);
+                    close(ip_fd);
+                }
+            } else {
+                info("no IP on eth0 after DHCP attempt");
+            }
+        }
+    }
 
     /*
      * Lit /cocker-spec écrit par cockerd avant le boot.

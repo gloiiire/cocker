@@ -133,6 +133,19 @@ actor ImageManager {
         await store.rootDir.appendingPathComponent("blobs/sha256")
     }
 
+    /// Clone le rootfs d'une image vers un rootfs dédié au container (overlay
+    /// via APFS clonefile). Garantit l'isolation entre containers de la même
+    /// image. Voir ImageStore.cloneRootfs pour les détails.
+    func cloneRootfs(for reference: String, containerID: String) async throws -> URL {
+        let img = try await find(reference)
+        return try await store.cloneRootfs(for: img, containerID: containerID)
+    }
+
+    /// Supprime le rootfs cloné d'un container.
+    func removeContainerRootfs(containerID: String) async throws {
+        try await store.removeContainerRootfs(containerID: containerID)
+    }
+
     // MARK: - Build
 
     func build(config: BuildConfig, progressHandler: @escaping (StreamEvent) -> Void) async throws -> ImageInfo {
