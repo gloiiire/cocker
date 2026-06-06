@@ -59,7 +59,7 @@ final class DaemonServer {
 
         self.serverFD = fd
         self.isRunning = true
-        print("[cockerd] Listening on \(socketPath)")
+        CockerLog.shared.info("ipc", "listening on \(socketPath)")
 
         // Accept loop in a background thread (POSIX accept is blocking)
         await acceptLoop()
@@ -89,7 +89,7 @@ final class DaemonServer {
         isRunning = false
         if serverFD >= 0 { close(serverFD); serverFD = -1 }
         try? FileManager.default.removeItem(atPath: socketPath)
-        print("[cockerd] Stopped.")
+        CockerLog.shared.info("ipc", "stopped")
     }
 
     // MARK: - Connection handler

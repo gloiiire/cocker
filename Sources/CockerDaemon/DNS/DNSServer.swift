@@ -66,20 +66,17 @@ actor DNSServer {
 
         self.serverFD = fd
         self.isRunning = true
-        fputs("[cockerd] DNS resolver listening on 0.0.0.0:\(port) (UDP)\n", stderr)
-        fflush(stderr)
+        CockerLog.shared.info("dns", "listening on 0.0.0.0:\(port) (UDP)")
 
         // TCP listener — used by cocker-init's in-VM DNS proxy. Apple's
         // App Sandbox blocks UDP packets from vmnet to user-signed daemons,
         // but TCP from VM works. See start_dns_proxy() in cocker-init/init.c.
         if let tfd = Self.bindTCP(port: port) {
             self.tcpFD = tfd
-            fputs("[cockerd] DNS resolver listening on 0.0.0.0:\(port) (TCP)\n", stderr)
-            fflush(stderr)
+            CockerLog.shared.info("dns", "listening on 0.0.0.0:\(port) (TCP)")
             Task { await self.tcpAcceptLoop(fd: tfd) }
         } else {
-            fputs("[cockerd] WARN: TCP DNS listener bind failed\n", stderr)
-            fflush(stderr)
+            CockerLog.shared.warn("dns", "TCP listener bind failed")
         }
 
         // Bonus UDP bind on bridge100 (in case the sandbox ever relaxes).
@@ -184,8 +181,7 @@ actor DNSServer {
                 if let ip = Self.vmnetGatewayIP(),
                    let fd = Self.bindUDP(on: ip, port: port) {
                     bridgeFD = fd
-                    fputs("[cockerd] DNS resolver also listening on \(ip):\(port) (bridge100)\n", stderr)
-                    fflush(stderr)
+                    CockerLog.shared.info("dns", "also listening on \(ip):\(port) (bridge100)")
                     Task { await self.receiveLoop(fd: fd) }
                 }
             }
