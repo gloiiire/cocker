@@ -41,24 +41,23 @@ public enum Banner {
         isatty(fileno(stderr)) == 1
     }
 
-    /// Print the banner with the daemon's listening summary. Safe to call
-    /// from cockerd's main() once all sockets are bound.
-    public static func printCockerdBanner(version: String,
-                                          rootDir: String,
-                                          ipcSocket: String,
-                                          dockerSocket: String,
-                                          dnsPort: UInt16) {
-        let tty = stderrIsTTY
-        let cyan   = tty ? ANSIStyle.brightCyan : ""
-        let green  = tty ? ANSIStyle.brightGreen : ""
-        let dim    = tty ? ANSIStyle.dim : ""
-        let bold   = tty ? ANSIStyle.bold : ""
-        let reset  = tty ? ANSIStyle.reset : ""
+    /// Build the cockerd boot screen as a string. Pure (no I/O) so the format
+    /// is testable. The caller decides whether to colour it (tty) or not.
+    public static func cockerdBanner(version: String,
+                                     rootDir: String,
+                                     ipcSocket: String,
+                                     dockerSocket: String,
+                                     dnsPort: UInt16,
+                                     colored: Bool) -> String {
+        let cyan   = colored ? ANSIStyle.brightCyan : ""
+        let green  = colored ? ANSIStyle.brightGreen : ""
+        let dim    = colored ? ANSIStyle.dim : ""
+        let bold   = colored ? ANSIStyle.bold : ""
+        let reset  = colored ? ANSIStyle.reset : ""
 
         var out = "\n"
         out += cyan + logo + reset + "\n"
-        out += "      \(dim)container engine for Apple Silicon \(reset)"
-        out += dim + "· v\(version)" + reset + "\n"
+        out += "      \(dim)container engine for Apple Silicon · v\(version)\(reset)\n"
         out += "      \(dim)https://github.com/gloiiire/cocker\(reset)\n\n"
 
         out += "  \(bold)Listeners\(reset)\n"
@@ -72,22 +71,40 @@ public enum Banner {
         out += "\(dim)Daemon is running. Press \(reset)\(bold)Ctrl-C\(reset)\(dim) to stop.\(reset)\n"
         out += "  \(dim)Open another terminal and try: \(reset)\(bold)cocker run alpine echo hello\(reset)\n\n"
 
-        FileHandle.standardError.write(Data(out.utf8))
+        return out
     }
 
-    /// Print the banner for the `cocker` no-args welcome. Concise — followed
-    /// by the help text from ArgumentParser.
-    public static func printCockerWelcome(version: String) {
-        let tty = isatty(fileno(stdout)) == 1
-        let cyan  = tty ? ANSIStyle.brightCyan : ""
-        let dim   = tty ? ANSIStyle.dim : ""
-        let reset = tty ? ANSIStyle.reset : ""
+    /// Pure version of the `cocker` no-args welcome. Used by the CLI to prepend
+    /// the help text.
+    public static func cockerWelcome(version: String, colored: Bool) -> String {
+        let cyan  = colored ? ANSIStyle.brightCyan : ""
+        let dim   = colored ? ANSIStyle.dim : ""
+        let reset = colored ? ANSIStyle.reset : ""
 
         var out = "\n"
         out += cyan + logo + reset + "\n"
         out += "      \(dim)container engine for Apple Silicon · v\(version)\(reset)\n"
         out += "      \(dim)https://github.com/gloiiire/cocker\(reset)\n\n"
+        return out
+    }
 
+    // MARK: - I/O wrappers (the bits we can't unit-test)
+
+    public static func printCockerdBanner(version: String,
+                                          rootDir: String,
+                                          ipcSocket: String,
+                                          dockerSocket: String,
+                                          dnsPort: UInt16) {
+        let out = cockerdBanner(
+            version: version, rootDir: rootDir, ipcSocket: ipcSocket,
+            dockerSocket: dockerSocket, dnsPort: dnsPort,
+            colored: stderrIsTTY
+        )
+        FileHandle.standardError.write(Data(out.utf8))
+    }
+
+    public static func printCockerWelcome(version: String) {
+        let out = cockerWelcome(version: version, colored: isatty(fileno(stdout)) == 1)
         FileHandle.standardOutput.write(Data(out.utf8))
     }
 }
