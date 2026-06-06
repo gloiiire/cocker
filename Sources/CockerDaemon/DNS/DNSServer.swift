@@ -1,0 +1,302 @@
+import Foundation
+import CockerCore
+
+// Internal DNS server for container name resolution
+//
+// Résolution par ordre de priorité :
+//   1. Nom exact de container         → "web"          → 172.17.0.3
+//   2. Nom de service compose         → "db"           → 172.17.0.4
+//   3. FQDN container                 → "web.cocker"   → 172.17.0.3
+//   4. Alias réseau                   → "api.frontend" → 172.17.0.5
+//   5. Forwarding upstream (1.1.1.1)  → tout le reste
+//
+// Le DNS écoute sur port 5300 (pas besoin de root)
+// Les VMs reçoivent l'IP du host via kernel cmdline → /etc/resolv.conf
+
+actor DNSServer {
+    static let defaultPort: UInt16 = 5300
+    static let listenAddress = "0.0.0.0"
+    static let upstreamDNS = "1.1.1.1"
+    static let cockerDomain = "cocker"
+
+    private let state: StateStore
+    private let port: UInt16
+    private var serverFD: Int32 = -1
+    private var isRunning = false
+
+    // Cache de résolution : name → ip, invalidé à chaque changement
+    private var cache: [String: String] = [:]
+    private var cacheVersion: Int = 0
+
+    init(state: StateStore, port: UInt16 = DNSServer.defaultPort) {
+        self.state = state
+        self.port = port
+    }
+
+    // MARK: - Start / Stop
+
+    func start() async throws {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else {
+            throw CockerError.internalError("DNS: socket() failed: \(String(cString: strerror(errno)))")
+        }
+
+        // Réutilisation du port pour les redémarrages rapides
+        var reuse: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = INADDR_ANY
+
+        let bindResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        guard bindResult == 0 else {
+            close(fd)
+            throw CockerError.internalError("DNS: bind() failed on port \(port): \(String(cString: strerror(errno)))")
+        }
+
+        self.serverFD = fd
+        self.isRunning = true
+        print("[cockerd] DNS resolver listening on 0.0.0.0:\(port)")
+
+        await receiveLoop()
+    }
+
+    func stop() {
+        isRunning = false
+        if serverFD >= 0 { close(serverFD); serverFD = -1 }
+    }
+
+    // Invalide le cache quand un container démarre/s'arrête
+    func invalidateCache() {
+        cache.removeAll()
+        cacheVersion += 1
+    }
+
+    // MARK: - Receive loop
+
+    private func receiveLoop() async {
+        var buf = [UInt8](repeating: 0, count: 4096)
+        var clientAddr = sockaddr_in()
+        var clientAddrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+
+        while isRunning {
+            let n = await Task.detached(priority: .userInitiated) { [fd = serverFD] in
+                withUnsafeMutablePointer(to: &clientAddr) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        recvfrom(fd, &buf, buf.count, 0, sa, &clientAddrLen)
+                    }
+                }
+            }.value
+
+            guard n > DNSHeader.size else { continue }
+            let packet = Data(buf.prefix(n))
+
+            // Capture des infos client pour la réponse
+            let clientPort = clientAddr.sin_port.bigEndian
+            let clientIP = withUnsafeBytes(of: clientAddr.sin_addr) { bytes -> String in
+                let b = bytes.bindMemory(to: UInt8.self)
+                return "\(b[0]).\(b[1]).\(b[2]).\(b[3])"
+            }
+
+            Task { await self.handlePacket(packet, clientIP: clientIP, clientPort: clientPort) }
+        }
+    }
+
+    // MARK: - Packet handler
+
+    private func handlePacket(_ data: Data, clientIP: String, clientPort: UInt16) async {
+        let header = DNSHeader(data: data)
+        guard header.isQuery, header.opcode == 0 else { return }  // Standard query only
+
+        let (questions, _) = parseDNSQuestions(from: data, count: Int(header.qdCount))
+        guard let question = questions.first else { return }
+
+        // Résolution
+        let response: Data
+
+        if let ip = await resolve(name: question.name), (question.isA || question.isAny) {
+            // Réponse authoritative avec l'IP du container
+            response = buildAResponse(header: header, question: question, ip: ip)
+            logDNS(question.name, result: ip, authoritative: true)
+        } else if question.isAAAA {
+            // AAAA → NOERROR vide (pas d'IPv6 pour les containers)
+            response = buildEmptyResponse(header: header, question: question)
+        } else {
+            // Forwarding vers upstream DNS
+            response = forwardToUpstream(data, upstream: Self.upstreamDNS) ?? buildNXDomain(header: header, question: question)
+            logDNS(question.name, result: "upstream", authoritative: false)
+        }
+
+        sendResponse(response, toIP: clientIP, port: clientPort)
+    }
+
+    // MARK: - Name resolution
+
+    private func resolve(name: String) async -> String? {
+        // Cache hit
+        if let cached = cache[name] { return cached }
+
+        let ip = await lookupInState(name: name)
+        if let ip { cache[name] = ip }
+        return ip
+    }
+
+    private func lookupInState(name: String) async -> String? {
+        let containers = await state.allContainers(includeAll: false)  // running only
+
+        // Nom à tester après normalisation (retire le domaine .cocker si présent)
+        let candidates = normalizedNames(from: name)
+
+        for container in containers {
+            guard let ip = container.ip else { continue }
+
+            // Match direct sur le nom du container
+            if candidates.contains(container.name) { return ip }
+
+            // Match sur le service compose (label com.cocker.service)
+            if let service = container.labels["com.cocker.service"],
+               candidates.contains(service) { return ip }
+
+            // Match sur le short ID
+            if candidates.contains(String(container.id.prefix(12))) { return ip }
+
+            // Match sur le hostname
+            if candidates.contains(container.hostname) { return ip }
+
+            // Match sur les aliases réseau (label com.cocker.aliases)
+            if let aliases = container.labels["com.cocker.aliases"]?.split(separator: ",") {
+                for alias in aliases {
+                    if candidates.contains(String(alias).trimmingCharacters(in: .whitespaces)) {
+                        return ip
+                    }
+                }
+            }
+        }
+
+        return nil
+    }
+
+    // Génère toutes les variantes d'un nom DNS à tester
+    // "web.myproject_default.cocker" → ["web", "web.myproject_default", ...]
+    private func normalizedNames(from name: String) -> Set<String> {
+        var candidates = Set<String>()
+        candidates.insert(name)
+
+        // Retire le domaine .cocker
+        let withoutCocker = name.hasSuffix(".\(Self.cockerDomain)")
+            ? String(name.dropLast(Self.cockerDomain.count + 1))
+            : name
+
+        candidates.insert(withoutCocker)
+
+        // Premier segment uniquement ("web.default" → "web")
+        let firstPart = withoutCocker.split(separator: ".").first.map(String.init) ?? withoutCocker
+        candidates.insert(firstPart)
+
+        // Sans le trailing dot DNS (FQDN)
+        let withoutDot = name.hasSuffix(".") ? String(name.dropLast()) : name
+        candidates.insert(withoutDot)
+
+        return candidates
+    }
+
+    // MARK: - Response builders
+
+    private func buildAResponse(header: DNSHeader, question: DNSQuestion, ip: String) -> Data {
+        var responseHeader = header
+        responseHeader.flags = header.responseFlags(rcode: 0, authoritative: true)
+        responseHeader.anCount = 1
+
+        var builder = DNSResponseBuilder()
+        builder.appendHeader(responseHeader)
+        builder.appendQuestion(question)
+        builder.appendARecord(ip: ip, ttl: 10)  // TTL court → cohérence après restart container
+        return builder.build()
+    }
+
+    private func buildEmptyResponse(header: DNSHeader, question: DNSQuestion) -> Data {
+        var responseHeader = header
+        responseHeader.flags = header.responseFlags(rcode: 0, authoritative: true)
+        responseHeader.anCount = 0
+
+        var builder = DNSResponseBuilder()
+        builder.appendHeader(responseHeader)
+        builder.appendQuestion(question)
+        return builder.build()
+    }
+
+    private func buildNXDomain(header: DNSHeader, question: DNSQuestion) -> Data {
+        var responseHeader = header
+        responseHeader.flags = header.responseFlags(rcode: 3, authoritative: true)  // NXDOMAIN
+        responseHeader.anCount = 0
+
+        var builder = DNSResponseBuilder()
+        builder.appendHeader(responseHeader)
+        builder.appendQuestion(question)
+        return builder.build()
+    }
+
+    // MARK: - Send response
+
+    private func sendResponse(_ data: Data, toIP ip: String, port: UInt16) {
+        var dest = sockaddr_in()
+        dest.sin_family = sa_family_t(AF_INET)
+        dest.sin_port = port.bigEndian
+        inet_pton(AF_INET, ip, &dest.sin_addr)
+
+        data.withUnsafeBytes { buf in
+            guard let ptr = buf.baseAddress else { return }
+            withUnsafePointer(to: &dest) { addrPtr in
+                addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    _ = sendto(serverFD, ptr, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+        }
+    }
+
+    // MARK: - Logging
+
+    private func logDNS(_ name: String, result: String, authoritative: Bool) {
+        let tag = authoritative ? "✓" : "→"
+        print("[dns] \(tag) \(name) → \(result)")
+    }
+
+    // MARK: - Host IP helper
+
+    // Retourne l'IP du host accessible depuis les VMs
+    // (utilisée pour écrire /etc/resolv.conf dans les containers)
+    static func hostIP() -> String {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return "127.0.0.1" }
+        defer { freeifaddrs(ifaddr) }
+
+        var current: UnsafeMutablePointer<ifaddrs>? = firstAddr
+        while let addr = current {
+            let name = String(cString: addr.pointee.ifa_name)
+            let family = addr.pointee.ifa_addr.pointee.sa_family
+
+            // On veut en0 ou utun0 ou vmenet0 — pas localhost
+            if family == UInt8(AF_INET) && (name.hasPrefix("en") || name.hasPrefix("bridge")) {
+                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                addr.pointee.ifa_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                    inet_ntop(AF_INET, &sin.pointee.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
+                }
+                let ip = String(cString: buf)
+                if !ip.hasPrefix("127.") && !ip.isEmpty {
+                    current = nil
+                    return ip
+                }
+            }
+            current = addr.pointee.ifa_next
+        }
+        return "192.168.64.1"  // fallback vmnet gateway
+    }
+}
