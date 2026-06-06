@@ -72,6 +72,12 @@ public struct CockerLog: Sendable {
         )
     }
 
+    /// Shared default — env-configured at first access. Use this from any
+    /// daemon component that doesn't have a logger injected ; that way the
+    /// boot output stays consistent (single timestamped+leveled format
+    /// instead of a mix of `[cockerd]` bare prints and structured records).
+    public static let shared: CockerLog = .fromEnvironment()
+
     public func debug(_ module: String, _ message: String) { emit(.debug, module, message) }
     public func info(_ module: String, _ message: String)  { emit(.info,  module, message) }
     public func warn(_ module: String, _ message: String)  { emit(.warn,  module, message) }

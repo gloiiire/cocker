@@ -74,7 +74,8 @@ struct PruneCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "system",
         abstract: "Manage Cocker",
-        subcommands: [SystemPruneCommand.self, SystemInfoCommand.self, SystemEventsCommand.self, SystemDfCommand.self]
+        subcommands: [SystemPruneCommand.self, SystemInfoCommand.self, SystemEventsCommand.self, SystemDfCommand.self],
+        aliases: ["s"]
     )
 }
 
