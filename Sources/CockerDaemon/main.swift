@@ -84,9 +84,20 @@ func main() async {
     print("[cockerd] Starting Cocker Engine \(CockerVersion.version)")
     print("[cockerd] Root: \(rootDir)")
 
+    // Discover the cocker-portfwd binary that ships next to cockerd. We do
+    // this here (rather than inside ContainerEngine.init) so the engine
+    // doesn't depend on CommandLine.arguments[0] — that makes it easier to
+    // construct an engine in tests with an arbitrary port forwarder.
+    let portFwdBinary = URL(fileURLWithPath: CommandLine.arguments[0])
+        .deletingLastPathComponent()
+        .appendingPathComponent("cocker-portfwd")
+
     let engine: ContainerEngine
     do {
-        engine = try await ContainerEngine(rootDir: rootURL)
+        engine = try await ContainerEngine(
+            rootDir: rootURL,
+            portForwarder: PortForwarder(portFwdBinary: portFwdBinary)
+        )
     } catch {
         fputs("[cockerd] Failed to initialize engine: \(error)\n", stderr)
         exit(1)
