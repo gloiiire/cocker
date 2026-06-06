@@ -5,7 +5,8 @@ import Foundation
 struct PSCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "ps",
-        abstract: "List containers"
+        abstract: "List containers",
+        aliases: ["ls", "list"]
     )
 
     @Flag(name: [.short, .customLong("all")], help: "Show all containers (default shows just running)")

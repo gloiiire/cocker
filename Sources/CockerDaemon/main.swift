@@ -80,9 +80,12 @@ func main() async {
         exit(1)
     }
 
-    // Initialize engine
-    print("[cockerd] Starting Cocker Engine \(CockerVersion.version)")
-    print("[cockerd] Root: \(rootDir)")
+    // Structured logger — honors COCKER_LOG_LEVEL and COCKER_LOG_FORMAT.
+    // The old [cockerd] print()/fputs() calls scattered through main() used
+    // to interleave with the structured records, which made the boot output
+    // a confusing two-format mess. We now go through CockerLog everywhere.
+    let log = CockerLog.fromEnvironment()
+    log.info("startup", "cockerd \(CockerVersion.version) root=\(rootDir)")
 
     // Rotate cockerd.log if it's grown past 10 MiB. Best-effort : a missing
     // file or a permission error is silently ignored — losing one rotation
@@ -90,12 +93,8 @@ func main() async {
     let logFile = rootURL.appendingPathComponent("cockerd.log")
     if LogRotator.shouldRotate(file: logFile, maxBytes: 10 * 1024 * 1024) {
         try? LogRotator.rotate(file: logFile, keep: 5)
-        print("[cockerd] log rotated → cockerd.log.1")
+        log.info("logrotate", "rotated cockerd.log → cockerd.log.1")
     }
-
-    // Structured logger — honors COCKER_LOG_LEVEL and COCKER_LOG_FORMAT.
-    let log = CockerLog.fromEnvironment()
-    log.info("startup", "cockerd \(CockerVersion.version) root=\(rootDir)")
 
     // Discover the cocker-portfwd binary that ships next to cockerd. We do
     // this here (rather than inside ContainerEngine.init) so the engine
@@ -112,7 +111,7 @@ func main() async {
             portForwarder: PortForwarder(portFwdBinary: portFwdBinary)
         )
     } catch {
-        fputs("[cockerd] Failed to initialize engine: \(error)\n", stderr)
+        log.error("startup", "failed to initialize engine: \(error)")
         exit(1)
     }
 
@@ -142,14 +141,14 @@ func main() async {
     let sigtermSrc = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 
     sigintSrc.setEventHandler {
-        print("\n[cockerd] Received SIGINT, shutting down...")
+        log.info("signal", "SIGINT received, shutting down")
         server.stop()
         dockerAPI.stop()
         Task { await dns.stop() }
         exit(0)
     }
     sigtermSrc.setEventHandler {
-        print("[cockerd] Received SIGTERM, shutting down...")
+        log.info("signal", "SIGTERM received, shutting down")
         server.stop()
         dockerAPI.stop()
         Task { await dns.stop() }
@@ -164,8 +163,7 @@ func main() async {
         do {
             try await dns.start()
         } catch {
-            fputs("[cockerd] DNS server error: \(error)\n", stderr)
-            fputs("[cockerd] → Essaie: COCKER_DNS_PORT=5300 cockerd\n", stderr)
+            log.error("dns", "server error: \(error) — try COCKER_DNS_PORT=5300 cockerd")
         }
     }
 
@@ -174,14 +172,14 @@ func main() async {
         do {
             try await dockerAPI.start()
         } catch {
-            fputs("[cockerd] Docker API server error: \(error)\n", stderr)
+            log.error("docker-api", "server error: \(error)")
         }
     }
 
     do {
         try await server.start()
     } catch {
-        fputs("[cockerd] Server error: \(error)\n", stderr)
+        log.error("ipc", "server error: \(error)")
         exit(1)
     }
 }

@@ -92,6 +92,15 @@ struct CockerCLI: AsyncParsableCommand {
             return
         }
 
+        // `-v` shorthand for `--version`. ArgumentParser auto-generates only
+        // the long form when you set `version:` on the configuration, so we
+        // intercept the common short alias here. Matches `docker -v`.
+        if CommandLine.arguments.count == 2,
+           CommandLine.arguments[1] == "-v" {
+            print("Cocker version \(CockerVersion.version)")
+            return
+        }
+
         do {
             var cmd = try parseAsRoot()
             if var async = cmd as? AsyncParsableCommand {
