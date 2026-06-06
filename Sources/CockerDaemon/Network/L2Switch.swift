@@ -125,6 +125,19 @@ actor L2Switch: L2Switching {
         let dstMAC = Self.macFromBytes(frame, offset: 0)
         let srcMAC = Self.macFromBytes(frame, offset: 6)
 
+        // Anti-spoofing : the source MAC on a frame coming out of `port` must
+        // equal the MAC we assigned to that port when the container booted.
+        // If a container tries to spoof someone else's MAC (to intercept
+        // their traffic by poisoning the learning table), we drop the frame
+        // and don't update the learning table.
+        guard let sourcePort = ports[sourceContainerID] else { return }
+        if srcMAC != sourcePort.staticMAC {
+            if verboseLogging {
+                log("drop spoofed src MAC from \(sourceContainerID): claimed=\(Self.macToString(srcMAC)) expected=\(Self.macToString(sourcePort.staticMAC))")
+            }
+            return
+        }
+
         // MAC learning : remember which port the source MAC lives on.
         macTable[srcMAC] = sourceContainerID
 
@@ -184,6 +197,12 @@ actor L2Switch: L2Switching {
             result = (result << 8) | UInt64(data[data.startIndex + offset + i])
         }
         return result
+    }
+
+    private static func macToString(_ mac: UInt64) -> String {
+        String(format: "%02x:%02x:%02x:%02x:%02x:%02x",
+               (mac >> 40) & 0xFF, (mac >> 32) & 0xFF, (mac >> 24) & 0xFF,
+               (mac >> 16) & 0xFF, (mac >>  8) & 0xFF,  mac        & 0xFF)
     }
 
     private nonisolated func log(_ msg: String) {

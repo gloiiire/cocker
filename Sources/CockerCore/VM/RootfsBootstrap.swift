@@ -16,23 +16,40 @@ import Foundation
 public enum RootfsBootstrap {
 
     // MARK: - /cocker-spec
+    //
+    // Wire format — length-prefixed binary, version 2. The old NUL-and-newline
+    // format broke whenever argv carried a literal newline (`bash -c "a\nb"`
+    // would be mis-parsed by cocker-init into argv + env). The new format is :
+    //
+    //   magic:    "COCKER\x02" (7 bytes — "COCKER" + version byte 0x02)
+    //   argc:     u32 BE
+    //   for each argv : u32 BE length, then bytes
+    //   envc:     u32 BE
+    //   for each env entry : u32 BE length, then bytes
+    //   wd_len:   u32 BE
+    //   wd:       bytes
+    //
+    // All length fields are unsigned big-endian 32-bit. Strings are UTF-8.
+    // Total size is bounded by the kernel cmdline (we don't enforce limits
+    // beyond what's reasonable).
 
-    /// Encode the container spec into the wire format cocker-init reads.
-    /// Three NUL-separated lines, each terminated by \n :
-    ///   argv0\0argv1\0...\n
-    ///   env0\0env1\0...\n
-    ///   workdir\n
+    /// Magic header for the v2 spec format. cocker-init's spec_load() reads
+    /// these 7 bytes first and refuses to proceed on mismatch.
+    public static let specMagic: [UInt8] = Array("COCKER\u{02}".utf8)
+
     public static func encodeSpec(command: [String],
                                   env: [String: String],
                                   workdir: String?) -> Data {
         var data = Data()
+        data.append(contentsOf: specMagic)
 
         // argv
-        for (i, arg) in command.enumerated() {
-            if i > 0 { data.append(0) }
-            data.append(arg.data(using: .utf8) ?? Data())
+        data.appendUInt32BE(UInt32(command.count))
+        for arg in command {
+            let bytes = Array(arg.utf8)
+            data.appendUInt32BE(UInt32(bytes.count))
+            data.append(contentsOf: bytes)
         }
-        data.append(0x0A)
 
         // env — inject sensible defaults if user didn't provide them
         var entries: [String] = []
@@ -43,17 +60,18 @@ public enum RootfsBootstrap {
         if env["TERM"] == nil { entries.append("TERM=xterm") }
         for (k, v) in env { entries.append("\(k)=\(v)") }
 
-        for (i, entry) in entries.enumerated() {
-            if i > 0 { data.append(0) }
-            data.append(entry.data(using: .utf8) ?? Data())
+        data.appendUInt32BE(UInt32(entries.count))
+        for entry in entries {
+            let bytes = Array(entry.utf8)
+            data.appendUInt32BE(UInt32(bytes.count))
+            data.append(contentsOf: bytes)
         }
-        data.append(0x0A)
 
-        // workdir — fall back to env["WORKDIR"] for backwards compat with
-        // older callers, then "/" if neither is set.
+        // workdir
         let wd = workdir ?? env["WORKDIR"] ?? "/"
-        data.append(wd.data(using: .utf8) ?? Data())
-        data.append(0x0A)
+        let wdBytes = Array(wd.utf8)
+        data.appendUInt32BE(UInt32(wdBytes.count))
+        data.append(contentsOf: wdBytes)
 
         return data
     }
@@ -117,3 +135,13 @@ public enum RootfsBootstrap {
             .write(to: path, atomically: true, encoding: .utf8)
     }
 }
+
+extension Data {
+    fileprivate mutating func appendUInt32BE(_ value: UInt32) {
+        append(UInt8((value >> 24) & 0xFF))
+        append(UInt8((value >> 16) & 0xFF))
+        append(UInt8((value >>  8) & 0xFF))
+        append(UInt8( value        & 0xFF))
+    }
+}
+

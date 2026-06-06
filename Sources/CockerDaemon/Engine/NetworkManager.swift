@@ -10,7 +10,7 @@ actor NetworkManager {
     private var allocatedIPs: [String: String] = [:]    // containerID -> IPv4
     private var allocatedIPv6s: [String: String] = [:]  // containerID -> IPv6
     private var allocatedCockerIPs: [String: String] = [:]  // containerID -> 10.42.x.x
-    private var cockerHostCounter: UInt16 = 2  // Next free host on 10.42.0.0/16 (skip .0 and .1=gateway)
+    private var cockerHostCounter: UInt16 = CockerSwitchAllocator.firstHost
 
     // Préfixe IPv6 pour les réseaux cocker : fd00:c0c4::/48
     private static let ipv6Prefix = "fd00:c0c4::"
@@ -146,27 +146,17 @@ actor NetworkManager {
 
     func allocateCockerIPAndMAC(for containerID: String) -> (ip: String, mac: String) {
         if let ip = allocatedCockerIPs[containerID] {
-            return (ip, Self.cockerMAC(forIP: ip))
+            return (ip, CockerSwitchAllocator.mac(forIP: ip))
         }
-        // Cap at 254 hosts per /24 segment, wrap to next segment up to 10.42.255.254
-        let host = cockerHostCounter
-        cockerHostCounter = (cockerHostCounter < 65534) ? cockerHostCounter + 1 : 2
-        let hi = UInt8((host >> 8) & 0xFF)
-        let lo = UInt8(host & 0xFF)
-        let ip = "10.42.\(hi).\(lo)"
+        let (host, next) = CockerSwitchAllocator.nextHost(from: cockerHostCounter)
+        cockerHostCounter = next
+        let ip = CockerSwitchAllocator.ip(forHost: host)
         allocatedCockerIPs[containerID] = ip
-        return (ip, Self.cockerMAC(forIP: ip))
+        return (ip, CockerSwitchAllocator.mac(forIP: ip))
     }
 
-    static func cockerMAC(forIP ip: String) -> String {
-        // "10.42.HI.LO" → "02:42:0a:2a:HI:LO"
-        let octets = ip.split(separator: ".").compactMap { UInt8($0) }
-        guard octets.count == 4 else { return "02:42:0a:2a:00:00" }
-        return String(format: "02:42:0a:2a:%02x:%02x", octets[2], octets[3])
-    }
-
-    static let cockerSwitchSubnet = "10.42.0.0/16"
-    static let cockerSwitchGateway = "10.42.0.1"  // virtual, no host actually answers
+    static let cockerSwitchSubnet = CockerSwitchAllocator.subnet
+    static let cockerSwitchGateway = CockerSwitchAllocator.gateway
 
     func allocateIPv6(for containerID: String, networkName: String = "bridge") -> String {
         if let existing = allocatedIPv6s[containerID] { return existing }

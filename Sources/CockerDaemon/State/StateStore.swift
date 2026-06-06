@@ -19,6 +19,30 @@ actor StateStore {
         try load()
     }
 
+    /// Reconcile persisted state with reality. cockerd loses its VM handles
+    /// every time the daemon restarts (kill -9 from a launchd reload, a
+    /// crash, sleep/wake, the user running `pkill cockerd`…). The container
+    /// records left in state.json then claim to be "running" even though no
+    /// VM exists. `cocker ps` shows phantom rows ; `cocker stop` fails with
+    /// "container is not running" ; `cocker rm` can't free the name. This
+    /// scrubs them at startup : every container marked .running or .paused
+    /// becomes .stopped with an exit code of -1 and a finishedAt timestamp.
+    /// Operators can `cocker rm` them or restart them normally.
+    func reconcileAfterRestart() throws {
+        var dirty = false
+        let now = Date()
+        for (id, container) in state.containers
+            where container.status == .running || container.status == .paused {
+            var c = container
+            c.status = .stopped
+            c.finishedAt = now
+            if c.exitCode == nil { c.exitCode = -1 }
+            state.containers[id] = c
+            dirty = true
+        }
+        if dirty { try save() }
+    }
+
     // MARK: - Persistence
 
     private func load() throws {
