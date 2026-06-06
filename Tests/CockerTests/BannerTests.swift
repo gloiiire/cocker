@@ -135,3 +135,27 @@ struct BannerANSIStyleTests {
         #expect(ANSIStyle.brightGreen.contains("92"))
     }
 }
+
+@Suite("Banner — I/O smoke tests")
+struct BannerIOTests {
+    /// Just confirm the I/O wrappers don't crash. Output gets captured by
+    /// the test runner so it doesn't pollute the suite output.
+    @Test func printCockerWelcomeDoesNotCrash() {
+        Banner.printCockerWelcome(version: "test-version")
+    }
+
+    @Test func printCockerdBannerDoesNotCrash() {
+        Banner.printCockerdBanner(
+            version: "test",
+            rootDir: "/tmp/cocker-test",
+            ipcSocket: "/tmp/cocker.sock",
+            dockerSocket: "/tmp/docker.sock",
+            dnsPort: 5300
+        )
+    }
+
+    @Test func stderrIsTTYReturnsBool() {
+        // Just exercise the path — value depends on test runner attachment.
+        _ = Banner.stderrIsTTY
+    }
+}
