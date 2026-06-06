@@ -1,24 +1,24 @@
 import Foundation
 
 // DNS packet parser/builder — RFC 1035
-// Handles A/AAAA queries, name compression, upstream forwarding
+// Handles A/AAAA queries, name compression. Pure, no I/O — transport
+// (UDP / TCP / vsock) lives in CockerDaemon.
 
-struct DNSHeader {
-    var id: UInt16
-    var flags: UInt16
-    var qdCount: UInt16
-    var anCount: UInt16
-    var nsCount: UInt16
-    var arCount: UInt16
+public struct DNSHeader: Sendable {
+    public var id: UInt16
+    public var flags: UInt16
+    public var qdCount: UInt16
+    public var anCount: UInt16
+    public var nsCount: UInt16
+    public var arCount: UInt16
 
-    // Flags helpers
-    var isQuery: Bool { (flags >> 15) & 1 == 0 }
-    var opcode: UInt8 { UInt8((flags >> 11) & 0xF) }
-    var isRecursionDesired: Bool { (flags >> 8) & 1 == 1 }
+    public var isQuery: Bool { (flags >> 15) & 1 == 0 }
+    public var opcode: UInt8 { UInt8((flags >> 11) & 0xF) }
+    public var isRecursionDesired: Bool { (flags >> 8) & 1 == 1 }
 
-    static let size = 12
+    public static let size = 12
 
-    init(data: Data) {
+    public init(data: Data) {
         id      = data.readUInt16BE(at: 0)
         flags   = data.readUInt16BE(at: 2)
         qdCount = data.readUInt16BE(at: 4)
@@ -27,7 +27,7 @@ struct DNSHeader {
         arCount = data.readUInt16BE(at: 10)
     }
 
-    func responseFlags(rcode: UInt8 = 0, authoritative: Bool = true) -> UInt16 {
+    public func responseFlags(rcode: UInt8 = 0, authoritative: Bool = true) -> UInt16 {
         var f: UInt16 = 0
         f |= (1 << 15)          // QR = response
         f |= UInt16(opcode) << 11
@@ -38,7 +38,7 @@ struct DNSHeader {
         return f
     }
 
-    func serialize() -> Data {
+    public func serialize() -> Data {
         var d = Data(count: 12)
         d.writeUInt16BE(id, at: 0)
         d.writeUInt16BE(flags, at: 2)
@@ -50,18 +50,22 @@ struct DNSHeader {
     }
 }
 
-struct DNSQuestion {
-    let name: String
-    let qtype: UInt16
-    let qclass: UInt16
-    let rawBytes: Data  // original bytes for copying into response
+public struct DNSQuestion: Sendable {
+    public let name: String
+    public let qtype: UInt16
+    public let qclass: UInt16
+    public let rawBytes: Data  // original bytes for copying into response
 
-    var isA:    Bool { qtype == 1  }
-    var isAAAA: Bool { qtype == 28 }
-    var isAny:  Bool { qtype == 255 }
+    public var isA:    Bool { qtype == 1  }
+    public var isAAAA: Bool { qtype == 28 }
+    public var isAny:  Bool { qtype == 255 }
+
+    public init(name: String, qtype: UInt16, qclass: UInt16, rawBytes: Data) {
+        self.name = name; self.qtype = qtype; self.qclass = qclass; self.rawBytes = rawBytes
+    }
 }
 
-enum DNSType: UInt16 {
+public enum DNSType: UInt16 {
     case A    = 1
     case AAAA = 28
     case PTR  = 12
@@ -70,7 +74,7 @@ enum DNSType: UInt16 {
 
 // MARK: - Packet parsing
 
-func parseDNSQuestions(from data: Data, count: Int) -> (questions: [DNSQuestion], bytesRead: Int) {
+public func parseDNSQuestions(from data: Data, count: Int) -> (questions: [DNSQuestion], bytesRead: Int) {
     var offset = DNSHeader.size
     var questions: [DNSQuestion] = []
 
@@ -91,7 +95,7 @@ func parseDNSQuestions(from data: Data, count: Int) -> (questions: [DNSQuestion]
     return (questions, offset)
 }
 
-func readDNSName(from data: Data, at startOffset: Int) -> (name: String, nextOffset: Int)? {
+public func readDNSName(from data: Data, at startOffset: Int) -> (name: String, nextOffset: Int)? {
     var labels: [String] = []
     var offset = startOffset
     var jumped = false
@@ -129,20 +133,20 @@ func readDNSName(from data: Data, at startOffset: Int) -> (name: String, nextOff
 
 // MARK: - Response building
 
-struct DNSResponseBuilder {
+public struct DNSResponseBuilder {
     private var data = Data()
 
-    mutating func appendHeader(_ header: DNSHeader) {
+    public init() {}
+
+    public mutating func appendHeader(_ header: DNSHeader) {
         data.append(header.serialize())
     }
 
-    // Copy raw question bytes
-    mutating func appendQuestion(_ question: DNSQuestion) {
+    public mutating func appendQuestion(_ question: DNSQuestion) {
         data.append(question.rawBytes)
     }
 
-    // A record answer: name pointer + type/class/ttl + IPv4
-    mutating func appendARecord(name pointer: UInt16 = 0xC00C, ip: String, ttl: UInt32 = 10) {
+    public mutating func appendARecord(name pointer: UInt16 = 0xC00C, ip: String, ttl: UInt32 = 10) {
         // NAME: pointer to question name
         data.writeUInt16BE(0xC000 | pointer, appendingAt: data.count)
         // TYPE: A (1)
@@ -159,8 +163,7 @@ struct DNSResponseBuilder {
         data.append(contentsOf: parts)
     }
 
-    // AAAA record answer: name pointer + type 28 + IPv6 (16 bytes)
-    mutating func appendAAAARecord(ip: String, ttl: UInt32 = 10) {
+    public mutating func appendAAAARecord(ip: String, ttl: UInt32 = 10) {
         // NAME: pointer to question name (0xC00C)
         data.writeUInt16BE(0xC00C, appendingAt: data.count)
         // TYPE: AAAA (28)
@@ -210,12 +213,13 @@ struct DNSResponseBuilder {
         return result
     }
 
-    mutating func build() -> Data { data }
+    public mutating func build() -> Data { data }
 }
 
-// MARK: - Upstream DNS forwarding
+// MARK: - Upstream DNS forwarding (lives in core for accessibility but uses
+// blocking sockets — only call from non-actor-isolated contexts).
 
-func forwardToUpstream(_ query: Data, upstream: String = "1.1.1.1", port: UInt16 = 53, timeout: TimeInterval = 2) -> Data? {
+public func forwardToUpstream(_ query: Data, upstream: String = "1.1.1.1", port: UInt16 = 53, timeout: TimeInterval = 2) -> Data? {
     let fd = socket(AF_INET, SOCK_DGRAM, 0)
     guard fd >= 0 else { return nil }
     defer { close(fd) }
