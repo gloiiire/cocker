@@ -141,13 +141,40 @@ struct KernelCommandLineTests {
 
 @Suite("Rootfs bootstrap — /cocker-spec")
 struct CockerSpecTests {
+    /// Mirror of cocker-init/spec.c — read magic, then length-prefixed
+    /// argv / env / workdir.
     private func parseSpec(_ data: Data) -> (argv: [String], env: [String], workdir: String) {
-        // Mirror cocker-init's parser : 3 lines, NUL-separated within each.
-        let parts = data.split(separator: 0x0A, omittingEmptySubsequences: false)
-        let argv = parts[0].split(separator: 0).map { String(data: Data($0), encoding: .utf8) ?? "" }
-        let env  = parts.count > 1 ? parts[1].split(separator: 0).map { String(data: Data($0), encoding: .utf8) ?? "" } : []
-        let wd   = parts.count > 2 ? (String(data: Data(parts[2]), encoding: .utf8) ?? "/") : "/"
-        return (argv, env, wd)
+        var i = 0
+        let bytes = Array(data)
+
+        // magic
+        precondition(bytes.count >= RootfsBootstrap.specMagic.count, "spec too short")
+        precondition(Array(bytes[0..<RootfsBootstrap.specMagic.count]) == RootfsBootstrap.specMagic, "magic mismatch")
+        i = RootfsBootstrap.specMagic.count
+
+        func readU32() -> Int {
+            let v = (Int(bytes[i]) << 24) | (Int(bytes[i+1]) << 16)
+                  | (Int(bytes[i+2]) << 8) |  Int(bytes[i+3])
+            i += 4
+            return v
+        }
+        func readString() -> String {
+            let len = readU32()
+            let slice = Array(bytes[i..<(i + len)])
+            i += len
+            return String(data: Data(slice), encoding: .utf8) ?? ""
+        }
+
+        var argv: [String] = []
+        let argc = readU32()
+        for _ in 0..<argc { argv.append(readString()) }
+
+        var env: [String] = []
+        let envc = readU32()
+        for _ in 0..<envc { env.append(readString()) }
+
+        let wd = readString()
+        return (argv, env, wd.isEmpty ? "/" : wd)
     }
 
     @Test func encodeSpecRoundtripsArgv() {
@@ -158,6 +185,27 @@ struct CockerSpecTests {
         )
         let parsed = parseSpec(data)
         #expect(parsed.argv == ["/bin/sh", "-c", "echo hi && exit 0"])
+    }
+
+    @Test func encodeSpecCarriesNewlinesInArgv() {
+        // The v1 format broke on this — newlines were interpreted as line
+        // separators. v2 length-prefixed encoding handles any byte.
+        let cmd = ["/bin/bash", "-c", "set -e\necho line1\necho line2\nexit 0"]
+        let data = RootfsBootstrap.encodeSpec(command: cmd, env: [:], workdir: nil)
+        let parsed = parseSpec(data)
+        #expect(parsed.argv == cmd)
+    }
+
+    @Test func encodeSpecCarriesNullBytesAndQuotesInArgv() {
+        let cmd = ["/bin/echo", "weird \"quoted\" 'arg'"]
+        let data = RootfsBootstrap.encodeSpec(command: cmd, env: [:], workdir: nil)
+        let parsed = parseSpec(data)
+        #expect(parsed.argv == cmd)
+    }
+
+    @Test func encodeSpecStartsWithMagic() {
+        let data = RootfsBootstrap.encodeSpec(command: ["sh"], env: [:], workdir: nil)
+        #expect(Array(data.prefix(RootfsBootstrap.specMagic.count)) == RootfsBootstrap.specMagic)
     }
 
     @Test func encodeSpecInjectsDefaultPath() {

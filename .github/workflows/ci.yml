@@ -147,3 +147,63 @@ jobs:
         # casser la CI pendant qu'on stabilise la base. Retirer le `|| true`
         # quand le code est formaté.
         run: swift-format lint --recursive Sources/ Tests/ || true
+
+  sbom:
+    name: Software Bill of Materials (syft)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install syft
+        run: |
+          if ! command -v syft >/dev/null 2>&1; then
+            curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          fi
+          syft version
+      - name: Generate SBOM (CycloneDX) for the repo
+        run: |
+          syft scan dir:. -o cyclonedx-json=sbom.cdx.json -o spdx-json=sbom.spdx.json
+          echo "## SBOM (top-level Swift packages)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          syft scan dir:. -o table | head -30 >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom.cdx.json
+            sbom.spdx.json
+
+  vuln-scan:
+    name: Vulnerability scan (trivy)
+    runs-on: macos-15
+    needs: sbom
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install trivy
+        run: |
+          if ! command -v trivy >/dev/null 2>&1; then
+            brew install trivy
+          fi
+          trivy --version
+      - name: Scan repository (config + secrets + dependencies)
+        # Fails on HIGH or CRITICAL findings. Skip license check for now,
+        # adopt later when we have a license policy.
+        run: |
+          trivy fs --severity HIGH,CRITICAL \
+                   --scanners vuln,secret,misconfig \
+                   --exit-code 1 \
+                   --skip-dirs .build,.git,Tests/CockerTests \
+                   . | tee trivy.txt
+          {
+            echo '## Trivy scan (HIGH + CRITICAL)'
+            echo '```'
+            cat trivy.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy
+          path: trivy.txt
