@@ -32,9 +32,39 @@ jobs:
             ${{ runner.os }}-spm-
       - name: swift build (debug)
         run: swift build
-      - name: swift test
-        # Fail si un test plante. Les 21 tests existants doivent passer.
-        run: swift test --parallel
+      - name: swift test + coverage gate (85%)
+        # Fails the build if line coverage drops below 85% (ratchet — never
+        # go down). Excluded paths (cannot be unit-tested without VM/network) :
+        #   - OCI/Registry (live HTTPS to Docker Hub)
+        #   - OCI/ImageStore (touches the filesystem rootfs/blobs layout)
+        #   - IPC/Transport (Unix socket connect to a running daemon)
+        run: |
+          swift test --parallel --enable-code-coverage
+
+          BIN="$(find .build -path '*CockerPackageTests.xctest/Contents/MacOS/CockerPackageTests' | head -1)"
+          PROF="$(find .build -name 'default.profdata' | head -1)"
+          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport)'
+
+          xcrun llvm-cov report "$BIN" -instr-profile="$PROF" \
+            -ignore-filename-regex="$IGNORE" \
+            | tee coverage.txt
+
+          # Extract the TOTAL line coverage percentage (last column after lines column)
+          COV=$(awk '/^TOTAL/ { gsub("%","",$10); print $10 }' coverage.txt)
+          echo "Line coverage: ${COV}%"
+          # Use python for float comparison so we don't depend on bc
+          MEET=$(python3 -c "print('yes' if float('${COV}') >= 85 else 'no')")
+          if [ "$MEET" != "yes" ]; then
+            echo "::error::Line coverage ${COV}% < 85% threshold"
+            exit 1
+          fi
+          {
+            echo '## Test coverage'
+            echo ''
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   swift-build-release:
     name: Swift build release
