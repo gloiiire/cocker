@@ -22,11 +22,18 @@ final class VMRuntime: NSObject {
     private let kernelPath: URL
     private let initrdPath: URL
     private let rootDir: URL
+    let l2Switch: L2Switch
+    // Injected by ContainerEngine after DNSServer exists. Registered on each
+    // VM's socket device right after the VM boots so the in-VM DNS proxy
+    // can reach cockerd over vsock instead of UDP/TCP via vmnet (which the
+    // App Sandbox blocks for user-signed daemons).
+    var dnsVsockListener: VZVirtioSocketListener?
 
-    init(rootDir: URL) throws {
+    init(rootDir: URL, l2Switch: L2Switch) throws {
         self.rootDir = rootDir
         self.kernelPath = rootDir.appendingPathComponent("kernel/vmlinuz")
         self.initrdPath = rootDir.appendingPathComponent("kernel/initrd.img")
+        self.l2Switch = l2Switch
         super.init()
     }
 
@@ -49,7 +56,7 @@ final class VMRuntime: NSObject {
 
     // MARK: - VM creation
 
-    func createVM(for container: Container, rootfsPath: URL, stdoutPipe: Pipe) throws -> VZVirtualMachine {
+    func createVM(for container: Container, rootfsPath: URL, stdoutPipe: Pipe) async throws -> VZVirtualMachine {
         fputs("[vm] createVM enter\n", stderr); fflush(stderr)
         let config = VZVirtualMachineConfiguration()
 
@@ -129,7 +136,7 @@ final class VMRuntime: NSObject {
 
         config.directorySharingDevices = fsDevices
 
-        // Network
+        // eth0 — outbound NAT to the internet (Apple-managed vmnet)
         let netDevice = VZVirtioNetworkDeviceConfiguration()
         switch container.networkMode {
         case .nat, .host:
@@ -144,8 +151,30 @@ final class VMRuntime: NSObject {
             }
         }
 
+        var netDevices: [VZVirtioNetworkDeviceConfiguration] = []
         if container.networkMode != .none {
-            config.networkDevices = [netDevice]
+            netDevices.append(netDevice)
+        }
+
+        // eth1 — inter-container fabric routed through the userspace L2 switch.
+        // We only add it when networking is enabled AND the container has a
+        // cocker switch IP/MAC allocated (it always does for normal runs).
+        if container.networkMode != .none,
+           let macStr = container.cockerMAC,
+           let fh = await l2Switch.addPort(containerID: container.id, staticMAC: macStr) {
+            let switchDev = VZVirtioNetworkDeviceConfiguration()
+            let attach = VZFileHandleNetworkDeviceAttachment(fileHandle: fh)
+            attach.maximumTransmissionUnit = L2Switch.mtu
+            switchDev.attachment = attach
+            if let macAddr = VZMACAddress(string: macStr) {
+                switchDev.macAddress = macAddr
+            }
+            netDevices.append(switchDev)
+            fputs("[vm] eth1 attached to L2 switch (mac=\(macStr))\n", stderr); fflush(stderr)
+        }
+
+        if !netDevices.isEmpty {
+            config.networkDevices = netDevices
         }
 
         // Socket device (vsock for exec, health checks)
@@ -181,10 +210,20 @@ final class VMRuntime: NSObject {
             "cocker.name=\(container.name)",
             "cocker.dns=\(dnsIP)",
             "cocker.dns_port=\(dnsPort)",
+            "cocker.dns_vsock_port=5353",
         ]
 
         if let hostname = container.hostname.isEmpty ? nil : container.hostname {
             parts.append("cocker.hostname=\(hostname)")
+        }
+
+        // L2 switch (eth1) — inter-container fabric. cocker-init brings up
+        // eth1 statically with this IP. Gateway is virtual (no host answers
+        // ARP for it) but Linux needs one to consider the subnet usable.
+        if let cIP = container.cockerIP, let cMAC = container.cockerMAC {
+            parts.append("cocker.cnet_ip=\(cIP)/16")
+            parts.append("cocker.cnet_gw=\(NetworkManager.cockerSwitchGateway)")
+            parts.append("cocker.cnet_mac=\(cMAC)")
         }
 
         // La commande container et les env vars sont écrites dans /cocker-spec
@@ -254,7 +293,7 @@ final class VMRuntime: NSObject {
 
         // Crée et démarre la VM
         let pipe = Pipe()
-        let vm = try createVM(for: container, rootfsPath: rootfsPath, stdoutPipe: pipe)
+        let vm = try await createVM(for: container, rootfsPath: rootfsPath, stdoutPipe: pipe)
 
         // Capture la sortie via une closure (qui doit être appelée sans capture
         // d'actor pour pouvoir l'invoquer depuis le readability handler).
@@ -331,7 +370,7 @@ final class VMRuntime: NSObject {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()  // réservé pour usage futur
 
-        let vm = try createVM(for: container, rootfsPath: rootfsPath, stdoutPipe: stdoutPipe)
+        let vm = try await createVM(for: container, rootfsPath: rootfsPath, stdoutPipe: stdoutPipe)
         fputs("[vm] createVM OK\n", stderr); fflush(stderr)
 
         let runningVM = RunningVM(
@@ -354,6 +393,15 @@ final class VMRuntime: NSObject {
                     continuation.resume(throwing: CockerError.vmStartFailed(error.localizedDescription))
                 }
             }
+        }
+
+        // Register the DNS vsock listener on this VM's socket device. Done
+        // after start so vm.socketDevices is populated. Same listener
+        // instance is shared across all VMs.
+        if let listener = dnsVsockListener,
+           let socketDev = vm.socketDevices.first as? VZVirtioSocketDevice {
+            socketDev.setSocketListener(listener, forPort: 5353)
+            fputs("[vm] DNS vsock listener attached on port 5353\n", stderr); fflush(stderr)
         }
     }
 
@@ -402,6 +450,7 @@ final class VMRuntime: NSObject {
         }
 
         runningVMs.removeValue(forKey: containerID)
+        await l2Switch.removePort(containerID: containerID)
     }
 
     func pause(containerID: String) async throws {
