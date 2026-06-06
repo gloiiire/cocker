@@ -31,6 +31,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <errno.h>
+#include <linux/vm_sockets.h>  /* AF_VSOCK, struct sockaddr_vm */
 
 #define die(fmt, ...) do { \
     fprintf(stderr, "[cocker-init] FATAL: " fmt "\n", ##__VA_ARGS__); \
@@ -118,6 +119,123 @@ static int parse_argv(char *cmd, char **argv, int max) {
     }
     argv[argc] = NULL;
     return argc;
+}
+
+/* Tiny inline DNS proxy.
+ *
+ * Apps in the container read /etc/resolv.conf which has no port column, so
+ * they query 127.0.0.1:53. We spawn this proxy as a child of PID 1, bind
+ * UDP 0.0.0.0:53 (works because PID 1 runs as root) and tunnel every
+ * datagram to cockerd over vsock (DNS-over-TCP framing, RFC 1035 §4.2.2).
+ *
+ * Why vsock and not TCP/UDP via vmnet : Apple's App Sandbox silently
+ * drops payload data from the vmnet kernel extension to user-signed
+ * daemons (cockerd). UDP packets are dropped outright ; TCP accept()
+ * succeeds but read() returns 0 immediately. vsock bypasses vmnet —
+ * it's a direct host↔VM channel via Apple's Virtualization.framework.
+ *
+ * Iterative — fine for a sub-second resolution rate. Child runs forever
+ * until VM shutdown sends SIGTERM.
+ */
+/* Forward a DNS query to the host's cockerd resolver via vsock.
+ *
+ * Wire format : DNS-over-TCP (RFC 1035 §4.2.2) — 2-byte length prefix,
+ * then the DNS message. cockerd's VZVirtioSocketListener on port 5353
+ * accepts one connection per query. AF_VSOCK CID 2 = the host. */
+static int dns_vsock_forward(unsigned int vsock_port,
+                             const char *query, size_t qlen,
+                             char *response, size_t resp_max) {
+    int sfd = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (sfd < 0) return -1;
+
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_vm dst;
+    memset(&dst, 0, sizeof(dst));
+    dst.svm_family = AF_VSOCK;
+    dst.svm_cid = 2;  /* VMADDR_CID_HOST */
+    dst.svm_port = vsock_port;
+
+    if (connect(sfd, (struct sockaddr *)&dst, sizeof(dst)) < 0) { close(sfd); return -1; }
+
+    unsigned char prefix[2] = {
+        (unsigned char)((qlen >> 8) & 0xFF),
+        (unsigned char)(qlen & 0xFF)
+    };
+    if (write(sfd, prefix, 2) != 2) { close(sfd); return -1; }
+    ssize_t w = 0;
+    while ((size_t)w < qlen) {
+        ssize_t n = write(sfd, query + w, qlen - w);
+        if (n <= 0) { close(sfd); return -1; }
+        w += n;
+    }
+
+    unsigned char rp[2];
+    ssize_t pr = 0;
+    while (pr < 2) {
+        ssize_t n = read(sfd, rp + pr, 2 - pr);
+        if (n <= 0) { close(sfd); return -1; }
+        pr += n;
+    }
+    size_t resp_len = ((size_t)rp[0] << 8) | rp[1];
+    if (resp_len == 0 || resp_len > resp_max) { close(sfd); return -1; }
+
+    ssize_t rr = 0;
+    while ((size_t)rr < resp_len) {
+        ssize_t n = read(sfd, response + rr, resp_len - rr);
+        if (n <= 0) { close(sfd); return -1; }
+        rr += n;
+    }
+    close(sfd);
+    return (int)resp_len;
+}
+
+static void start_dns_proxy(unsigned int vsock_port) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        info("dns-proxy fork: %s", strerror(errno));
+        return;
+    }
+    if (pid != 0) {
+        info("dns-proxy spawned (pid=%d, upstream=vsock CID=2 port=%u)",
+             pid, vsock_port);
+        return;
+    }
+
+    int listen_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (listen_fd < 0) _exit(1);
+
+    int yes = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in laddr;
+    memset(&laddr, 0, sizeof(laddr));
+    laddr.sin_family = AF_INET;
+    laddr.sin_port = htons(53);
+    laddr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(listen_fd, (struct sockaddr *)&laddr, sizeof(laddr)) < 0) {
+        fprintf(stderr, "[cocker-init] dns-proxy bind :53: %s\n",
+                strerror(errno));
+        _exit(1);
+    }
+
+    char query[65536];
+    char response[65536];
+    while (1) {
+        struct sockaddr_in client;
+        socklen_t cl = sizeof(client);
+        ssize_t n = recvfrom(listen_fd, query, sizeof(query), 0,
+                             (struct sockaddr *)&client, &cl);
+        if (n <= 0) continue;
+
+        int m = dns_vsock_forward(vsock_port, query, (size_t)n,
+                                  response, sizeof(response));
+        if (m <= 0) continue;  // silent ; cockerd may be temporarily down
+
+        sendto(listen_fd, response, m, 0, (struct sockaddr *)&client, cl);
+    }
 }
 
 /* Mount the virtiofs rootfs tag "root" at /newroot, then switch_root */
@@ -237,10 +355,18 @@ int main(int argc, char **argv) {
      * forwarding TCP host → container.
      */
     {
-        /* Up de eth0 (ifconfig eth0 up) */
+        /* Up de lo (loopback) — sinon le DNS proxy à 127.0.0.1:53 est
+         * inatteignable depuis la même VM. */
         int up_sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (up_sock >= 0) {
             struct ifreq ifr;
+            memset(&ifr, 0, sizeof(ifr));
+            strncpy(ifr.ifr_name, "lo", IFNAMSIZ - 1);
+            if (ioctl(up_sock, SIOCGIFFLAGS, &ifr) == 0) {
+                ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+                ioctl(up_sock, SIOCSIFFLAGS, &ifr);
+            }
+            /* Up de eth0 (ifconfig eth0 up) */
             memset(&ifr, 0, sizeof(ifr));
             strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
             if (ioctl(up_sock, SIOCGIFFLAGS, &ifr) == 0) {
@@ -281,6 +407,35 @@ int main(int argc, char **argv) {
             info("no DHCP client found (udhcpc/dhclient), trying static IP read");
         }
 
+        /* udhcpc overwrites /etc/resolv.conf with the vmnet gateway DNS
+         * (192.168.64.1) which short-circuits container name resolution.
+         * We instead point libc at our local DNS proxy on 127.0.0.1:53.
+         * The proxy tunnels every query to cockerd's vsock DNS listener
+         * (host CID=2, port from cocker.dns_vsock_port — default 5353). */
+        {
+            char *vsock_port_s = cmdline_get(cmdline, "dns_vsock_port");
+            unsigned int vsock_port = vsock_port_s ? (unsigned int)atoi(vsock_port_s) : 5353;
+            if (vsock_port == 0) vsock_port = 5353;
+
+            start_dns_proxy(vsock_port);
+
+            int rc_fd = open("/etc/resolv.conf",
+                             O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (rc_fd >= 0) {
+                const char *rc =
+                    "# generated by cocker-init (post-DHCP)\n"
+                    "nameserver 127.0.0.1\n"
+                    "search cocker\n"
+                    "options ndots:0 timeout:1 attempts:2\n";
+                write(rc_fd, rc, strlen(rc));
+                close(rc_fd);
+                info("pinned /etc/resolv.conf to 127.0.0.1 "
+                     "(proxy → vsock CID=2 port=%u)", vsock_port);
+            }
+
+            if (vsock_port_s) free(vsock_port_s);
+        }
+
         /* Lit l'IP eth0 — retry rapide au cas où DHCP en cours */
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock >= 0) {
@@ -308,6 +463,72 @@ int main(int argc, char **argv) {
             } else {
                 info("no IP on eth0 after DHCP attempt");
             }
+        }
+    }
+
+    /* eth1 — cocker L2 switch fabric (10.42.0.0/16).
+     *
+     * Configured statically from the kernel cmdline. cockerd allocates IP +
+     * MAC for each container and runs a userspace L2 switch on the host that
+     * forwards Ethernet frames between containers. This interface is what
+     * makes container-to-container networking work — Apple's vmnet on eth0
+     * isolates VMs from each other, but eth1 sees all peer containers
+     * directly. No gateway is reachable on this fabric (cockerd doesn't
+     * answer ARP for 10.42.0.1) — it's a flat inter-container LAN only.
+     *
+     * If cocker.cnet_ip is absent (old daemon, --net=none, etc.) we skip
+     * eth1 setup silently.
+     */
+    {
+        char *cnet_ip = cmdline_get(cmdline, "cnet_ip");
+        if (cnet_ip) {
+            /* "10.42.0.5/16" → strip the prefix length */
+            char *slash = strchr(cnet_ip, '/');
+            if (slash) *slash = '\0';
+
+            int sock = socket(AF_INET, SOCK_DGRAM, 0);
+            if (sock >= 0) {
+                struct ifreq ifr;
+
+                /* Bring eth1 up */
+                memset(&ifr, 0, sizeof(ifr));
+                strncpy(ifr.ifr_name, "eth1", IFNAMSIZ - 1);
+                if (ioctl(sock, SIOCGIFFLAGS, &ifr) == 0) {
+                    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+                    if (ioctl(sock, SIOCSIFFLAGS, &ifr) != 0)
+                        info("ifup eth1: %s", strerror(errno));
+                } else {
+                    info("eth1 SIOCGIFFLAGS: %s (no switch fabric ?)", strerror(errno));
+                }
+
+                /* Set IP */
+                memset(&ifr, 0, sizeof(ifr));
+                strncpy(ifr.ifr_name, "eth1", IFNAMSIZ - 1);
+                {
+                    struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
+                    sin->sin_family = AF_INET;
+                    if (inet_pton(AF_INET, cnet_ip, &sin->sin_addr) == 1) {
+                        if (ioctl(sock, SIOCSIFADDR, &ifr) != 0)
+                            info("eth1 SIOCSIFADDR: %s", strerror(errno));
+                        else
+                            info("eth1 IP=%s/16", cnet_ip);
+                    }
+                }
+
+                /* Netmask 255.255.0.0 (/16) */
+                memset(&ifr, 0, sizeof(ifr));
+                strncpy(ifr.ifr_name, "eth1", IFNAMSIZ - 1);
+                {
+                    struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_netmask;
+                    sin->sin_family = AF_INET;
+                    sin->sin_addr.s_addr = htonl(0xFFFF0000);
+                    if (ioctl(sock, SIOCSIFNETMASK, &ifr) != 0)
+                        info("eth1 SIOCSIFNETMASK: %s", strerror(errno));
+                }
+
+                close(sock);
+            }
+            free(cnet_ip);
         }
     }
 
