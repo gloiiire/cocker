@@ -1,13 +1,36 @@
 name: sync-homebrew-tap
 
+# Sur chaque tag vX.Y.Z, met à jour la formule du tap Homebrew.
+#
+# Branch protection sur homebrew-cocker/main exige PR + commits signés.
+# Pour respecter ça SANS clé GPG locale au bot, on passe par l'API GitHub
+# /repos/.../contents/{path} qui produit un commit signé par "GitHub web
+# flow" (la clé que GitHub utilise pour signer ce qu'on édite via l'UI web).
+#
+# Flow :
+#   1. Crée une branche bump/vX.Y.Z depuis main
+#   2. PUT contents → commit signé sur la branche
+#   3. Crée la PR
+#   4. Auto-merge (squash) — le merge final est aussi signé
+#
+# PAT requis (HOMEBREW_TAP_TOKEN) — fine-grained sur gloiiire/homebrew-cocker :
+#   - Contents       : Read and write
+#   - Pull requests  : Read and write
+
 on:
   push:
     tags:
       - 'v*.*.*'
 
+permissions: {}
+
 jobs:
   bump-tap:
     runs-on: ubuntu-latest
+    env:
+      TAP_OWNER: gloiiire
+      TAP_REPO: homebrew-cocker
+      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
       - name: Resolve tag + tarball SHA256
         id: meta
@@ -27,11 +50,12 @@ jobs:
           test -s /tmp/source.tar.gz || { echo "Tarball never appeared at $URL"; exit 1; }
 
           SHA=$(sha256sum /tmp/source.tar.gz | awk '{print $1}')
+          BRANCH="bump/${TAG}"
           {
             echo "tag=$TAG"
             echo "version=$VERSION"
-            echo "url=$URL"
             echo "sha=$SHA"
+            echo "branch=$BRANCH"
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout source (for source-of-truth Formula)
@@ -39,31 +63,92 @@ jobs:
         with:
           path: source
 
-      - name: Checkout tap
-        uses: actions/checkout@v4
-        with:
-          repository: gloiiire/homebrew-cocker
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: tap
-
-      - name: Update formula in tap
+      - name: Build patched formula
+        id: build
         run: |
-          cp source/Formula/cocker.rb tap/Formula/cocker.rb
-          cd tap
-          sed -i -E "s|^(  version ).*|\1\"${{ steps.meta.outputs.version }}\"|" Formula/cocker.rb
-          sed -i -E "s|^(  sha256 ).*|\1\"${{ steps.meta.outputs.sha }}\"|" Formula/cocker.rb
-          echo "--- Formula/cocker.rb (head) ---"
-          head -10 Formula/cocker.rb
+          cp source/Formula/cocker.rb /tmp/cocker.rb
+          sed -i -E "s|^(  version ).*|\1\"${{ steps.meta.outputs.version }}\"|" /tmp/cocker.rb
+          sed -i -E "s|^(  sha256 ).*|\1\"${{ steps.meta.outputs.sha }}\"|" /tmp/cocker.rb
+          echo "--- patched Formula/cocker.rb (head) ---"
+          head -10 /tmp/cocker.rb
+          # Base64 single-line pour l'API GitHub
+          base64 -w 0 /tmp/cocker.rb > /tmp/cocker.rb.b64
 
-      - name: Commit + push to tap
+      - name: Create branch + commit via API (signed by GitHub web-flow)
+        id: pr
         run: |
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Formula/cocker.rb
-          if git diff --cached --quiet; then
-            echo "Tap formula already up to date."
-            exit 0
+          set -euo pipefail
+          API="https://api.github.com/repos/${TAP_OWNER}/${TAP_REPO}"
+          BRANCH="${{ steps.meta.outputs.branch }}"
+          VERSION="${{ steps.meta.outputs.version }}"
+
+          # 1. SHA HEAD de main
+          MAIN_SHA=$(gh api "${API}/git/refs/heads/main" --jq .object.sha)
+          echo "main HEAD: $MAIN_SHA"
+
+          # 2. SHA actuel du fichier Formula/cocker.rb (requis pour PUT contents)
+          CURRENT_FILE_SHA=$(gh api "${API}/contents/Formula/cocker.rb?ref=main" --jq .sha)
+          echo "current file SHA: $CURRENT_FILE_SHA"
+
+          # 3. Crée la branche bump/vX.Y.Z (si elle existe pas déjà)
+          if ! gh api "${API}/git/refs/heads/${BRANCH}" >/dev/null 2>&1; then
+            gh api --method POST "${API}/git/refs" \
+              -f ref="refs/heads/${BRANCH}" \
+              -f sha="${MAIN_SHA}" >/dev/null
+            echo "Created branch ${BRANCH}"
+          else
+            echo "Branch ${BRANCH} already exists, will overwrite the file there"
           fi
-          git commit -m "cocker ${{ steps.meta.outputs.version }}"
-          git push
+
+          # 4. PUT contents — commit signé par GitHub web-flow
+          CONTENT=$(cat /tmp/cocker.rb.b64)
+          RESPONSE=$(gh api --method PUT "${API}/contents/Formula/cocker.rb" \
+            -f message="cocker ${VERSION}" \
+            -f content="${CONTENT}" \
+            -f branch="${BRANCH}" \
+            -f sha="${CURRENT_FILE_SHA}")
+          NEW_COMMIT=$(echo "$RESPONSE" | jq -r .commit.sha)
+          echo "Signed commit created: $NEW_COMMIT"
+
+          # 5. Crée la PR (si pas déjà existante pour cette branche)
+          EXISTING_PR=$(gh api "${API}/pulls?head=${TAP_OWNER}:${BRANCH}&state=open" --jq '.[0].number // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            PR_NUMBER="$EXISTING_PR"
+            echo "PR #${PR_NUMBER} already open, reusing"
+          else
+            PR_NUMBER=$(gh api --method POST "${API}/pulls" \
+              -f title="cocker ${VERSION}" \
+              -f head="${BRANCH}" \
+              -f base="main" \
+              -f body="Automated formula bump for cocker ${VERSION}.
+
+          Source: https://github.com/${{ github.repository }}/releases/tag/${{ steps.meta.outputs.tag }}
+          Tarball SHA256: \`${{ steps.meta.outputs.sha }}\`
+
+          Generated by sync-homebrew-tap.yml workflow." \
+              --jq .number)
+            echo "Opened PR #${PR_NUMBER}"
+          fi
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Auto-merge PR (squash, signed)
+        run: |
+          set -e
+          API="https://api.github.com/repos/${TAP_OWNER}/${TAP_REPO}"
+          PR="${{ steps.pr.outputs.pr_number }}"
+
+          # Wait briefly for any required checks (none on this tap, but safe)
+          sleep 3
+
+          # Merge via API — squash & sign avec GitHub web-flow
+          gh api --method PUT "${API}/pulls/${PR}/merge" \
+            -f merge_method=squash \
+            -f commit_title="cocker ${{ steps.meta.outputs.version }}" \
+            -f commit_message="Automated bump from gloiiire/cocker tag ${{ steps.meta.outputs.tag }}.
+
+          🤖 GitHub web-flow signed."
+
+          echo "PR #${PR} merged."
+
+          # Cleanup branche bump
+          gh api --method DELETE "${API}/git/refs/heads/${{ steps.meta.outputs.branch }}" || true
