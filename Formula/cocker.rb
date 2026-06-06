@@ -41,13 +41,19 @@ class Cocker < Formula
     bin.install ".build/release/cockerd"
     bin.install ".build/release/cocker-portfwd"
 
-    # 4. Generate + install man pages (one per subcommand).
-    # `swift package` doesn't accept `--disable-sandbox` — that's a
-    # `swift build` flag. The package plugin runs in its own sandbox-aware
-    # mode and just needs the writes-to-package permission.
-    system "swift", "package", "--allow-writing-to-package-directory",
-           "generate-manual", "--multi-page"
-    man1.install Dir[".build/plugins/GenerateManual/outputs/CockerCLI/*.1"]
+    # 4. Generate + install man pages (best-effort).
+    # The plugin tries to install its own sandbox via sandbox-exec, which
+    # gets denied by Homebrew's outer sandbox (`sandbox_apply: Operation
+    # not permitted`). When that happens we silently skip — man pages are
+    # nice-to-have, not load-bearing for the install to succeed.
+    if system "swift", "package", "--allow-writing-to-package-directory",
+              "generate-manual", "--multi-page"
+      man1.install Dir[".build/plugins/GenerateManual/outputs/CockerCLI/*.1"]
+    else
+      opoo "man page generation failed (likely Homebrew sandbox vs. swift " \
+           "plugin) — proceeding without ; run `swift package generate-manual " \
+           "--multi-page` from a source checkout to produce them manually."
+    end
 
     # 5. Stage entitlements + initrd for post_install
     (share/"cocker").install "entitlements/cockerd.entitlements"
