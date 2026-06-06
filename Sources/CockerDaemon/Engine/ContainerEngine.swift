@@ -10,6 +10,7 @@ final class ContainerEngine {
     let volumes: VolumeManager
     let state: StateStore
     let vmRuntime: VMRuntime
+    let portForwarder: PortForwarder
     private let rootDir: URL
     var dnsServer: DNSServer?  // injecté par main après init
 
@@ -23,6 +24,7 @@ final class ContainerEngine {
         self.networks = try await NetworkManager(store: state)
         self.volumes = VolumeManager(store: state, rootDir: rootDir)
         self.vmRuntime = try VMRuntime(rootDir: rootDir)
+        self.portForwarder = PortForwarder()
     }
 
     // MARK: - Container lifecycle
@@ -89,9 +91,15 @@ final class ContainerEngine {
         fputs("[eng] event emitted\n", stderr); fflush(stderr)
 
         // Start VM
-        fputs("[eng] resolving rootfs path\n", stderr); fflush(stderr)
-        let rootfsPath = try await images.rootfsPath(for: config.image)
-        fputs("[eng] rootfs=\(rootfsPath.path)\n", stderr); fflush(stderr)
+        // Overlay rootfs : clone le rootfs de l'image vers un dossier propre
+        // au container via APFS clonefile. Garantit l'isolation fs entre
+        // containers de la même image (sinon ils écrivent dans le même rootfs
+        // partagé — bug du PoC initial visible sur compose db+web).
+        fputs("[eng] cloning rootfs (APFS copy-on-write)\n", stderr); fflush(stderr)
+        // S'assure que l'image a un rootfs extrait (pull-on-demand)
+        _ = try await images.rootfsPath(for: config.image)
+        let rootfsPath = try await images.cloneRootfs(for: config.image, containerID: id)
+        fputs("[eng] container rootfs=\(rootfsPath.path)\n", stderr); fflush(stderr)
         fputs("[eng] calling vmRuntime.start\n", stderr); fflush(stderr)
         try await vmRuntime.start(container: container, rootfsPath: rootfsPath)
         fputs("[eng] vmRuntime.start returned\n", stderr); fflush(stderr)
@@ -107,9 +115,39 @@ final class ContainerEngine {
             try? await networks.connect(containerID: id, networkID: networkName)
         }
 
-        // Configure port forwarding
+        // Démarre le port forwarding TCP (host port → container IP:port)
+        // via le PortForwarder Swift. NAT vmnet est outbound-only sans ça.
+        //
+        // cocker-init écrit l'IP DHCP réelle du container dans /cocker-ip
+        // du rootfs (visible via virtiofs côté host). On poll ce fichier
+        // pour récupérer l'IP — placeholder "127.0.0.1" si non dispo.
         if !ports.isEmpty {
-            await networks.configurePortForwarding(containerID: id, ports: ports)
+            fputs("[eng] scheduling IP discovery task for ports: \(ports.map { $0.description }.joined(separator: ","))\n", stderr); fflush(stderr)
+            Task { [rootfsPath, ports, id] in
+                fputs("[eng] IP discovery task started for \(id)\n", stderr); fflush(stderr)
+                let ipFile = rootfsPath.appendingPathComponent("cocker-ip")
+                fputs("[eng] polling \(ipFile.path)\n", stderr); fflush(stderr)
+                var realIP: String? = nil
+                for attempt in 0..<150 {  // 15s timeout (100ms × 150)
+                    if FileManager.default.fileExists(atPath: ipFile.path),
+                       let data = try? Data(contentsOf: ipFile),
+                       let ip = String(data: data, encoding: .utf8)?
+                                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                       !ip.isEmpty {
+                        realIP = ip
+                        fputs("[eng] IP read on attempt \(attempt): \(ip)\n", stderr); fflush(stderr)
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                let finalIP = realIP ?? "127.0.0.1"
+                fputs("[eng] container IP discovered: \(finalIP) (ports: \(ports.map { $0.description }.joined(separator: ", ")))\n", stderr); fflush(stderr)
+                // Update state with real IP
+                try? await self.state.updateContainer(id: id) { c in c.ip = finalIP }
+                fputs("[eng] state updated, calling portForwarder.start\n", stderr); fflush(stderr)
+                await self.portForwarder.start(containerID: id, containerIP: finalIP, mappings: ports)
+                fputs("[eng] portForwarder.start returned\n", stderr); fflush(stderr)
+            }
         }
 
         // Watch VM for exit (in background)
@@ -130,7 +168,17 @@ final class ContainerEngine {
             throw CockerError.containerAlreadyRunning(id)
         }
 
-        let rootfsPath = try await images.rootfsPath(for: container.image)
+        // Réutilise le rootfs cloné du container (créé au run initial).
+        // S'il n'existe plus (cleanup, premier start après crash daemon),
+        // on le re-clone depuis l'image source.
+        let containerRootfs = await images.store.containerRootfsDirectory(containerID: id)
+        let rootfsPath: URL
+        if FileManager.default.fileExists(atPath: containerRootfs.path) {
+            rootfsPath = containerRootfs
+        } else {
+            _ = try await images.rootfsPath(for: container.image)
+            rootfsPath = try await images.cloneRootfs(for: container.image, containerID: id)
+        }
         try await vmRuntime.start(container: container, rootfsPath: rootfsPath)
         try await state.updateContainer(id: id) { c in
             c.status = .running
@@ -149,6 +197,7 @@ final class ContainerEngine {
         }
 
         try await vmRuntime.stop(containerID: container.id, timeout: timeout)
+        await portForwarder.stop(containerID: container.id)
         try await state.updateContainer(id: id) { c in
             c.status = .stopped
             c.finishedAt = Date()
@@ -163,6 +212,7 @@ final class ContainerEngine {
             throw CockerError.containerNotFound(id)
         }
         try await vmRuntime.stop(containerID: container.id, timeout: 0)
+        await portForwarder.stop(containerID: container.id)
         try await state.updateContainer(id: id) { c in
             c.status = .dead
             c.finishedAt = Date()
@@ -209,6 +259,10 @@ final class ContainerEngine {
         }
 
         await networks.releaseIP(for: container.id)
+        await portForwarder.stop(containerID: container.id)
+        // Supprime aussi le rootfs cloné du container (libère l'espace
+        // disque pris par les modifications post-clonefile).
+        try? await images.removeContainerRootfs(containerID: container.id)
         try await state.removeContainer(id: container.id)
         emitEvent("container", action: "destroy", id: container.id)
     }

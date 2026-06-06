@@ -25,6 +25,11 @@
 #include <sys/wait.h>
 #include <sys/reboot.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <net/if.h>
 #include <errno.h>
 
 #define die(fmt, ...) do { \
@@ -75,7 +80,9 @@ static char *cmdline_get(const char *cmdline, const char *key) {
     return NULL;
 }
 
-/* Iterate all cocker.env.KEY=VALUE from cmdline and setenv() them */
+/* Iterate all cocker.env.KEY=VALUE from cmdline and setenv() them
+ * (legacy — env vient maintenant de /cocker-spec) */
+__attribute__((unused))
 static void setup_env_from_cmdline(const char *cmdline) {
     const char *p = cmdline;
     while ((p = strstr(p, "cocker.env."))) {
@@ -96,7 +103,9 @@ static void setup_env_from_cmdline(const char *cmdline) {
     }
 }
 
-/* Tokenize a command string into argv[] */
+/* Tokenize a command string into argv[]
+ * (legacy — argv vient maintenant de /cocker-spec NUL-séparé) */
+__attribute__((unused))
 static int parse_argv(char *cmd, char **argv, int max) {
     int argc = 0;
     char *p = cmd;
@@ -220,43 +229,191 @@ int main(int argc, char **argv) {
     /* Mount any volume shares */
     mount_volumes(cmdline);
 
-    /* Setup environment from cocker.env.* params */
-    setup_env_from_cmdline(cmdline);
+    /* IP discovery :
+     *   1. up de l'interface eth0
+     *   2. démarrer udhcpc (DHCP client) pour obtenir une IP DHCP de vmnet
+     *   3. récupérer l'IP via ioctl + écrire dans /cocker-ip
+     * Le daemon poll ce fichier via virtiofs pour configurer le port
+     * forwarding TCP host → container.
+     */
+    {
+        /* Up de eth0 (ifconfig eth0 up) */
+        int up_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (up_sock >= 0) {
+            struct ifreq ifr;
+            memset(&ifr, 0, sizeof(ifr));
+            strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
+            if (ioctl(up_sock, SIOCGIFFLAGS, &ifr) == 0) {
+                ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+                if (ioctl(up_sock, SIOCSIFFLAGS, &ifr) != 0)
+                    info("ifup eth0: %s", strerror(errno));
+            }
+            close(up_sock);
+        }
 
-    /* Default PATH if not set */
-    if (!getenv("PATH"))
-        setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-    if (!getenv("HOME"))
-        setenv("HOME", "/root", 1);
-    if (!getenv("TERM"))
-        setenv("TERM", "xterm", 1);
+        /* Lance udhcpc en background. Plusieurs chemins possibles selon
+         * la distro : busybox dans Alpine, dhclient ailleurs. */
+        const char *dhcp_clients[] = {
+            "/sbin/udhcpc", "/usr/sbin/udhcpc",
+            "/sbin/dhclient", "/usr/sbin/dhclient",
+            NULL
+        };
+        pid_t dhcp_pid = -1;
+        for (int i = 0; dhcp_clients[i]; i++) {
+            if (access(dhcp_clients[i], X_OK) != 0) continue;
+            dhcp_pid = fork();
+            if (dhcp_pid == 0) {
+                if (strstr(dhcp_clients[i], "udhcpc")) {
+                    execl(dhcp_clients[i], "udhcpc", "-i", "eth0",
+                          "-t", "3", "-n", "-q", "-f", (char *)NULL);
+                } else {
+                    execl(dhcp_clients[i], "dhclient", "-1", "eth0", (char *)NULL);
+                }
+                _exit(127);
+            }
+            info("started DHCP client %s (pid %d)", dhcp_clients[i], dhcp_pid);
+            break;
+        }
+        if (dhcp_pid > 0) {
+            int dhcp_status;
+            waitpid(dhcp_pid, &dhcp_status, 0);
+        } else {
+            info("no DHCP client found (udhcpc/dhclient), trying static IP read");
+        }
 
-    /* chdir to workdir if specified */
-    char *workdir = cmdline_get(cmdline, "workdir");
-    if (workdir) {
-        if (chdir(workdir) < 0)
-            info("chdir %s failed: %s", workdir, strerror(errno));
-        free(workdir);
+        /* Lit l'IP eth0 — retry rapide au cas où DHCP en cours */
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            char ip_str[INET_ADDRSTRLEN] = {0};
+            for (int try = 0; try < 20; try++) {
+                struct ifreq ifr;
+                memset(&ifr, 0, sizeof(ifr));
+                strncpy(ifr.ifr_name, "eth0", IFNAMSIZ - 1);
+                if (ioctl(sock, SIOCGIFADDR, &ifr) == 0) {
+                    struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+                    if (inet_ntop(AF_INET, &ipaddr->sin_addr, ip_str, sizeof(ip_str)))
+                        break;
+                }
+                usleep(100000);  /* 100ms */
+            }
+            close(sock);
+            if (ip_str[0]) {
+                info("eth0 IP=%s", ip_str);
+                int ip_fd = open("/cocker-ip", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (ip_fd >= 0) {
+                    write(ip_fd, ip_str, strlen(ip_str));
+                    fsync(ip_fd);
+                    close(ip_fd);
+                }
+            } else {
+                info("no IP on eth0 after DHCP attempt");
+            }
+        }
     }
 
-    /* Get the command to run */
-    char *cmd = cmdline_get(cmdline, "cmd");
-    if (!cmd) {
-        info("no cocker.cmd in cmdline, defaulting to /bin/sh");
-        cmd = strdup("/bin/sh");
-    }
-
-    info("exec: %s", cmd);
-
+    /*
+     * Lit /cocker-spec écrit par cockerd avant le boot.
+     * Format (3 lignes, chaque champ NUL-séparé) :
+     *   argv0\0argv1\0...\n
+     *   env0\0env1\0...\n
+     *   workdir\n
+     * Plus robuste que la kernel cmdline (qui mange les espaces/quotes).
+     */
     char *child_argv[128];
-    parse_argv(cmd, child_argv, 128);
+    int argc_count = 0;
+    int spec_fd = open("/cocker-spec", O_RDONLY);
+    if (spec_fd < 0) {
+        info("no /cocker-spec found, defaulting to /bin/sh");
+        child_argv[0] = "/bin/sh";
+        child_argv[1] = NULL;
+        argc_count = 1;
+    } else {
+        static char spec_buf[65536];
+        ssize_t spec_len = read(spec_fd, spec_buf, sizeof(spec_buf) - 1);
+        close(spec_fd);
+        if (spec_len < 0) die("read /cocker-spec: %s", strerror(errno));
+        spec_buf[spec_len] = '\0';
 
-    if (child_argv[0] == NULL)
-        die("empty command");
+        /* Ligne 1 : argv (champs NUL séparés, ligne terminée par \n) */
+        char *p = spec_buf;
+        char *line_end = memchr(p, '\n', spec_len);
+        if (line_end) {
+            *line_end = '\0';  /* termine la ligne pour les strlen() suivants */
+            char *q = p;
+            while (q < line_end && argc_count < 127) {
+                child_argv[argc_count++] = q;
+                q += strlen(q) + 1;  /* saute le NUL séparateur */
+            }
+            child_argv[argc_count] = NULL;
+            p = line_end + 1;
+        }
 
-    /* exec the container's command as PID 1 */
-    execvp(child_argv[0], child_argv);
+        /* Ligne 2 : env (KEY=VALUE NUL séparés, ligne terminée par \n) */
+        ssize_t remaining = spec_buf + spec_len - p;
+        line_end = remaining > 0 ? memchr(p, '\n', remaining) : NULL;
+        if (line_end) {
+            *line_end = '\0';
+            char *q = p;
+            while (q < line_end) {
+                if (*q && strchr(q, '=')) {
+                    putenv(q);  /* le buffer static reste valide pour l'environnement */
+                }
+                q += strlen(q) + 1;
+            }
+            p = line_end + 1;
+        }
 
-    /* If we get here, exec failed */
-    die("execvp %s: %s", child_argv[0], strerror(errno));
+        /* Ligne 3 : workdir */
+        remaining = spec_buf + spec_len - p;
+        line_end = remaining > 0 ? memchr(p, '\n', remaining) : NULL;
+        if (line_end) {
+            *line_end = '\0';
+            if (*p && chdir(p) < 0)
+                info("chdir %s failed: %s", p, strerror(errno));
+        }
+    }
+
+    if (argc_count == 0 || child_argv[0] == NULL)
+        die("empty command in /cocker-spec");
+
+    info("exec: %s (argc=%d)", child_argv[0], argc_count);
+
+    /*
+     * Fork + wait pattern : on garde PID 1 vivant pour éviter le kernel panic
+     * quand la commande container exit. Sans ça, exec direct = quand le shell
+     * meurt, le kernel panic "Attempted to kill init!" et la VM tourne en
+     * boucle à ~200% CPU jusqu'à kill manuel (vu en vrai sur M3 Max).
+     */
+    pid_t child = fork();
+    if (child < 0)
+        die("fork: %s", strerror(errno));
+
+    if (child == 0) {
+        execvp(child_argv[0], child_argv);
+        fprintf(stderr, "[cocker-init] execvp %s: %s\n", child_argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    /* PID 1 : reap zombies + wait child principal */
+    int status = 0;
+    while (1) {
+        pid_t r = waitpid(-1, &status, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (errno == ECHILD) break;
+            die("waitpid: %s", strerror(errno));
+        }
+        if (r == child) break;
+    }
+
+    int exitcode = 0;
+    if (WIFEXITED(status))         exitcode = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status))  exitcode = 128 + WTERMSIG(status);
+
+    info("container exited with code %d", exitcode);
+
+    /* Shutdown propre — évite le kernel panic. */
+    sync();
+    reboot(RB_POWER_OFF);
+    _exit(exitcode);
 }
