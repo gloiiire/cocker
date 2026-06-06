@@ -50,12 +50,15 @@ final class VMRuntime: NSObject {
     // MARK: - VM creation
 
     func createVM(for container: Container, rootfsPath: URL) throws -> VZVirtualMachine {
+        fputs("[vm] createVM enter\n", stderr); fflush(stderr)
         let config = VZVirtualMachineConfiguration()
 
         // Boot loader
         let bootLoader = VZLinuxBootLoader(kernelURL: kernelPath)
         bootLoader.initialRamdiskURL = initrdPath
-        bootLoader.commandLine = buildKernelCommandLine(for: container, rootfsPath: rootfsPath)
+        let cmdline = buildKernelCommandLine(for: container, rootfsPath: rootfsPath)
+        bootLoader.commandLine = cmdline
+        fputs("[vm] cmdline (\(cmdline.count) chars): \(cmdline)\n", stderr); fflush(stderr)
         config.bootLoader = bootLoader
 
         // CPU & Memory
@@ -81,11 +84,26 @@ final class VMRuntime: NSObject {
         consoleDevice.ports[0] = port0
         config.consoleDevices = [consoleDevice]
 
-        // Virtio FS for rootfs (container image layers)
-        let sharedDir = VZSharedDirectory(url: rootfsPath, readOnly: false)
+        // Virtio FS for rootfs — Apple's VZSharedDirectory n'aime pas certains paths
+        // avec caractères spéciaux. On normalise via un symlink propre si nécessaire.
+        let normalizedRootfs: URL
+        if rootfsPath.path.contains(":") {
+            // Crée un symlink dans tmp avec un nom propre
+            let safeName = rootfsPath.lastPathComponent.replacingOccurrences(of: ":", with: "_")
+            let safeLink = rootDir.appendingPathComponent("tmp/rootfs_\(safeName)")
+            try? FileManager.default.removeItem(at: safeLink)
+            try FileManager.default.createSymbolicLink(at: safeLink, withDestinationURL: rootfsPath)
+            normalizedRootfs = safeLink
+            fputs("[vm] symlinked rootfs: \(safeLink.path) -> \(rootfsPath.path)\n", stderr); fflush(stderr)
+        } else {
+            normalizedRootfs = rootfsPath
+        }
+
+        let sharedDir = VZSharedDirectory(url: normalizedRootfs, readOnly: false)
         let sharing = VZSingleDirectoryShare(directory: sharedDir)
         let fsConfig = VZVirtioFileSystemDeviceConfiguration(tag: "root")
         fsConfig.share = sharing
+        fputs("[vm] virtiofs root config OK\n", stderr); fflush(stderr)
         var fsDevices: [VZVirtioFileSystemDeviceConfiguration] = [fsConfig]
 
         // Additional volume mounts via virtiofs
@@ -129,8 +147,16 @@ final class VMRuntime: NSObject {
         let socketDevice = VZVirtioSocketDeviceConfiguration()
         config.socketDevices = [socketDevice]
 
-        try config.validate()
-        return VZVirtualMachine(configuration: config)
+        do {
+            try config.validate()
+            fputs("[vm] config.validate() OK\n", stderr); fflush(stderr)
+        } catch {
+            fputs("[vm] config.validate() FAILED: \(error)\n", stderr); fflush(stderr)
+            throw error
+        }
+        let vm = VZVirtualMachine(configuration: config)
+        fputs("[vm] VZVirtualMachine instance created\n", stderr); fflush(stderr)
+        return vm
     }
 
     // MARK: - Kernel command line
@@ -190,12 +216,17 @@ final class VMRuntime: NSObject {
     // MARK: - Start/Stop
 
     func start(container: Container, rootfsPath: URL) async throws {
+        fputs("[vm] start: container=\(container.id) rootfs=\(rootfsPath.path)\n", stderr)
+        fflush(stderr)
         try ensureKernelAvailable()
+        fputs("[vm] kernel OK\n", stderr); fflush(stderr)
 
         // Écrit resolv.conf dans le rootfs pour que le container utilise le DNS interne
         try writeResolvConf(to: rootfsPath, container: container)
+        fputs("[vm] resolv.conf OK\n", stderr); fflush(stderr)
 
         let vm = try createVM(for: container, rootfsPath: rootfsPath)
+        fputs("[vm] createVM OK\n", stderr); fflush(stderr)
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
 

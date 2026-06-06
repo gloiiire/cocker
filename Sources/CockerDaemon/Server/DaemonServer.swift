@@ -114,8 +114,11 @@ final class DaemonServer {
                 try sendResponse(requestId: request.id, payload: PingResponse(), to: fd)
 
             case .run:
+                fputs("[srv] .run received\n", stderr); fflush(stderr)
                 let runReq = try JSONDecoder().decode(RunRequest.self, from: request.payload)
+                fputs("[srv] decoded RunRequest, image=\(runReq.config.image)\n", stderr); fflush(stderr)
                 let containerID = try await engine.run(config: runReq.config)
+                fputs("[srv] engine.run returned id=\(containerID)\n", stderr); fflush(stderr)
                 try sendResponse(requestId: request.id, payload: RunResponse(containerID: containerID), to: fd)
 
             case .start:

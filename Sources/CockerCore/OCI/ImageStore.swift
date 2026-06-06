@@ -49,8 +49,11 @@ public actor ImageStore {
     public func find(_ reference: String) -> ImageInfo? {
         // Exact match
         if let img = index[reference] { return img }
-        // Try adding :latest
+        // Try adding :latest if no tag
         if !reference.contains(":"), let img = index["\(reference):latest"] { return img }
+        // Try with Docker Hub library/ prefix (alpine → library/alpine)
+        let withLatest = reference.contains(":") ? reference : "\(reference):latest"
+        if !withLatest.contains("/"), let img = index["library/\(withLatest)"] { return img }
         // Try by short ID
         return index.values.first { $0.id.hasPrefix(reference) }
     }

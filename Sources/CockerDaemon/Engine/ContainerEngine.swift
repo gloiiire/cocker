@@ -28,19 +28,25 @@ final class ContainerEngine {
     // MARK: - Container lifecycle
 
     func run(config: RunConfig) async throws -> String {
+        fputs("[eng] run() image=\(config.image)\n", stderr); fflush(stderr)
         // Pull image if not present
         if !(await images.exists(config.image)) {
+            fputs("[eng] image not present, pulling\n", stderr); fflush(stderr)
             _ = try await images.pull(reference: config.image) { _ in }
         }
+        fputs("[eng] image exists\n", stderr); fflush(stderr)
 
-        // Generate container ID and name
-        let id = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(64))
+        // Generate container ID and name (12 chars lowercase, matches state lookup)
+        let id = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)).lowercased()
+        fputs("[eng] id=\(id)\n", stderr); fflush(stderr)
         let generatedName = await state.generateName()
         let name = config.name ?? generatedName
+        fputs("[eng] name=\(name)\n", stderr); fflush(stderr)
 
         guard !(await state.nameExists(name)) else {
             throw CockerError.containerAlreadyExists(name)
         }
+        fputs("[eng] name unique check OK\n", stderr); fflush(stderr)
 
         // Resolve ports
         let ports = config.ports
@@ -71,15 +77,24 @@ final class ContainerEngine {
             restartPolicy: config.restartPolicy
         )
 
+        fputs("[eng] container struct created\n", stderr); fflush(stderr)
         // Allocate IP
         container.ip = await networks.allocateIP(for: id)
+        fputs("[eng] ipv4=\(container.ip ?? "?")\n", stderr); fflush(stderr)
         container.ipv6 = await networks.allocateIPv6(for: id)
+        fputs("[eng] ipv6=\(container.ipv6 ?? "?")\n", stderr); fflush(stderr)
         try await state.store(container: container)
+        fputs("[eng] state stored\n", stderr); fflush(stderr)
         emitEvent("container", action: "create", id: id)
+        fputs("[eng] event emitted\n", stderr); fflush(stderr)
 
         // Start VM
+        fputs("[eng] resolving rootfs path\n", stderr); fflush(stderr)
         let rootfsPath = try await images.rootfsPath(for: config.image)
+        fputs("[eng] rootfs=\(rootfsPath.path)\n", stderr); fflush(stderr)
+        fputs("[eng] calling vmRuntime.start\n", stderr); fflush(stderr)
         try await vmRuntime.start(container: container, rootfsPath: rootfsPath)
+        fputs("[eng] vmRuntime.start returned\n", stderr); fflush(stderr)
 
         // Update status
         try await state.updateContainer(id: id) { c in

@@ -118,7 +118,9 @@ actor NetworkManager {
     func allocateIPv6(for containerID: String, networkName: String = "bridge") -> String {
         if let existing = allocatedIPv6s[containerID] { return existing }
         // Générer une adresse IPv6 unique dans fd00:c0c4::/48
-        let suffix = UInt32(abs(containerID.hashValue)) % 0xFFFF
+        // abs() crash sur Int.min — on cast via bitPattern pour être safe
+        let hash = UInt(bitPattern: containerID.hashValue)
+        let suffix = UInt16(truncatingIfNeeded: hash) & 0xFFFF
         let ipv6 = "\(Self.ipv6Prefix)\(String(format: "%x", suffix))"
         allocatedIPv6s[containerID] = ipv6
         return ipv6
