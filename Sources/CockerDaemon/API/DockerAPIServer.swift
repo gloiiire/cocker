@@ -63,8 +63,8 @@ final class DockerAPIServer {
         chmod(socketPath, 0o666)
         self.serverFD = fd
         self.isRunning = true
-        print("[cockerd] Docker API listening on \(socketPath)")
-        print("[cockerd] Use: DOCKER_HOST=unix://\(socketPath) docker ps")
+        CockerLog.shared.info("docker-api", "listening on \(socketPath)")
+        CockerLog.shared.info("docker-api", "export DOCKER_HOST=unix://\(socketPath)")
 
         await acceptLoop()
     }
