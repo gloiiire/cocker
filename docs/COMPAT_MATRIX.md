@@ -24,7 +24,7 @@ What works today, what's partial, what's missing. Anything not on this list is "
 | `cocker pull` | ✅ works | Docker Hub, GHCR, ECR via OCI v1.1 |
 | `cocker push` | ✅ works | |
 | `cocker build` | ✅ works | `FROM`, `COPY`, `RUN` (ephemeral VM), `CMD`, `ENV`, `WORKDIR`, `EXPOSE`, `LABEL` ; multi-stage works ; `ARG` works |
-| `cocker buildx` | ⚠️ partial | Multi-arch via zig cross-compile ; no full QEMU emulation |
+| `cocker buildx` | ⚠️ partial | Multi-arch via zig cross-compile ; full QEMU emulation : `cocker-init` registers `binfmt_misc` handlers since v0.2.1 (x86_64, aarch64, riscv64), but the Swift-side wiring (virtiofs share of qemu-user-static binary + `Container.platform` field + `cocker qemu install` command) is not yet implemented. PRs welcome. |
 | `cocker images` | ✅ works | |
 | `cocker rmi` | ✅ works | |
 | `cocker tag` | ✅ works | |

@@ -1,0 +1,92 @@
+name: Release
+
+# Triggered on tag push (v*) — builds the release binaries, signs them with
+# cosign keyless OIDC (no private keys to manage), uploads them and the
+# signatures as GitHub release assets.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # gh release create / upload
+  id-token: write   # cosign keyless via GitHub OIDC
+  attestations: write
+
+jobs:
+  build-and-sign:
+    name: Build & sign release artifacts
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+
+      - name: Build release binaries
+        run: |
+          swift build -c release --disable-sandbox
+          mkdir -p dist
+          cp .build/release/cocker dist/cocker-${{ github.ref_name }}-arm64-macos
+          cp .build/release/cockerd dist/cockerd-${{ github.ref_name }}-arm64-macos
+          cp .build/release/cocker-portfwd dist/cocker-portfwd-${{ github.ref_name }}-arm64-macos
+          ls -la dist/
+
+      - name: Cross-compile cocker-init for Linux ARM64
+        run: |
+          brew install zig
+          cd cocker-init
+          zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init \
+                 init.c cmdline.c net.c dns_proxy.c spec.c
+          cp cocker-init ../dist/cocker-init-${{ github.ref_name }}-aarch64-linux
+          cp initrd.img ../dist/initrd-${{ github.ref_name }}.img
+
+      - name: Compute SHA-256 checksums
+        run: |
+          cd dist
+          shasum -a 256 * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign each binary with cosign (keyless OIDC)
+        # Each .sig + .crt gets uploaded next to the binary. Verification :
+        #   cosign verify-blob --certificate=cocker.crt --signature=cocker.sig \
+        #     --certificate-identity-regexp='https://github.com/gloiiire/cocker/.*' \
+        #     --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \
+        #     cocker
+        run: |
+          cd dist
+          for f in cocker-* cockerd-* initrd-* SHA256SUMS; do
+            [ -f "$f" ] || continue
+            echo "Signing $f"
+            COSIGN_EXPERIMENTAL=1 cosign sign-blob --yes \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.crt" \
+              "$f"
+          done
+          ls -la
+
+      - name: Attach assets to GitHub release
+        run: |
+          # The release object was already created by the human who pushed the
+          # tag (or by an earlier `gh release create`). If it doesn't exist
+          # yet, create a placeholder so we can attach assets.
+          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 \
+            || gh release create "${{ github.ref_name }}" \
+                 --title "${{ github.ref_name }}" \
+                 --notes "Signed release artifacts attached by CI."
+          gh release upload "${{ github.ref_name }}" dist/* --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Generate SLSA provenance attestation
+        # GitHub-native attestations link the artifact to the workflow run that
+        # produced it ; verifiable via `gh attestation verify`.
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'dist/cocker*,dist/cockerd*,dist/initrd*'
