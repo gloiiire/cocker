@@ -1,0 +1,69 @@
+name: sync-homebrew-tap
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  bump-tap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag + tarball SHA256
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          URL="https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
+
+          # GitHub generates archive tarballs lazily — retry until available.
+          for i in 1 2 3 4 5 6; do
+            if curl -sfL "$URL" -o /tmp/source.tar.gz; then
+              break
+            fi
+            echo "Tarball not ready (attempt $i), sleeping..."
+            sleep 10
+          done
+          test -s /tmp/source.tar.gz || { echo "Tarball never appeared at $URL"; exit 1; }
+
+          SHA=$(sha256sum /tmp/source.tar.gz | awk '{print $1}')
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "url=$URL"
+            echo "sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout source (for source-of-truth Formula)
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: gloiiire/homebrew-cocker
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula in tap
+        run: |
+          cp source/Formula/cocker.rb tap/Formula/cocker.rb
+          cd tap
+          sed -i -E "s|^(  version ).*|\1\"${{ steps.meta.outputs.version }}\"|" Formula/cocker.rb
+          sed -i -E "s|^(  sha256 ).*|\1\"${{ steps.meta.outputs.sha }}\"|" Formula/cocker.rb
+          echo "--- Formula/cocker.rb (head) ---"
+          head -10 Formula/cocker.rb
+
+      - name: Commit + push to tap
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/cocker.rb
+          if git diff --cached --quiet; then
+            echo "Tap formula already up to date."
+            exit 0
+          fi
+          git commit -m "cocker ${{ steps.meta.outputs.version }}"
+          git push
