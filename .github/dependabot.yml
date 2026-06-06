@@ -1,0 +1,44 @@
+# Dependabot — mises à jour des deps non-sécurité (les alertes CVE sont gérées
+# séparément via Dependabot Security Updates côté repo settings).
+# Config minimaliste : monthly + groupes par écosystème pour éviter le bruit.
+version: 2
+updates:
+  # Swift Package Manager : swift-argument-parser, swift-log, swift-crypto, Yams
+  - package-ecosystem: "swift"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 5
+    target-branch: "dev"
+    groups:
+      swift-all:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "swift"
+
+  # Actions GitHub : checkout, cache, etc.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 3
+    target-branch: "dev"
+    groups:
+      gha-all:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - "dependencies"
+      - "github-actions"

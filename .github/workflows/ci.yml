@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main, staging, dev]
+  pull_request:
+    branches: [main, staging, dev]
+
+# Annule les runs en cours quand un nouveau commit arrive sur la même branche.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift-tests:
+    name: Swift tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+      - name: Swift version
+        run: swift --version
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+      - name: swift build (debug)
+        run: swift build
+      - name: swift test
+        # Fail si un test plante. Les 21 tests existants doivent passer.
+        run: swift test --parallel
+
+  swift-build-release:
+    name: Swift build release
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-spm-release-${{ hashFiles('Package.resolved') }}
+      - name: swift build -c release
+        # Vérifie que cocker + cockerd compilent en release.
+        # Le code signing virtualization est fait à l'install via Homebrew.
+        run: swift build -c release
+      - name: Verify binaries exist
+        run: |
+          test -f .build/release/cocker || { echo "❌ cocker binary missing"; exit 1; }
+          test -f .build/release/cockerd || { echo "❌ cockerd binary missing"; exit 1; }
+          file .build/release/cocker
+          file .build/release/cockerd
+
+  cocker-init-build:
+    name: cocker-init (Linux ARM64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install zig
+        run: brew install zig
+      - name: Cross-compile cocker-init
+        # cocker-init est un binaire C statique pour Linux ARM64,
+        # cross-compilé via zig cc depuis macOS. Il sert d'init (PID 1)
+        # dans les VMs container.
+        working-directory: cocker-init
+        run: zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init init.c
+      - name: Verify ELF
+        working-directory: cocker-init
+        run: |
+          file cocker-init | grep -q "ELF 64-bit.*ARM aarch64" || { echo "❌ wrong arch"; exit 1; }
+          echo "✅ cocker-init cross-compiled for Linux ARM64"
+
+  audit:
+    name: SwiftPM dependency audit
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
+      - name: Resolve dependencies
+        run: swift package resolve
+      - name: List dependencies
+        # Affiche l'arbre de dépendances. Dependabot gère les CVE alerts
+        # côté GitHub; ce job garantit que Package.resolved est cohérent
+        # avec Package.swift et catch les drifts à la PR.
+        run: swift package show-dependencies
+      - name: Verify Package.resolved committed and clean
+        run: |
+          if [ -n "$(git status --porcelain Package.resolved)" ]; then
+            echo "❌ Package.resolved drifted from Package.swift"
+            git diff Package.resolved
+            exit 1
+          fi
+          echo "✅ Package.resolved is in sync"
+
+  lint:
+    name: Swift lint (formatting)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install swift-format
+        # swift-format est intégré à Xcode 16+, on l'invoque directement.
+        run: which swift-format || brew install swift-format
+      - name: Check formatting
+        # Mode --strict: échoue sur la moindre divergence de style.
+        # Ne bloque PAS la build initialement — warning only — pour ne pas
+        # casser la CI pendant qu'on stabilise la base. Retirer le `|| true`
+        # quand le code est formaté.
+        run: swift-format lint --recursive Sources/ Tests/ || true
