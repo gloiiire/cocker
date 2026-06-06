@@ -24,7 +24,13 @@ final class ContainerEngine {
         self.networks = try await NetworkManager(store: state)
         self.volumes = VolumeManager(store: state, rootDir: rootDir)
         self.vmRuntime = try VMRuntime(rootDir: rootDir)
-        self.portForwarder = PortForwarder()
+
+        // Cherche cocker-portfwd : à côté de cockerd dans le bundle,
+        // ou dans le même PREFIX bin/ (cas Homebrew + install.sh).
+        let daemonURL = URL(fileURLWithPath: CommandLine.arguments[0])
+        let daemonDir = daemonURL.deletingLastPathComponent()
+        let portFwdBinary = daemonDir.appendingPathComponent("cocker-portfwd")
+        self.portForwarder = PortForwarder(portFwdBinary: portFwdBinary)
     }
 
     // MARK: - Container lifecycle

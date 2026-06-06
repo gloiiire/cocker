@@ -7,6 +7,10 @@ let package = Package(
     products: [
         .executable(name: "cocker", targets: ["CockerCLI"]),
         .executable(name: "cockerd", targets: ["CockerDaemon"]),
+        // Binaire séparé pour le port forwarding TCP. Signé sans
+        // l'entitlement virtualization → pas de sandbox sur les bridges
+        // privés vmnet (sinon EHOSTUNREACH depuis cockerd).
+        .executable(name: "cocker-portfwd", targets: ["CockerPortFwd"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
@@ -46,6 +50,10 @@ let package = Package(
                 .linkedFramework("Virtualization"),
                 .linkedFramework("vmnet", .when(platforms: [.macOS])),
             ]
+        ),
+        .executableTarget(
+            name: "CockerPortFwd",
+            path: "Sources/CockerPortFwd"
         ),
         .testTarget(
             name: "CockerTests",
