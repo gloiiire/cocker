@@ -600,6 +600,9 @@ actor DockerfileBuilder {
 
         let totalSize = layers.reduce(UInt64(0)) { $0 + UInt64($1.size) }
 
+        // Map env dict → ["KEY=VALUE", ...] (format OCI)
+        let envArray: [String]? = env.isEmpty ? nil : env.map { "\($0.key)=\($0.value)" }
+
         let imageInfo = ImageInfo(
             id: manifestDigest,
             repository: parseRepo(config.tag),
@@ -607,7 +610,13 @@ actor DockerfileBuilder {
             size: totalSize,
             architecture: arch,
             os: "linux",
-            layers: layers.map { $0.digest }
+            layers: layers.map { $0.digest },
+            cmd: cmd.isEmpty ? nil : cmd,
+            entrypoint: entrypoint.isEmpty ? nil : entrypoint,
+            env: envArray,
+            workdir: workdir == "/" ? nil : workdir,
+            labels: labels,
+            exposedPorts: exposedPorts.map { "\($0.containerPort)/\($0.proto.rawValue)" }
         )
 
         try await imageManager.storeBuiltImage(imageInfo)
