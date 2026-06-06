@@ -110,6 +110,13 @@ final class DockerAPIServer {
 
         switch (method, segments.first ?? "") {
 
+        // ── Prometheus metrics ──────────────────────────────────
+        // Exposed at /metrics for compat with most scrapers. The Docker
+        // Engine HTTP API namespace doesn't normally use this path so
+        // there's no collision.
+        case ("GET", "metrics"):
+            response = await handleMetrics()
+
         // ── Ping & version ──────────────────────────────────────
         case ("GET", "_ping"), ("HEAD", "_ping"):
             response = HTTPResponse(status: 200, headers: [
@@ -276,6 +283,58 @@ final class DockerAPIServer {
                 _ = Darwin.write(fd, ptr, buf.count)
             }
         }
+    }
+
+    // MARK: - Prometheus metrics
+
+    private func handleMetrics() async -> HTTPResponse {
+        let info = await engine.info()
+        let metrics: [PromMetric] = [
+            PromMetric(
+                name: "cocker_containers_total",
+                help: "Number of containers known to cockerd (running + stopped)",
+                type: .gauge,
+                samples: [PromSample(value: Double(info.containers))]
+            ),
+            PromMetric(
+                name: "cocker_containers_running",
+                help: "Number of containers currently running",
+                type: .gauge,
+                samples: [PromSample(value: Double(info.containersRunning))]
+            ),
+            PromMetric(
+                name: "cocker_images_total",
+                help: "Number of images stored locally",
+                type: .gauge,
+                samples: [PromSample(value: Double(info.images))]
+            ),
+            PromMetric(
+                name: "cocker_volumes_total",
+                help: "Number of named volumes",
+                type: .gauge,
+                samples: [PromSample(value: Double(info.volumes))]
+            ),
+            PromMetric(
+                name: "cocker_networks_total",
+                help: "Number of custom networks defined",
+                type: .gauge,
+                samples: [PromSample(value: Double(info.networks))]
+            ),
+            PromMetric(
+                name: "cocker_build_info",
+                help: "Static build information",
+                type: .gauge,
+                samples: [PromSample(value: 1, labels: [
+                    ("version", CockerVersion.version),
+                    ("api_version", CockerVersion.apiVersion),
+                ])]
+            ),
+        ]
+        return HTTPResponse(
+            status: 200,
+            headers: ["Content-Type": PrometheusExposition.contentType],
+            body: Data(PrometheusExposition.render(metrics).utf8)
+        )
     }
 
     // MARK: - System handlers
