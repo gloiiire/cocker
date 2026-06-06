@@ -25,6 +25,7 @@ final class ContainerEngine {
     ) async throws {
         self.rootDir = rootDir
         self.state = try StateStore(rootDir: rootDir)
+        try await self.state.reconcileAfterRestart()
         self.images = try ImageManager(rootDir: rootDir)
         self.networks = try await NetworkManager(store: state)
         self.volumes = VolumeManager(store: state, rootDir: rootDir)

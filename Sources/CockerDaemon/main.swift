@@ -84,6 +84,19 @@ func main() async {
     print("[cockerd] Starting Cocker Engine \(CockerVersion.version)")
     print("[cockerd] Root: \(rootDir)")
 
+    // Rotate cockerd.log if it's grown past 10 MiB. Best-effort : a missing
+    // file or a permission error is silently ignored — losing one rotation
+    // is better than refusing to start.
+    let logFile = rootURL.appendingPathComponent("cockerd.log")
+    if LogRotator.shouldRotate(file: logFile, maxBytes: 10 * 1024 * 1024) {
+        try? LogRotator.rotate(file: logFile, keep: 5)
+        print("[cockerd] log rotated → cockerd.log.1")
+    }
+
+    // Structured logger — honors COCKER_LOG_LEVEL and COCKER_LOG_FORMAT.
+    let log = CockerLog.fromEnvironment()
+    log.info("startup", "cockerd \(CockerVersion.version) root=\(rootDir)")
+
     // Discover the cocker-portfwd binary that ships next to cockerd. We do
     // this here (rather than inside ContainerEngine.init) so the engine
     // doesn't depend on CommandLine.arguments[0] — that makes it easier to
