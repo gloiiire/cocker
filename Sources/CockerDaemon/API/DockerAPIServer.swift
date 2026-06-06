@@ -553,8 +553,21 @@ final class DockerAPIServer {
     }
 
     private func handleContainerRename(id: String, req: HTTPRequest) async -> HTTPResponse {
-        // TODO: implement rename in engine
-        return .noContent()
+        guard let newName = req.query["name"], !newName.isEmpty else {
+            return .error("name query parameter is required", status: 400)
+        }
+        // Strip leading slash if present (Docker convention)
+        let cleanName = newName.hasPrefix("/") ? String(newName.dropFirst()) : newName
+        guard let container = await engine.state.container(id: id) else {
+            return .notFound(id)
+        }
+        do {
+            try await engine.state.updateContainer(id: container.id) { c in c.name = cleanName }
+            await engine.dnsServer?.invalidateCache()
+            return .noContent()
+        } catch {
+            return .error(error.localizedDescription, status: 500)
+        }
     }
 
     private func handleContainerStats(id: String) async -> HTTPResponse {

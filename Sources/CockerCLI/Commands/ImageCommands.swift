@@ -291,6 +291,123 @@ struct ImagePruneCommand: AsyncParsableCommand {
     }
 }
 
+struct CommitCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "commit",
+        abstract: "Create a new image from a container's changes"
+    )
+
+    @Option(name: [.short, .customLong("author")], help: "Author (e.g. \"Alice <alice@example.com>\")")
+    var author: String?
+
+    @Option(name: [.short, .customLong("message")], help: "Commit message")
+    var message: String?
+
+    @Argument(help: "Container ID or name")
+    var container: String
+
+    @Argument(help: "Repository and tag (image:tag)")
+    var repository: String
+
+    mutating func run() async throws {
+        let client = IPCClient()
+        let payload = CommitRequest(containerID: container, tag: repository, author: author, message: message)
+        let request = try IPCRequest(type: .commit, payload: payload)
+        let response = try await client.send(request)
+        let img = try response.decode(ImageInfo.self)
+        print(String(img.id.prefix(12)))
+    }
+}
+
+struct ExportCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "export",
+        abstract: "Export a container's filesystem as a tar archive"
+    )
+
+    @Option(name: [.short, .customLong("output")], help: "Write to a file (default: stdout)")
+    var output: String?
+
+    @Argument(help: "Container ID or name")
+    var container: String
+
+    mutating func run() async throws {
+        let client = IPCClient()
+        let payload = ExportRequest(containerID: container)
+        let request = try IPCRequest(type: .export, payload: payload)
+        let response = try await client.send(request)
+        let result = try response.decode(SaveResponse.self)
+
+        if let outPath = output {
+            let url = URL(fileURLWithPath: outPath.hasPrefix("/") ? outPath : FileManager.default.currentDirectoryPath + "/" + outPath)
+            try result.tarData.write(to: url)
+            print("Container \(container) exported to \(outPath)")
+        } else {
+            FileHandle.standardOutput.write(result.tarData)
+        }
+    }
+}
+
+struct ImportCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "import",
+        abstract: "Import a tarball as an image"
+    )
+
+    @Argument(help: "Path to tar file (- for stdin)")
+    var file: String
+
+    @Argument(help: "Repository and tag (image:tag)")
+    var tag: String
+
+    mutating func run() async throws {
+        let tarData: Data
+        if file == "-" {
+            tarData = FileHandle.standardInput.readDataToEndOfFile()
+        } else {
+            let url = URL(fileURLWithPath: file.hasPrefix("/") ? file : FileManager.default.currentDirectoryPath + "/" + file)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                fputs("Error: file not found: \(file)\n", stderr)
+                throw ExitCode.failure
+            }
+            tarData = try Data(contentsOf: url)
+        }
+
+        let client = IPCClient()
+        let payload = ContainerImportRequest(tarData: tarData, tag: tag)
+        let request = try IPCRequest(type: .containerImport, payload: payload)
+        let response = try await client.send(request)
+        let img = try response.decode(ImageInfo.self)
+        print("sha256:\(img.id.hasPrefix("sha256:") ? String(img.id.dropFirst(7)) : img.id)")
+    }
+}
+
+struct UpdateCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "update",
+        abstract: "Update configuration of one or more containers"
+    )
+
+    @Option(name: .customLong("cpus"), help: "Number of CPUs")
+    var cpus: Int?
+
+    @Option(name: .customShort("m"), help: "Memory limit in MB")
+    var memory: UInt64?
+
+    @Argument(help: "Container ID(s) or name(s)")
+    var containers: [String]
+
+    mutating func run() async throws {
+        let client = IPCClient()
+        for id in containers {
+            let payload = UpdateRequest(containerID: id, cpus: cpus, memoryMB: memory)
+            let request = try IPCRequest(type: .update, payload: payload)
+            _ = try await client.send(request)
+            print(id)
+        }
+    }
+}
+
 struct ImageInspectCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "image",

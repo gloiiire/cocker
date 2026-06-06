@@ -11,6 +11,13 @@ public struct OCIManifest: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case schemaVersion, mediaType, config, layers
     }
+
+    public init(schemaVersion: Int, mediaType: String?, config: OCIDescriptor, layers: [OCIDescriptor]) {
+        self.schemaVersion = schemaVersion
+        self.mediaType = mediaType
+        self.config = config
+        self.layers = layers
+    }
 }
 
 public struct OCIIndex: Codable, Sendable {
@@ -32,6 +39,13 @@ public struct OCIDescriptor: Codable, Sendable {
     public let digest: String
     public let size: Int
     public let urls: [String]?
+
+    public init(mediaType: String, digest: String, size: Int, urls: [String]?) {
+        self.mediaType = mediaType
+        self.digest = digest
+        self.size = size
+        self.urls = urls
+    }
 
     public var isGzipLayer: Bool {
         mediaType.contains("gzip") || mediaType.contains("tar+gzip")
@@ -61,6 +75,14 @@ public struct OCIImageConfig: Codable, Sendable {
     public let rootfs: RootFS?
     public let history: [LayerHistory]?
 
+    public init(architecture: String?, os: String?, config: ContainerConfig?, rootfs: RootFS?, history: [LayerHistory]?) {
+        self.architecture = architecture
+        self.os = os
+        self.config = config
+        self.rootfs = rootfs
+        self.history = history
+    }
+
     public struct ContainerConfig: Codable, Sendable {
         public let user: String?
         public let exposedPorts: [String: Empty]?
@@ -83,6 +105,20 @@ public struct OCIImageConfig: Codable, Sendable {
             case stopSignal = "StopSignal"
             case volumes = "Volumes"
         }
+
+        public init(user: String?, exposedPorts: [String: Empty]?, env: [String]?, cmd: [String]?,
+                    entrypoint: [String]?, workingDir: String?, labels: [String: String]?,
+                    stopSignal: String?, volumes: [String: Empty]?) {
+            self.user = user
+            self.exposedPorts = exposedPorts
+            self.env = env
+            self.cmd = cmd
+            self.entrypoint = entrypoint
+            self.workingDir = workingDir
+            self.labels = labels
+            self.stopSignal = stopSignal
+            self.volumes = volumes
+        }
     }
 
     public struct RootFS: Codable, Sendable {
@@ -92,6 +128,11 @@ public struct OCIImageConfig: Codable, Sendable {
         enum CodingKeys: String, CodingKey {
             case type
             case diffIDs = "diff_ids"
+        }
+
+        public init(type: String, diffIDs: [String]) {
+            self.type = type
+            self.diffIDs = diffIDs
         }
     }
 
@@ -106,9 +147,18 @@ public struct OCIImageConfig: Codable, Sendable {
             case createdBy = "created_by"
             case emptyLayer = "empty_layer"
         }
+
+        public init(created: String?, createdBy: String?, emptyLayer: Bool?, comment: String?) {
+            self.created = created
+            self.createdBy = createdBy
+            self.emptyLayer = emptyLayer
+            self.comment = comment
+        }
     }
 
-    public struct Empty: Codable, Sendable {}
+    public struct Empty: Codable, Sendable {
+        public init() {}
+    }
 }
 
 // MARK: - Image reference parsing

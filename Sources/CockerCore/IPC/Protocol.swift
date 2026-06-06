@@ -21,6 +21,10 @@ public enum IPCRequestType: String, Codable, Sendable {
     case pull, push, build, images, rmi, imageInspect, tag
     case imageHistory, imagePrune
     case save, load
+    // Commit / export / import
+    case commit, export, containerImport
+    // Update
+    case update
     // Network
     case networkCreate, networkRm, networkLs, networkInspect, networkConnect, networkDisconnect
     // Volume
@@ -357,6 +361,36 @@ public struct ComposeLsResponse: Codable, Sendable {
     }
     public let projects: [ProjectInfo]
     public init(projects: [ProjectInfo]) { self.projects = projects }
+}
+
+public struct CommitRequest: Codable, Sendable {
+    public let containerID: String
+    public let tag: String
+    public let author: String?
+    public let message: String?
+    public init(containerID: String, tag: String, author: String? = nil, message: String? = nil) {
+        self.containerID = containerID; self.tag = tag; self.author = author; self.message = message
+    }
+}
+
+public struct ExportRequest: Codable, Sendable {
+    public let containerID: String
+    public init(containerID: String) { self.containerID = containerID }
+}
+
+public struct ContainerImportRequest: Codable, Sendable {
+    public let tarData: Data
+    public let tag: String
+    public init(tarData: Data, tag: String) { self.tarData = tarData; self.tag = tag }
+}
+
+public struct UpdateRequest: Codable, Sendable {
+    public let containerID: String
+    public let cpus: Int?
+    public let memoryMB: UInt64?
+    public init(containerID: String, cpus: Int? = nil, memoryMB: UInt64? = nil) {
+        self.containerID = containerID; self.cpus = cpus; self.memoryMB = memoryMB
+    }
 }
 
 // MARK: - Version

@@ -432,6 +432,26 @@ final class DaemonServer {
             case .top:
                 try sendResponse(requestId: request.id, payload: "PID   USER   COMMAND\n1     root   /sbin/init\n", to: fd)
 
+            case .commit:
+                let req = try JSONDecoder().decode(CommitRequest.self, from: request.payload)
+                let result = try await handleCommit(req)
+                try sendResponse(requestId: request.id, payload: result, to: fd)
+
+            case .export:
+                let req = try JSONDecoder().decode(ExportRequest.self, from: request.payload)
+                let tarData = try await handleExport(req.containerID)
+                try sendResponse(requestId: request.id, payload: SaveResponse(tarData: tarData), to: fd)
+
+            case .containerImport:
+                let req = try JSONDecoder().decode(ContainerImportRequest.self, from: request.payload)
+                let img = try await engine.images.importTar(req.tarData, tag: req.tag)
+                try sendResponse(requestId: request.id, payload: img, to: fd)
+
+            case .update:
+                let req = try JSONDecoder().decode(UpdateRequest.self, from: request.payload)
+                try await handleUpdate(req)
+                try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
+
             case .setup:
                 try await performSetup(requestId: request.id, to: fd)
 
@@ -706,6 +726,52 @@ final class DaemonServer {
         }.sorted { $0.name < $1.name }
 
         return ComposeLsResponse(projects: infos)
+    }
+
+    // MARK: - Commit
+
+    private func handleCommit(_ req: CommitRequest) async throws -> ImageInfo {
+        guard let container = await engine.state.container(id: req.containerID) else {
+            throw CockerError.containerNotFound(req.containerID)
+        }
+        let img = try await engine.images.find(container.image)
+        let rootfsDir = await engine.images.store.rootfsDirectory(for: img)
+        guard FileManager.default.fileExists(atPath: rootfsDir.path) else {
+            throw CockerError.imageNotFound("\(container.image) (rootfs not available)")
+        }
+        return try await engine.images.commit(
+            fromRootfs: rootfsDir,
+            tag: req.tag,
+            baseImage: img,
+            author: req.author,
+            message: req.message
+        )
+    }
+
+    // MARK: - Export
+
+    private func handleExport(_ containerID: String) async throws -> Data {
+        guard let container = await engine.state.container(id: containerID) else {
+            throw CockerError.containerNotFound(containerID)
+        }
+        let img = try await engine.images.find(container.image)
+        let rootfsDir = await engine.images.store.rootfsDirectory(for: img)
+        guard FileManager.default.fileExists(atPath: rootfsDir.path) else {
+            throw CockerError.imageNotFound("\(container.image) (rootfs not available)")
+        }
+        return try await engine.images.exportRootfs(at: rootfsDir)
+    }
+
+    // MARK: - Update
+
+    private func handleUpdate(_ req: UpdateRequest) async throws {
+        guard let _ = await engine.state.container(id: req.containerID) else {
+            throw CockerError.containerNotFound(req.containerID)
+        }
+        try await engine.state.updateContainer(id: req.containerID) { c in
+            if let cpus = req.cpus { c.cpuCount = cpus }
+            if let mem = req.memoryMB { c.memoryMB = mem }
+        }
     }
 
     // MARK: - Setup

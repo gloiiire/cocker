@@ -259,6 +259,12 @@ public struct RunConfig: Codable, Sendable {
     public var restartPolicy: RestartPolicy
     public var capAdd: [String]
     public var capDrop: [String]
+    public var addHosts: [String]
+    public var dnsServers: [String]
+    public var dnsSearch: [String]
+    public var volumesFrom: [String]
+    public var tmpfsMounts: [String]
+    public var readOnly: Bool
 
     public init(image: String, command: [String] = []) {
         self.image = image
@@ -282,6 +288,12 @@ public struct RunConfig: Codable, Sendable {
         self.restartPolicy = .no
         self.capAdd = []
         self.capDrop = []
+        self.addHosts = []
+        self.dnsServers = []
+        self.dnsSearch = []
+        self.volumesFrom = []
+        self.tmpfsMounts = []
+        self.readOnly = false
     }
 }
 

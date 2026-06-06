@@ -45,6 +45,14 @@ final class ContainerEngine {
         // Resolve ports
         let ports = config.ports
 
+        // Resolve volumes from other containers
+        var resolvedVolumes = config.volumes
+        for sourceID in config.volumesFrom {
+            if let sourceContainer = await state.container(id: sourceID) {
+                resolvedVolumes.append(contentsOf: sourceContainer.volumes)
+            }
+        }
+
         // Create container record
         var container = Container(
             id: id,
@@ -52,7 +60,7 @@ final class ContainerEngine {
             image: config.image,
             command: config.command,
             ports: ports,
-            volumes: config.volumes,
+            volumes: resolvedVolumes,
             env: config.env,
             labels: config.labels,
             networkMode: config.networkMode,
@@ -360,10 +368,51 @@ final class ContainerEngine {
         while true {
             try? await Task.sleep(nanoseconds: 500_000_000)
             if !(await vmRuntime.isRunning(containerID: id)) {
+                guard let container = await state.container(id: id) else { break }
+
+                // Record exit
+                try? await state.updateContainer(id: id) { c in
+                    c.finishedAt = Date()
+                    if c.exitCode == nil { c.exitCode = 0 }
+                }
+
+                // Check restart policy
+                let exitCode = container.exitCode ?? 0
+                var shouldRestart = false
+                switch container.restartPolicy {
+                case .always:
+                    shouldRestart = true
+                case .unlessStopped:
+                    // Restart unless manually stopped (status == .stopped means user stopped it)
+                    shouldRestart = container.status != .stopped
+                case .onFailure:
+                    shouldRestart = exitCode != 0
+                case .no:
+                    shouldRestart = false
+                }
+
+                if shouldRestart {
+                    try? await state.updateContainer(id: id) { c in
+                        c.status = .restarting
+                    }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)  // 1s backoff
+                    if let c = await state.container(id: id) {
+                        let rootfsPath = try? await images.rootfsPath(for: c.image)
+                        if let rootfsPath {
+                            try? await vmRuntime.start(container: c, rootfsPath: rootfsPath)
+                            try? await state.updateContainer(id: id) { c in
+                                c.status = .running
+                                c.startedAt = Date()
+                                c.exitCode = nil
+                            }
+                        }
+                    }
+                    continue  // Keep watching
+                }
+
+                // Container truly stopped
                 try? await state.updateContainer(id: id) { c in
                     c.status = .stopped
-                    c.finishedAt = Date()
-                    c.exitCode = 0
                 }
                 if rm {
                     try? await state.removeContainer(id: id)

@@ -47,6 +47,10 @@ struct CockerCLI: AsyncParsableCommand {
             ImageInspectCommand.self,
             SaveCommand.self,
             LoadCommand.self,
+            CommitCommand.self,
+            ExportCommand.self,
+            ImportCommand.self,
+            UpdateCommand.self,
 
             // Network
             NetworkCommand.self,

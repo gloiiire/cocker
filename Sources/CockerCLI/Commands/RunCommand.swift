@@ -62,6 +62,27 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customLong("cap-drop"), help: "Drop Linux capabilities")
     var capDrop: [String] = []
 
+    @Option(name: .customLong("env-file"), help: "Read environment variables from a file")
+    var envFile: [String] = []
+
+    @Option(name: .customLong("add-host"), help: "Add an entry to /etc/hosts (host:ip)")
+    var addHosts: [String] = []
+
+    @Option(name: .customLong("dns"), help: "Custom DNS server")
+    var dns: [String] = []
+
+    @Option(name: .customLong("dns-search"), help: "Custom DNS search domain")
+    var dnsSearch: [String] = []
+
+    @Option(name: .customLong("volumes-from"), help: "Mount volumes from another container")
+    var volumesFrom: [String] = []
+
+    @Option(name: .customLong("tmpfs"), help: "Mount a tmpfs directory (e.g. /run:size=64m)")
+    var tmpfs: [String] = []
+
+    @Flag(name: .customLong("read-only"), help: "Mount root filesystem as read-only")
+    var readOnly = false
+
     @Argument(help: "Image to run")
     var image: String
 
@@ -88,6 +109,32 @@ struct RunCommand: AsyncParsableCommand {
         config.restartPolicy = RestartPolicy(rawValue: restart) ?? .no
         config.capAdd = capAdd
         config.capDrop = capDrop
+
+        // Parse env files
+        for file in envFile {
+            let path = file.hasPrefix("/") ? file : FileManager.default.currentDirectoryPath + "/" + file
+            if let content = try? String(contentsOfFile: path, encoding: .utf8) {
+                for line in content.components(separatedBy: .newlines) {
+                    let trimmed = line.trimmingCharacters(in: .whitespaces)
+                    if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+                    let parts = trimmed.split(separator: "=", maxSplits: 1)
+                    if parts.count == 2 {
+                        config.env[String(parts[0])] = String(parts[1])
+                    } else {
+                        config.env[trimmed] = ProcessInfo.processInfo.environment[trimmed] ?? ""
+                    }
+                }
+            } else {
+                fputs("Warning: env-file not found: \(file)\n", stderr)
+            }
+        }
+
+        config.addHosts = addHosts
+        config.dnsServers = dns
+        config.dnsSearch = dnsSearch
+        config.volumesFrom = volumesFrom
+        config.tmpfsMounts = tmpfs
+        config.readOnly = readOnly
 
         let client = IPCClient()
         let request = try IPCRequest(type: .run, payload: RunRequest(config: config))
