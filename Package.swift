@@ -12,9 +12,9 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
         // swift-log 1.13+ exige swift-tools-version 6.2 (Xcode 26), pas dispo
         // sur macos-15 runner (Xcode 16.4 max = Swift 6.1). Cap à < 1.13.
-        .package(url: "https://github.com/apple/swift-log", "1.5.0"..<"1.13.0"),
-        .package(url: "https://github.com/apple/swift-crypto", from: "3.0.0"),
-        .package(url: "https://github.com/jpsim/Yams", from: "5.1.0"),
+        .package(url: "https://github.com/apple/swift-log", "1.5.0"..<"2.0.0"),
+        .package(url: "https://github.com/apple/swift-crypto", from: "4.5.0"),
+        .package(url: "https://github.com/jpsim/Yams", from: "6.2.2"),
     ],
     targets: [
         .target(
