@@ -121,6 +121,14 @@ actor DNSServer {
     }
 
     private func handleTCPClient(fd: Int32) async {
+        await handleStreamedDNSQuery(fd: fd)
+    }
+
+    /// Read a DNS-over-TCP framed query from `fd`, build a response, write it
+    /// back framed, close the fd. Used by both the TCP listener and the vsock
+    /// listener — the wire is identical (RFC 1035 §4.2.2). Caller transfers
+    /// fd ownership.
+    func handleStreamedDNSQuery(fd: Int32) async {
         defer { close(fd) }
         var lenBuf: [UInt8] = [0, 0]
         guard Self.readAll(fd: fd, into: &lenBuf, count: 2) else { return }
@@ -151,10 +159,9 @@ actor DNSServer {
         } else {
             response = forwardToUpstream(query, upstream: Self.upstreamDNS)
                 ?? buildNXDomain(header: header, question: question)
-            logDNS(question.name, result: "upstream(tcp)", authoritative: false)
+            logDNS(question.name, result: "upstream", authoritative: false)
         }
 
-        // Send back with 2-byte length prefix
         let prefix: [UInt8] = [UInt8((response.count >> 8) & 0xFF), UInt8(response.count & 0xFF)]
         _ = prefix.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, 2) }
         _ = response.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, response.count) }
