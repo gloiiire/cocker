@@ -19,51 +19,72 @@ Cocker runs Linux containers natively on macOS using lightweight Apple VMs — n
 
 - Apple Silicon Mac (M1 or later)
 - macOS 14.0 Sonoma or later
-- Xcode 15.0 or later (for building)
-- Apple container runtime: `brew install apple/container/container`
+- Xcode 15.0 or later (for building / signing)
+- An **Apple Development** signing certificate (free with any Apple ID — see below)
+- Apple's container Linux kernel: `brew install container`
 
 ## Installation
 
 ### Via Homebrew (recommended)
 
 ```bash
-brew tap gloiiire-/cocker
+brew tap gloiiire/cocker
 brew install cocker
 brew services start cocker
 ```
 
+The formula builds from source and, in `post_install`, auto-detects your **Apple Development** certificate to sign `cockerd` with the Virtualization entitlement. If no cert is found, it tells you exactly how to create one (Xcode → Settings → Accounts → Manage Certificates → +) and then run `brew postinstall cocker`.
+
+Why a cert is required: `cockerd` calls `Virtualization.framework`, and macOS only grants the `com.apple.security.virtualization` entitlement to binaries signed by a real Apple developer certificate — not an ad-hoc signature. The cert is free; only an Apple ID is needed.
+
+See the [`gloiiire/homebrew-cocker`](https://github.com/gloiiire/homebrew-cocker) tap for full details.
+
 ### From source
 
 ```bash
-git clone https://github.com/gloiiire-/cocker
+git clone https://github.com/gloiiire/cocker
 cd cocker
-swift build -c release --disable-sandbox
-
-# Sign cockerd with required entitlements
-codesign --force --sign - \
-  --entitlements entitlements/cockerd.entitlements \
-  .build/release/cockerd
-
-# Install
-cp .build/release/cocker /usr/local/bin/
-cp .build/release/cockerd /usr/local/bin/
+./install.sh
 ```
 
-## Setup
+`install.sh` does the whole dance: checks prereqs, builds `cocker` + `cockerd` + `cocker-init` (the Linux PID 1 used inside each VM), signs `cockerd` with your Apple Development cert, populates `~/.cocker/kernel/`, and registers a LaunchAgent that keeps the daemon running.
+
+## Verify
 
 ```bash
-# Install Apple container runtime (provides Linux kernel + initrd)
-brew install apple/container/container
-
-# Set up Cocker (links kernel files)
-cockerd setup
-
-# Start the daemon
-cockerd &
-
-# Verify
 cocker version
 cocker info
+```
+
+## Help & man pages
+
+Every command and subcommand supports `-h` / `--help`:
+
+```bash
+cocker --help
+cocker run --help
+cocker compose up --help
+```
+
+`install.sh` also generates and installs man pages (via the `swift-argument-parser` `GenerateManual` plugin) into `$PREFIX/share/man/man1/`. Pages are named with dots, one per subcommand:
+
+```bash
+man cocker              # root page
+man cocker.run          # subcommand (dot, not dash)
+man cocker.compose.up
+```
+
+If `man cocker` returns "No manual entry", add the install prefix to your `MANPATH`:
+
+```bash
+export MANPATH="$HOME/.local/share/man:$(manpath 2>/dev/null)"
+```
+
+To regenerate pages from a source checkout:
+
+```bash
+swift package --allow-writing-to-package-directory generate-manual --multi-page
+# output: .build/plugins/GenerateManual/outputs/CockerCLI/*.1
 ```
 
 ## Usage

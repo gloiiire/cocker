@@ -113,6 +113,57 @@ public actor ImageStore {
         FileManager.default.fileExists(atPath: rootfsDirectory(for: image).path)
     }
 
+    /// Répertoire d'un container : son rootfs personnel cloné depuis l'image
+    public func containerRootfsDirectory(containerID: String) -> URL {
+        rootDir.appendingPathComponent("containers/\(containerID)/rootfs")
+    }
+
+    /// Clone le rootfs d'une image vers un dossier dédié au container via APFS
+    /// `clonefile()` (copy-on-write natif macOS). Instantané, zéro coût disque
+    /// jusqu'à modification. Garantit l'isolation : 2 containers de la même
+    /// image n'écrivent plus dans le même rootfs partagé (bug critique du PoC).
+    ///
+    /// Fallback : si clonefile échoue (filesystem non-APFS, etc.), on retombe
+    /// sur cp -R classique.
+    public func cloneRootfs(for image: ImageInfo, containerID: String) throws -> URL {
+        let source = rootfsDirectory(for: image)
+        guard FileManager.default.fileExists(atPath: source.path) else {
+            throw CockerError.internalError("Source rootfs introuvable: \(source.path)")
+        }
+
+        let dest = containerRootfsDirectory(containerID: containerID)
+        let destParent = dest.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: destParent, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: dest)
+
+        // clonefile(3) — copy-on-write APFS, syscall direct via Darwin
+        let result = source.path.withCString { src in
+            dest.path.withCString { dst in
+                Darwin.clonefile(src, dst, 0)
+            }
+        }
+        if result == 0 { return dest }
+
+        // Fallback : cp -R si clonefile échoue (rare : non-APFS, perms, etc.)
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/cp")
+        proc.arguments = ["-R", source.path, dest.path]
+        try proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else {
+            throw CockerError.internalError("cp -R fallback échoué pour \(source.path) → \(dest.path)")
+        }
+        return dest
+    }
+
+    /// Supprime le rootfs d'un container (et son dossier parent).
+    /// Utilisé au `rm` d'un container, ou à son cleanup automatique.
+    public func removeContainerRootfs(containerID: String) throws {
+        let containerDir = rootDir
+            .appendingPathComponent("containers/\(containerID)")
+        try? FileManager.default.removeItem(at: containerDir)
+    }
+
     public func extractRootfs(
         for image: ImageInfo,
         layers: [OCIDescriptor],

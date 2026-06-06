@@ -163,12 +163,16 @@ struct ComposePsCommand: AsyncParsableCommand {
     var projectName: String?
 
     mutating func run() async throws {
-        let composePath = resolvePath(file)
+        // Détermine le project name : argument explicite, ou dossier du compose file
+        let project = projectName ?? URL(fileURLWithPath: resolvePath(file))
+            .deletingLastPathComponent().lastPathComponent
+
         let client = IPCClient()
-        let payload = ComposeRequest(composePath: composePath, projectName: projectName)
-        let request = try IPCRequest(type: .composeUp, payload: payload)
+        // Utilise `ps` avec filter label pour récupérer les containers du projet
+        let payload = PSRequest(all: true, filter: ["label": "com.cocker.project=\(project)"])
+        let request = try IPCRequest(type: .ps, payload: payload)
         let response = try await client.send(request)
-        let containers = try response.decode([Container].self)
+        let containers = try response.decode(PSResponse.self).containers
 
         let columns: [TableFormatter.Column] = [
             .init("NAME", min: 24),
