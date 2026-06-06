@@ -378,9 +378,42 @@ int main(int argc, char **argv) {
 
     info("exec: %s (argc=%d)", child_argv[0], argc_count);
 
-    /* exec the container's command as PID 1 */
-    execvp(child_argv[0], child_argv);
+    /*
+     * Fork + wait pattern : on garde PID 1 vivant pour éviter le kernel panic
+     * quand la commande container exit. Sans ça, exec direct = quand le shell
+     * meurt, le kernel panic "Attempted to kill init!" et la VM tourne en
+     * boucle à ~200% CPU jusqu'à kill manuel (vu en vrai sur M3 Max).
+     */
+    pid_t child = fork();
+    if (child < 0)
+        die("fork: %s", strerror(errno));
 
-    /* If we get here, exec failed */
-    die("execvp %s: %s", child_argv[0], strerror(errno));
+    if (child == 0) {
+        execvp(child_argv[0], child_argv);
+        fprintf(stderr, "[cocker-init] execvp %s: %s\n", child_argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    /* PID 1 : reap zombies + wait child principal */
+    int status = 0;
+    while (1) {
+        pid_t r = waitpid(-1, &status, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (errno == ECHILD) break;
+            die("waitpid: %s", strerror(errno));
+        }
+        if (r == child) break;
+    }
+
+    int exitcode = 0;
+    if (WIFEXITED(status))         exitcode = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status))  exitcode = 128 + WTERMSIG(status);
+
+    info("container exited with code %d", exitcode);
+
+    /* Shutdown propre — évite le kernel panic. */
+    sync();
+    reboot(RB_POWER_OFF);
+    _exit(exitcode);
 }
