@@ -22,6 +22,8 @@ actor DNSServer {
     private let state: StateStore
     private let port: UInt16
     private var serverFD: Int32 = -1
+    private var bridgeFD: Int32 = -1  // second listener bound on bridge100 IP
+    private var tcpFD: Int32 = -1     // TCP listener (used by VMs via cocker-init DNS proxy)
     private var isRunning = false
 
     // Cache de résolution : name → ip, invalidé à chaque changement
@@ -64,14 +66,155 @@ actor DNSServer {
 
         self.serverFD = fd
         self.isRunning = true
-        print("[cockerd] DNS resolver listening on 0.0.0.0:\(port)")
+        fputs("[cockerd] DNS resolver listening on 0.0.0.0:\(port) (UDP)\n", stderr)
+        fflush(stderr)
 
-        await receiveLoop()
+        // TCP listener — used by cocker-init's in-VM DNS proxy. Apple's
+        // App Sandbox blocks UDP packets from vmnet to user-signed daemons,
+        // but TCP from VM works. See start_dns_proxy() in cocker-init/init.c.
+        if let tfd = Self.bindTCP(port: port) {
+            self.tcpFD = tfd
+            fputs("[cockerd] DNS resolver listening on 0.0.0.0:\(port) (TCP)\n", stderr)
+            fflush(stderr)
+            Task { await self.tcpAcceptLoop(fd: tfd) }
+        } else {
+            fputs("[cockerd] WARN: TCP DNS listener bind failed\n", stderr)
+            fflush(stderr)
+        }
+
+        // Bonus UDP bind on bridge100 (in case the sandbox ever relaxes).
+        Task { await self.bridgeBindLoop() }
+
+        await receiveLoop(fd: serverFD)
+    }
+
+    // MARK: - TCP DNS (RFC 1035 §4.2.2)
+
+    private static func bindTCP(port: UInt16) -> Int32? {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        var reuse: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr.s_addr = INADDR_ANY
+        let bindOK = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if bindOK != 0 { close(fd); return nil }
+        if listen(fd, 128) != 0 { close(fd); return nil }
+        return fd
+    }
+
+    private func tcpAcceptLoop(fd: Int32) async {
+        while isRunning {
+            let cfd = await Task.detached(priority: .userInitiated) { [fd] in
+                Darwin.accept(fd, nil, nil)
+            }.value
+            if cfd < 0 { try? await Task.sleep(nanoseconds: 50_000_000); continue }
+            Task { await self.handleTCPClient(fd: cfd) }
+        }
+    }
+
+    private func handleTCPClient(fd: Int32) async {
+        defer { close(fd) }
+        var lenBuf: [UInt8] = [0, 0]
+        guard Self.readAll(fd: fd, into: &lenBuf, count: 2) else { return }
+        let msgLen = (Int(lenBuf[0]) << 8) | Int(lenBuf[1])
+        guard msgLen > 0, msgLen <= 65535 else { return }
+
+        var msgBuf = [UInt8](repeating: 0, count: msgLen)
+        guard Self.readAll(fd: fd, into: &msgBuf, count: msgLen) else { return }
+        let query = Data(msgBuf)
+
+        guard query.count > DNSHeader.size else { return }
+        let header = DNSHeader(data: query)
+        guard header.isQuery, header.opcode == 0 else { return }
+
+        let (questions, _) = parseDNSQuestions(from: query, count: Int(header.qdCount))
+        guard let question = questions.first else { return }
+
+        let response: Data
+        if let ip = await resolve(name: question.name), (question.isA || question.isAny) {
+            response = buildAResponse(header: header, question: question, ip: ip)
+            logDNS(question.name, result: ip, authoritative: true)
+        } else if question.isAAAA {
+            if let ipv6 = await resolveIPv6(name: question.name) {
+                response = buildAAAAResponse(header: header, question: question, ipv6: ipv6)
+            } else {
+                response = buildEmptyResponse(header: header, question: question)
+            }
+        } else {
+            response = forwardToUpstream(query, upstream: Self.upstreamDNS)
+                ?? buildNXDomain(header: header, question: question)
+            logDNS(question.name, result: "upstream(tcp)", authoritative: false)
+        }
+
+        // Send back with 2-byte length prefix
+        let prefix: [UInt8] = [UInt8((response.count >> 8) & 0xFF), UInt8(response.count & 0xFF)]
+        _ = prefix.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, 2) }
+        _ = response.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, response.count) }
+    }
+
+    private static func readAll(fd: Int32, into buf: inout [UInt8], count: Int) -> Bool {
+        var off = 0
+        while off < count {
+            let n = buf.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return -1 }
+                return read(fd, base.advanced(by: off), count - off)
+            }
+            if n <= 0 { return false }
+            off += n
+        }
+        return true
+    }
+
+    private func bridgeBindLoop() async {
+        while isRunning {
+            if bridgeFD < 0 {
+                if let ip = Self.vmnetGatewayIP(),
+                   let fd = Self.bindUDP(on: ip, port: port) {
+                    bridgeFD = fd
+                    fputs("[cockerd] DNS resolver also listening on \(ip):\(port) (bridge100)\n", stderr)
+                    fflush(stderr)
+                    Task { await self.receiveLoop(fd: fd) }
+                }
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+    }
+
+    private static func bindUDP(on ip: String, port: UInt16) -> Int32? {
+        let fd = socket(AF_INET, SOCK_DGRAM, 0)
+        guard fd >= 0 else { return nil }
+        var reuse: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        if inet_pton(AF_INET, ip, &addr.sin_addr) != 1 {
+            close(fd); return nil
+        }
+        let ok = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if ok != 0 { close(fd); return nil }
+        return fd
     }
 
     func stop() {
         isRunning = false
         if serverFD >= 0 { close(serverFD); serverFD = -1 }
+        if bridgeFD >= 0 { close(bridgeFD); bridgeFD = -1 }
+        if tcpFD >= 0 { close(tcpFD); tcpFD = -1 }
     }
 
     // Invalide le cache quand un container démarre/s'arrête
@@ -82,13 +225,13 @@ actor DNSServer {
 
     // MARK: - Receive loop
 
-    private func receiveLoop() async {
+    private func receiveLoop(fd: Int32) async {
         var buf = [UInt8](repeating: 0, count: 4096)
         var clientAddr = sockaddr_in()
         var clientAddrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
 
         while isRunning {
-            let n = await Task.detached(priority: .userInitiated) { [fd = serverFD] in
+            let n = await Task.detached(priority: .userInitiated) { [fd] in
                 withUnsafeMutablePointer(to: &clientAddr) { ptr in
                     ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                         recvfrom(fd, &buf, buf.count, 0, sa, &clientAddrLen)
@@ -106,13 +249,13 @@ actor DNSServer {
                 return "\(b[0]).\(b[1]).\(b[2]).\(b[3])"
             }
 
-            Task { await self.handlePacket(packet, clientIP: clientIP, clientPort: clientPort) }
+            Task { await self.handlePacket(packet, clientIP: clientIP, clientPort: clientPort, viaFD: fd) }
         }
     }
 
     // MARK: - Packet handler
 
-    private func handlePacket(_ data: Data, clientIP: String, clientPort: UInt16) async {
+    private func handlePacket(_ data: Data, clientIP: String, clientPort: UInt16, viaFD: Int32) async {
         let header = DNSHeader(data: data)
         guard header.isQuery, header.opcode == 0 else { return }  // Standard query only
 
@@ -140,7 +283,7 @@ actor DNSServer {
             logDNS(question.name, result: "upstream", authoritative: false)
         }
 
-        sendResponse(response, toIP: clientIP, port: clientPort)
+        sendResponse(response, toIP: clientIP, port: clientPort, viaFD: viaFD)
     }
 
     // MARK: - Name resolution
@@ -161,7 +304,11 @@ actor DNSServer {
         let candidates = normalizedNames(from: name)
 
         for container in containers {
-            guard let ip = container.ip else { continue }
+            // Prefer the cocker switch IP (10.42.x.x) when present : container-to-
+            // container traffic goes through the userspace L2 switch and that IP
+            // is the only one reachable from peer VMs. Fall back to the legacy
+            // vmnet IP for installs that haven't yet been migrated.
+            guard let ip = container.cockerIP ?? container.ip else { continue }
 
             // Match direct sur le nom du container
             if candidates.contains(container.name) { return ip }
@@ -279,7 +426,7 @@ actor DNSServer {
 
     // MARK: - Send response
 
-    private func sendResponse(_ data: Data, toIP ip: String, port: UInt16) {
+    private func sendResponse(_ data: Data, toIP ip: String, port: UInt16, viaFD: Int32) {
         var dest = sockaddr_in()
         dest.sin_family = sa_family_t(AF_INET)
         dest.sin_port = port.bigEndian
@@ -289,7 +436,7 @@ actor DNSServer {
             guard let ptr = buf.baseAddress else { return }
             withUnsafePointer(to: &dest) { addrPtr in
                 addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    _ = sendto(serverFD, ptr, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    _ = sendto(viaFD, ptr, data.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
                 }
             }
         }
@@ -304,32 +451,43 @@ actor DNSServer {
 
     // MARK: - Host IP helper
 
-    // Retourne l'IP du host accessible depuis les VMs
-    // (utilisée pour écrire /etc/resolv.conf dans les containers)
+    // IP du host accessible depuis les VMs container.
+    //
+    // VZNATNetworkDeviceAttachment d'Apple utilise un subnet vmnet privé
+    // 192.168.64.0/24 avec le host à .1. Cette convention est stable depuis
+    // macOS 11 et utilisée par tous les VMM Mac (Lima, tart, multipass…).
+    // Les autres interfaces du host (bridge0/en0 = LAN, utun = VPN…) ne
+    // sont pas routables depuis les VMs vmnet.
+    //
+    // On préfère détecter dynamiquement bridge100 si elle existe (au cas où
+    // Apple change l'IP par défaut), sinon on retombe sur 192.168.64.1.
     static func hostIP() -> String {
+        if let ip = vmnetGatewayIP() { return ip }
+        return "192.168.64.1"
+    }
+
+    private static func vmnetGatewayIP() -> String? {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return "127.0.0.1" }
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
         defer { freeifaddrs(ifaddr) }
 
         var current: UnsafeMutablePointer<ifaddrs>? = firstAddr
         while let addr = current {
-            let name = String(cString: addr.pointee.ifa_name)
-            let family = addr.pointee.ifa_addr.pointee.sa_family
+            defer { current = addr.pointee.ifa_next }
 
-            // On veut en0 ou utun0 ou vmenet0 — pas localhost
-            if family == UInt8(AF_INET) && (name.hasPrefix("en") || name.hasPrefix("bridge")) {
-                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                addr.pointee.ifa_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
-                    inet_ntop(AF_INET, &sin.pointee.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
-                }
-                let ip = String(cString: buf)
-                if !ip.hasPrefix("127.") && !ip.isEmpty {
-                    current = nil
-                    return ip
-                }
+            let name = String(cString: addr.pointee.ifa_name)
+            // Apple's vmnet bridge for VZNATNetworkDeviceAttachment is
+            // always named bridge100 / bridge101 / … (vmenet* on older OS).
+            guard name.hasPrefix("bridge1") || name.hasPrefix("vmenet") else { continue }
+            guard addr.pointee.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+            var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            addr.pointee.ifa_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+                _ = inet_ntop(AF_INET, &sin.pointee.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
             }
-            current = addr.pointee.ifa_next
+            let ip = String(cString: buf)
+            if !ip.isEmpty && !ip.hasPrefix("127.") { return ip }
         }
-        return "192.168.64.1"  // fallback vmnet gateway
+        return nil
     }
 }
