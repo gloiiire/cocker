@@ -81,6 +81,7 @@ info "Installation dans $BIN_DIR..."
 mkdir -p "$BIN_DIR" "$MAN_DIR"
 install -m 755 .build/release/cocker "$BIN_DIR/cocker"
 install -m 755 .build/release/cockerd "$BIN_DIR/cockerd"
+install -m 755 .build/release/cocker-portfwd "$BIN_DIR/cocker-portfwd"
 install -m 644 "$MAN_SRC"/*.1 "$MAN_DIR/"
 ok "Binaires + man pages installés ($MAN_DIR)"
 
