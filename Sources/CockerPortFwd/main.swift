@@ -1,25 +1,19 @@
 import Foundation
-
-// cocker-portfwd — TCP port forwarder dédié.
-//
-// Pourquoi un binaire séparé : `cockerd` est signé avec l'entitlement
-// `com.apple.security.virtualization`, qui implique un sandbox macOS qui
-// bloque les `connect()` outbound vers les bridges privés vmnet
-// (192.168.64.0/24). Erreur observée : EHOSTUNREACH ("No route to host")
-// alors que `curl` direct depuis le terminal marche.
-//
-// Ce binaire-ci est signé SANS cet entitlement (ad-hoc suffit) → pas de
-// sandbox → peut connect aux IPs vmnet.
-//
-// Usage :
-//   cocker-portfwd --listen 0.0.0.0:8080 --target 192.168.64.5:80
-//
-// Lance un listener et forward chaque connexion entrante. Reste online
-// jusqu'à SIGTERM/SIGINT.
-
 import Darwin
 
-// MARK: - Args parsing
+// cocker-portfwd — TCP port forwarder.
+//
+// Architecture : on accept des connexions client soi-même (binaire user-signed,
+// pas de problème pour accept() sur 0.0.0.0), puis pour chaque connexion on
+// spawn /usr/bin/nc (binaire Apple système) qui se charge du connect() vers
+// l'IP container du bridge vmnet privé. macOS Sequoia bloque connect() vers
+// 192.168.64.0/24 depuis tout binaire NON-Apple-signed, mais autorise
+// /usr/bin/nc même quand il est lancé comme subprocess d'un binaire user-signed.
+//
+// Le pipe stdin/stdout du nc est branché sur le socket client → forwarding
+// bidirectionnel via deux pumps.
+
+// MARK: - Args
 
 struct Args {
     var listenAddr: String = "0.0.0.0"
@@ -32,8 +26,7 @@ struct Args {
         var i = 1
         let argv = CommandLine.arguments
         while i < argv.count {
-            let arg = argv[i]
-            switch arg {
+            switch argv[i] {
             case "--listen":
                 i += 1
                 guard i < argv.count else { return nil }
@@ -41,8 +34,6 @@ struct Args {
                 if parts.count == 2 {
                     args.listenAddr = String(parts[0])
                     args.listenPort = UInt16(parts[1]) ?? 0
-                } else {
-                    args.listenPort = UInt16(arg) ?? 0
                 }
             case "--target":
                 i += 1
@@ -52,12 +43,10 @@ struct Args {
                 args.targetIP = String(parts[0])
                 args.targetPort = UInt16(parts[1]) ?? 0
             case "--help", "-h":
-                printUsage()
-                exit(0)
+                printUsage(); exit(0)
             default:
-                fputs("cocker-portfwd: unknown arg \(arg)\n", stderr)
-                printUsage()
-                exit(2)
+                fputs("cocker-portfwd: unknown arg \(argv[i])\n", stderr)
+                printUsage(); exit(2)
             }
             i += 1
         }
@@ -72,16 +61,12 @@ func printUsage() {
     print("""
     Usage: cocker-portfwd --listen ADDR:PORT --target IP:PORT
 
-      --listen ADDR:PORT  Bind interface and port (use 0.0.0.0 for all)
-      --target IP:PORT    Container IP and port to forward to
-      --help              Show this message
-
-    Spawned by cockerd as a subprocess per port mapping. The separate process
-    avoids the macOS sandbox attached to com.apple.security.virtualization.
+    For each incoming TCP connection on ADDR:PORT, spawns /usr/bin/nc to
+    forward bidirectionally to IP:PORT. /usr/bin/nc is an Apple system
+    binary that can traverse the macOS Sequoia sandbox restricting
+    connect() to private vmnet bridges from user-signed binaries.
     """)
 }
-
-// MARK: - Logging
 
 func log(_ msg: String) {
     let stamp = ISO8601DateFormatter().string(from: Date())
@@ -91,75 +76,28 @@ func log(_ msg: String) {
 
 func errStr() -> String { String(cString: strerror(errno)) }
 
-// MARK: - Bidirectional pump
+// MARK: - Per-connection handler using /usr/bin/nc
 
-func pumpBidirectional(client: Int32, upstream: Int32) {
-    let q1 = DispatchQueue(label: "pump.c2u", qos: .userInitiated)
-    let q2 = DispatchQueue(label: "pump.u2c", qos: .userInitiated)
-    let closeOnce = ClosedFlag()
+func forward(clientFD: Int32, targetIP: String, targetPort: UInt16) {
+    // Spawn /usr/bin/nc avec stdin = client socket (read), stdout = client socket (write)
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
+    proc.arguments = ["\(targetIP)", "\(targetPort)"]
 
-    q1.async { pump(src: client, dst: upstream, closed: closeOnce, fd1: client, fd2: upstream) }
-    q2.async { pump(src: upstream, dst: client, closed: closeOnce, fd1: client, fd2: upstream) }
-}
+    // Brancher le socket client directement sur stdin/stdout de nc
+    let clientHandle = FileHandle(fileDescriptor: clientFD, closeOnDealloc: false)
+    proc.standardInput = clientHandle
+    proc.standardOutput = clientHandle
+    // stderr de nc → stderr du daemon (pour debug)
+    proc.standardError = FileHandle.standardError
 
-func pump(src: Int32, dst: Int32, closed: ClosedFlag, fd1: Int32, fd2: Int32) {
-    var buf = [UInt8](repeating: 0, count: 16 * 1024)
-    while !closed.isSet {
-        let n = Darwin.read(src, &buf, buf.count)
-        if n <= 0 { break }
-        let ok = buf.withUnsafeBufferPointer { ptr -> Bool in
-            guard let base = ptr.baseAddress else { return false }
-            var written = 0
-            while written < n {
-                let w = Darwin.write(dst, base + written, n - written)
-                if w <= 0 { return false }
-                written += w
-            }
-            return true
-        }
-        if !ok { break }
+    do {
+        try proc.run()
+        proc.waitUntilExit()
+    } catch {
+        log("spawn /usr/bin/nc failed: \(error)")
     }
-    if closed.tryClose() {
-        close(fd1)
-        close(fd2)
-    }
-}
-
-final class ClosedFlag: @unchecked Sendable {
-    private var flag = false
-    private let lock = NSLock()
-    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return flag }
-    func tryClose() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if flag { return false }
-        flag = true
-        return true
-    }
-}
-
-// MARK: - Upstream connect
-
-func connectUpstream(ip: String, port: UInt16) -> Int32 {
-    let sock = socket(AF_INET, SOCK_STREAM, 0)
-    guard sock >= 0 else { return -1 }
-
-    var addr = sockaddr_in()
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = port.bigEndian
-    let pton = inet_pton(AF_INET, ip, &addr.sin_addr)
-    guard pton == 1 else { close(sock); return -1 }
-
-    let result = withUnsafePointer(to: &addr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-            Darwin.connect(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-    }
-    if result != 0 {
-        log("connect \(ip):\(port) failed: \(errStr())")
-        close(sock)
-        return -1
-    }
-    return sock
+    close(clientFD)
 }
 
 // MARK: - Listener
@@ -167,8 +105,7 @@ func connectUpstream(ip: String, port: UInt16) -> Int32 {
 func runListener(addr: String, port: UInt16, targetIP: String, targetPort: UInt16) -> Never {
     let sock = socket(AF_INET, SOCK_STREAM, 0)
     guard sock >= 0 else {
-        log("socket() failed: \(errStr())")
-        exit(1)
+        log("socket() failed: \(errStr())"); exit(1)
     }
 
     var yes: Int32 = 1
@@ -189,28 +126,19 @@ func runListener(addr: String, port: UInt16, targetIP: String, targetPort: UInt1
         }
     }
     guard bindResult == 0 else {
-        log("bind \(addr):\(port) failed: \(errStr())")
-        exit(1)
+        log("bind \(addr):\(port) failed: \(errStr())"); exit(1)
     }
     guard Darwin.listen(sock, 128) == 0 else {
-        log("listen failed: \(errStr())")
-        exit(1)
+        log("listen failed: \(errStr())"); exit(1)
     }
 
-    log("listening on \(addr):\(port) → \(targetIP):\(targetPort)")
+    log("listening on \(addr):\(port) → \(targetIP):\(targetPort) (via /usr/bin/nc)")
 
-    // Handle SIGTERM/SIGINT to clean up
-    signal(SIGTERM) { _ in
-        fputs("[portfwd] SIGTERM, exiting\n", stderr)
-        exit(0)
-    }
-    signal(SIGINT) { _ in
-        fputs("[portfwd] SIGINT, exiting\n", stderr)
-        exit(0)
-    }
-    signal(SIGPIPE, SIG_IGN)  // sinon Darwin.write peut killer le process
+    signal(SIGTERM) { _ in fputs("[portfwd] SIGTERM\n", stderr); exit(0) }
+    signal(SIGINT) { _ in fputs("[portfwd] SIGINT\n", stderr); exit(0) }
+    signal(SIGPIPE, SIG_IGN)
 
-    // Accept loop
+    // Accept loop : pour chaque connexion, spawn un nc dédié dans un thread.
     while true {
         var clientAddr = sockaddr_in()
         var clientLen = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -225,16 +153,14 @@ func runListener(addr: String, port: UInt16, targetIP: String, targetPort: UInt1
             continue
         }
 
-        let upstream = connectUpstream(ip: targetIP, port: targetPort)
-        if upstream < 0 {
-            close(client)
-            continue
+        // Spawn nc dans un thread dédié pour ne pas bloquer l'accept loop
+        DispatchQueue.global(qos: .userInitiated).async {
+            forward(clientFD: client, targetIP: targetIP, targetPort: targetPort)
         }
-        pumpBidirectional(client: client, upstream: upstream)
     }
 }
 
-// MARK: - Entry point
+// MARK: - Entry
 
 guard let args = Args.parse() else {
     fputs("cocker-portfwd: missing required args\n", stderr)
@@ -242,9 +168,5 @@ guard let args = Args.parse() else {
     exit(2)
 }
 
-runListener(
-    addr: args.listenAddr,
-    port: args.listenPort,
-    targetIP: args.targetIP,
-    targetPort: args.targetPort
-)
+runListener(addr: args.listenAddr, port: args.listenPort,
+            targetIP: args.targetIP, targetPort: args.targetPort)
