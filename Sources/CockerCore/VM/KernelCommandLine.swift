@@ -1,0 +1,85 @@
+import Foundation
+
+// Pure builder for the Linux kernel boot command line that cockerd hands to
+// VZLinuxBootLoader.commandLine. Extracted from VMRuntime so the cmdline
+// construction is unit-testable without any VZ dependency.
+//
+// The result is a single space-separated string. Each cocker-specific
+// parameter is namespaced under `cocker.*` so it doesn't collide with any
+// stock kernel param. cocker-init (PID 1 in the guest) parses these from
+// /proc/cmdline. See cocker-init/init.c.
+
+public struct KernelCommandLineParams: Sendable {
+    public let container: Container
+    public let dnsIP: String
+    public let dnsPort: UInt16
+    public let dnsVsockPort: UInt32
+    public let cockerSwitchGateway: String
+
+    public init(container: Container,
+                dnsIP: String,
+                dnsPort: UInt16,
+                dnsVsockPort: UInt32 = 5353,
+                cockerSwitchGateway: String) {
+        self.container = container
+        self.dnsIP = dnsIP
+        self.dnsPort = dnsPort
+        self.dnsVsockPort = dnsVsockPort
+        self.cockerSwitchGateway = cockerSwitchGateway
+    }
+}
+
+public enum KernelCommandLine {
+    /// Build the full cmdline string for one container's VM boot.
+    public static func build(_ params: KernelCommandLineParams) -> String {
+        var parts = [
+            "console=hvc0",
+            "root=virtiofs",
+            "rootfstype=virtiofs",
+            "rw",
+            "quiet",
+            "cocker.id=\(params.container.id)",
+            "cocker.name=\(params.container.name)",
+            "cocker.dns=\(params.dnsIP)",
+            "cocker.dns_port=\(params.dnsPort)",
+            "cocker.dns_vsock_port=\(params.dnsVsockPort)",
+        ]
+
+        if !params.container.hostname.isEmpty {
+            parts.append("cocker.hostname=\(params.container.hostname)")
+        }
+
+        // L2 switch (eth1) — inter-container fabric. cocker-init brings up
+        // eth1 statically with this IP. Gateway is virtual (no host answers
+        // ARP for it) but Linux needs one to consider the subnet usable.
+        if let cIP = params.container.cockerIP, let cMAC = params.container.cockerMAC {
+            parts.append("cocker.cnet_ip=\(cIP)/16")
+            parts.append("cocker.cnet_gw=\(params.cockerSwitchGateway)")
+            parts.append("cocker.cnet_mac=\(cMAC)")
+        }
+
+        // The container's command and env vars are written into /cocker-spec
+        // (NUL-separated) because the kernel cmdline can't carry spaces or
+        // quotes inside parameter values. See writeContainerSpec().
+
+        // Port forward info — handled host-side by cocker-portfwd, but we
+        // also pass it in so cocker-init can report on it.
+        for port in params.container.ports {
+            parts.append("cocker.port.\(port.containerPort)=\(port.hostPort)/\(port.proto.rawValue)")
+        }
+
+        for (i, mount) in params.container.volumes.enumerated() {
+            parts.append("cocker.vol\(i)=vol\(i):\(mount.destination)")
+        }
+
+        if let workdir = params.container.env["WORKDIR"] {
+            parts.append("cocker.workdir=\(workdir)")
+        }
+
+        if let user = params.container.env["USER"] {
+            parts.append("cocker.user=\(user)")
+        }
+
+        return parts.joined(separator: " ")
+    }
+}

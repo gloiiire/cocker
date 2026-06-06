@@ -35,6 +35,77 @@ struct CredentialsTests {
         #expect(store.get(for: "docker.io")?.username == "bob")
         #expect(store.get(for: "quay.io") == nil)
     }
+
+    @Test func saveAndLoadRoundTrip() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cocker-test-\(UUID().uuidString)")
+            .appendingPathComponent("credentials.json")
+        defer { try? FileManager.default.removeItem(at: tmp.deletingLastPathComponent()) }
+
+        var store = CredentialStore()
+        store.credentials["ghcr.io"] = .init(username: "alice", password: "secret")
+        store.credentials["docker.io"] = .init(username: "bob", password: "hunter2")
+        try store.save(to: tmp)
+
+        let loaded = CredentialStore.load(from: tmp)
+        #expect(loaded.credentials.count == 2)
+        #expect(loaded.get(for: "ghcr.io")?.username == "alice")
+        #expect(loaded.get(for: "ghcr.io")?.password == "secret")
+        #expect(loaded.get(for: "docker.io")?.password == "hunter2")
+    }
+
+    @Test func loadFromMissingFileReturnsEmptyStore() {
+        let nonexistent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cocker-nonexistent-\(UUID().uuidString).json")
+        let loaded = CredentialStore.load(from: nonexistent)
+        #expect(loaded.credentials.isEmpty)
+    }
+
+    @Test func loadFromCorruptedFileReturnsEmptyStore() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cocker-corrupt-\(UUID().uuidString).json")
+        try "not json at all".data(using: .utf8)!.write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let loaded = CredentialStore.load(from: tmp)
+        #expect(loaded.credentials.isEmpty)
+    }
+
+    @Test func savedFileHasOwnerOnlyPermissions() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cocker-perms-\(UUID().uuidString)")
+            .appendingPathComponent("credentials.json")
+        defer { try? FileManager.default.removeItem(at: tmp.deletingLastPathComponent()) }
+
+        var store = CredentialStore()
+        store.credentials["ghcr.io"] = .init(username: "alice", password: "pw")
+        try store.save(to: tmp)
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: tmp.path)
+        let perms = attrs[.posixPermissions] as? NSNumber
+        #expect(perms?.intValue == 0o600)
+    }
+
+    @Test func saveCreatesParentDirectoryIfMissing() throws {
+        let tmpRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cocker-mkdir-\(UUID().uuidString)")
+        let nested = tmpRoot.appendingPathComponent("deep/nested/dir/credentials.json")
+        defer { try? FileManager.default.removeItem(at: tmpRoot) }
+
+        var store = CredentialStore()
+        store.credentials["ghcr.io"] = .init(username: "x", password: "y")
+        try store.save(to: nested)
+
+        #expect(FileManager.default.fileExists(atPath: nested.path))
+    }
+
+    @Test func defaultLoadReturnsAStoreWithoutCrashing() {
+        // Just confirm the no-arg facade doesn't blow up — it reads from
+        // ~/.cocker/credentials.json which may or may not exist on the runner.
+        let store = CredentialStore.load()
+        // Either populated or empty, but the call must succeed.
+        _ = store.credentials.count
+    }
 }
 
 @Suite("Cocker Context")
@@ -599,6 +670,178 @@ struct IPCProtocolEncodingTests {
         let data = try JSONEncoder().encode(r)
         let back = try JSONDecoder().decode(ImagesResponse.self, from: data)
         #expect(back.images.count == 1)
+    }
+
+    @Test func ipcRequestEncodesPayloadAndCarriesType() throws {
+        let cfg = RunConfig(image: "alpine")
+        let req = try IPCRequest(type: .run, payload: RunRequest(config: cfg))
+        let bytes = try JSONEncoder().encode(req)
+        let back = try JSONDecoder().decode(IPCRequest.self, from: bytes)
+        #expect(back.type == .run)
+        let inner = try JSONDecoder().decode(RunRequest.self, from: back.payload)
+        #expect(inner.config.image == "alpine")
+    }
+
+    @Test func ipcResponseSuccessRoundtripAndDecode() throws {
+        let resp = try IPCResponse(requestId: "r1", payload: RunResponse(containerID: "c1"))
+        let bytes = try JSONEncoder().encode(resp)
+        let back = try JSONDecoder().decode(IPCResponse.self, from: bytes)
+        #expect(back.requestId == "r1")
+        #expect(back.success == true)
+        #expect(back.error == nil)
+        let inner: RunResponse = try back.decode(RunResponse.self)
+        #expect(inner.containerID == "c1")
+    }
+
+    @Test func ipcResponseFailureCarriesErrorAndEmptyPayload() throws {
+        let resp = IPCResponse(requestId: "r2", error: "boom")
+        let bytes = try JSONEncoder().encode(resp)
+        let back = try JSONDecoder().decode(IPCResponse.self, from: bytes)
+        #expect(back.success == false)
+        #expect(back.error == "boom")
+        #expect(back.payload.isEmpty)
+        #expect(back.isLast == true)
+    }
+
+    @Test func ipcResponseStreamingFlags() throws {
+        let resp = try IPCResponse(
+            requestId: "r3",
+            payload: StreamEvent(stream: .stdout, data: "chunk"),
+            isStreaming: true, isLast: false
+        )
+        let back = try JSONDecoder().decode(IPCResponse.self, from: try JSONEncoder().encode(resp))
+        #expect(back.isStreaming == true)
+        #expect(back.isLast == false)
+    }
+
+    @Test func pingResponseHasNonEmptyFields() throws {
+        let p = PingResponse()
+        let bytes = try JSONEncoder().encode(p)
+        let back = try JSONDecoder().decode(PingResponse.self, from: bytes)
+        #expect(!back.version.isEmpty)
+        #expect(!back.apiVersion.isEmpty)
+        #expect(!back.buildTime.isEmpty)
+    }
+
+    @Test func emptyPayloadRoundtrip() throws {
+        let bytes = try JSONEncoder().encode(EmptyPayload())
+        _ = try JSONDecoder().decode(EmptyPayload.self, from: bytes)
+    }
+
+    @Test func buildRequestRoundtrip() throws {
+        var cfg = BuildConfig(contextPath: "/tmp/ctx", tag: "myimg:1")
+        cfg.buildArgs = ["A": "1"]
+        cfg.platform = "linux/arm64"
+        let r = BuildRequest(config: cfg)
+        let back = try JSONDecoder().decode(BuildRequest.self, from: try JSONEncoder().encode(r))
+        #expect(back.config.tag == "myimg:1")
+        #expect(back.config.buildArgs["A"] == "1")
+        #expect(back.config.platform == "linux/arm64")
+    }
+
+    @Test func execRequestRoundtrip() throws {
+        var cfg = ExecConfig(containerID: "abc", command: ["ls", "-la"])
+        cfg.env = ["X": "1"]
+        cfg.workdir = "/app"
+        cfg.user = "root"
+        cfg.interactive = true
+        cfg.tty = true
+        let r = ExecRequest(config: cfg)
+        let back = try JSONDecoder().decode(ExecRequest.self, from: try JSONEncoder().encode(r))
+        #expect(back.config.containerID == "abc")
+        #expect(back.config.command == ["ls", "-la"])
+        #expect(back.config.tty == true)
+        #expect(back.config.env["X"] == "1")
+    }
+
+    @Test func composeRequestRoundtripWithDefaults() throws {
+        let r = ComposeRequest(composePath: "docker-compose.yml")
+        let back = try JSONDecoder().decode(ComposeRequest.self, from: try JSONEncoder().encode(r))
+        #expect(back.composePath == "docker-compose.yml")
+        #expect(back.detach == false)
+        #expect(back.services.isEmpty)
+        #expect(back.projectName == nil)
+    }
+
+    @Test func pruneRequestAndResponseRoundtrip() throws {
+        let req = PruneRequest(volumes: true)
+        let backReq = try JSONDecoder().decode(PruneRequest.self, from: try JSONEncoder().encode(req))
+        #expect(backReq.volumes == true)
+
+        let resp = PruneResponse(
+            containersDeleted: ["a", "b"],
+            imagesDeleted: ["x"],
+            volumesDeleted: [],
+            spaceReclaimed: 1024
+        )
+        let backResp = try JSONDecoder().decode(PruneResponse.self, from: try JSONEncoder().encode(resp))
+        #expect(backResp.containersDeleted == ["a", "b"])
+        #expect(backResp.spaceReclaimed == 1024)
+    }
+
+    @Test func cpRequestRoundtrip() throws {
+        let r = CpRequest(containerID: "c", containerPath: "/etc/nginx.conf",
+                         hostPath: "/tmp/nginx.conf", toContainer: false)
+        let back = try JSONDecoder().decode(CpRequest.self, from: try JSONEncoder().encode(r))
+        #expect(back.containerID == "c")
+        #expect(back.toContainer == false)
+        #expect(back.containerPath == "/etc/nginx.conf")
+    }
+
+    @Test func renameRequestRoundtrip() throws {
+        let r = RenameRequest(id: "abc", newName: "newname")
+        let back = try JSONDecoder().decode(RenameRequest.self, from: try JSONEncoder().encode(r))
+        #expect(back.id == "abc")
+        #expect(back.newName == "newname")
+    }
+
+    @Test func diffResponseRoundtrip() throws {
+        let r = DiffResponse(entries: [
+            DiffEntry(kind: "A", path: "/etc/new"),
+            DiffEntry(kind: "C", path: "/etc/passwd"),
+            DiffEntry(kind: "D", path: "/tmp/gone"),
+        ])
+        let back = try JSONDecoder().decode(DiffResponse.self, from: try JSONEncoder().encode(r))
+        #expect(back.entries.count == 3)
+        #expect(back.entries[0].kind == "A")
+        #expect(back.entries[2].path == "/tmp/gone")
+    }
+
+    @Test func imageHistoryResponseRoundtrip() throws {
+        let entry = ImageHistoryEntry(
+            id: "sha256:abc", createdAt: Date(timeIntervalSince1970: 1700000000),
+            createdBy: "RUN apt-get install", size: 4096, comment: "system update"
+        )
+        let r = ImageHistoryResponse(entries: [entry])
+        let back = try JSONDecoder().decode(ImageHistoryResponse.self, from: try JSONEncoder().encode(r))
+        #expect(back.entries.first?.id == "sha256:abc")
+        #expect(back.entries.first?.size == 4096)
+    }
+
+    @Test func infoResponseRoundtripPreservesAllFields() throws {
+        let r = InfoResponse(
+            containers: 5, containersRunning: 3, images: 12, volumes: 4, networks: 2,
+            kernelVersion: "6.12.28", architecture: "arm64", cpus: 8,
+            totalMemory: 17_179_869_184, cockerRootDir: "/Users/x/.cocker",
+            socketPath: "/Users/x/.cocker/cocker.sock"
+        )
+        let back = try JSONDecoder().decode(InfoResponse.self, from: try JSONEncoder().encode(r))
+        #expect(back.containers == 5)
+        #expect(back.containersRunning == 3)
+        #expect(back.totalMemory == 17_179_869_184)
+        #expect(back.socketPath.hasSuffix("cocker.sock"))
+    }
+
+    @Test func networksResponseAndVolumesResponseRoundtrip() throws {
+        let nResp = NetworksResponse(networks: [
+            NetworkInfo(name: "bridge", driver: .bridge, subnet: "172.17.0.0/16", gateway: "172.17.0.1")
+        ])
+        let backN = try JSONDecoder().decode(NetworksResponse.self, from: try JSONEncoder().encode(nResp))
+        #expect(backN.networks.first?.name == "bridge")
+
+        let vResp = VolumesResponse(volumes: [VolumeInfo(name: "data")])
+        let backV = try JSONDecoder().decode(VolumesResponse.self, from: try JSONEncoder().encode(vResp))
+        #expect(backV.volumes.first?.name == "data")
     }
 }
 
