@@ -82,6 +82,16 @@ struct CockerCLI: AsyncParsableCommand {
     )
 
     static func main() async {
+        // Bare `cocker` (no args) used to surface as
+        //   "Error: The operation couldn't be completed.
+        //    (ArgumentParser.CleanExit error 1.)"
+        // because the outer catch only got error.localizedDescription. Show
+        // the help text instead — that's what users (and `docker` itself) expect.
+        if CommandLine.arguments.count <= 1 {
+            print(Self.helpMessage())
+            return
+        }
+
         do {
             var cmd = try parseAsRoot()
             if var async = cmd as? AsyncParsableCommand {
