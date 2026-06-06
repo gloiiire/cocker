@@ -18,21 +18,19 @@ final class ContainerEngine {
     // Event stream
     private var eventContinuations: [UUID: AsyncStream<StreamEvent>.Continuation] = [:]
 
-    init(rootDir: URL) async throws {
+    init(
+        rootDir: URL,
+        portForwarder: PortForwarder,
+        l2Switch: any L2Switching = L2Switch()
+    ) async throws {
         self.rootDir = rootDir
         self.state = try StateStore(rootDir: rootDir)
         self.images = try ImageManager(rootDir: rootDir)
         self.networks = try await NetworkManager(store: state)
         self.volumes = VolumeManager(store: state, rootDir: rootDir)
-        self.l2Switch = L2Switch()
+        self.l2Switch = l2Switch
         self.vmRuntime = try VMRuntime(rootDir: rootDir, l2Switch: self.l2Switch)
-
-        // Cherche cocker-portfwd : à côté de cockerd dans le bundle,
-        // ou dans le même PREFIX bin/ (cas Homebrew + install.sh).
-        let daemonURL = URL(fileURLWithPath: CommandLine.arguments[0])
-        let daemonDir = daemonURL.deletingLastPathComponent()
-        let portFwdBinary = daemonDir.appendingPathComponent("cocker-portfwd")
-        self.portForwarder = PortForwarder(portFwdBinary: portFwdBinary)
+        self.portForwarder = portForwarder
     }
 
     // MARK: - Container lifecycle
