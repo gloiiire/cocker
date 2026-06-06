@@ -52,9 +52,51 @@ cd cocker
 ## Verify
 
 ```bash
-cocker version
+cocker version    # or `cocker -v`
 cocker info
 ```
+
+## Running cockerd
+
+`cockerd` is a long-running daemon (like `dockerd`). It listens on three Unix sockets and waits for requests — it does **not** exit on its own. Pick one of three ways to run it :
+
+### 1. As a managed service (recommended for daily use)
+
+```bash
+brew services start cocker     # launchd starts it now and at login
+brew services stop cocker
+brew services list             # status
+
+tail -f /opt/homebrew/var/log/cockerd.log
+# logs are auto-rotated at 10 MiB, last 5 kept
+```
+
+### 2. Foreground (for debugging)
+
+```bash
+cockerd
+```
+
+You'll see the startup banner + listener summary + a "Ready" line, then it sits there. **That's normal** — the daemon is alive and waiting. Open another terminal to use `cocker ps`, `cocker run`, etc. Press `Ctrl-C` to stop.
+
+### 3. Backgrounded in the current shell
+
+```bash
+cockerd > ~/cockerd.log 2>&1 &
+cocker ps
+kill %1
+```
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `COCKER_ROOT` | data directory (default `~/.cocker`) |
+| `COCKER_SOCKET` | IPC socket path |
+| `COCKER_LOG_LEVEL` | `debug` / `info` / `warn` / `error` (default `info`) |
+| `COCKER_LOG_FORMAT` | `text` (default) or `json` for structured records |
+| `COCKER_TRACE` | `stderr` to emit OTLP-compatible JSON spans |
+| `COCKER_DNS_PORT` | override the internal DNS port (default `5300`) |
 
 ## Help & man pages
 
