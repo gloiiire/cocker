@@ -157,6 +157,16 @@ public struct ImageInfo: Codable, Sendable, Identifiable {
     public var os: String
     public var layers: [String]     // layer digests
 
+    // OCI image config defaults (CMD, ENTRYPOINT, ENV, WORKDIR, LABEL, EXPOSE)
+    // — utilisés par ContainerEngine.run() quand l'user ne fournit pas de cmd.
+    // Sans ça, `cocker run my-image` ignore le CMD du Dockerfile.
+    public var cmd: [String]?
+    public var entrypoint: [String]?
+    public var env: [String]?       // ["KEY=VALUE", ...]
+    public var workdir: String?
+    public var labels: [String: String]
+    public var exposedPorts: [String]
+
     public var reference: String { "\(repository):\(tag)" }
 
     public init(
@@ -167,7 +177,13 @@ public struct ImageInfo: Codable, Sendable, Identifiable {
         createdAt: Date = Date(),
         architecture: String = "arm64",
         os: String = "linux",
-        layers: [String] = []
+        layers: [String] = [],
+        cmd: [String]? = nil,
+        entrypoint: [String]? = nil,
+        env: [String]? = nil,
+        workdir: String? = nil,
+        labels: [String: String] = [:],
+        exposedPorts: [String] = []
     ) {
         self.id = id
         self.repository = repository
@@ -177,6 +193,12 @@ public struct ImageInfo: Codable, Sendable, Identifiable {
         self.architecture = architecture
         self.os = os
         self.layers = layers
+        self.cmd = cmd
+        self.entrypoint = entrypoint
+        self.env = env
+        self.workdir = workdir
+        self.labels = labels
+        self.exposedPorts = exposedPorts
     }
 }
 

@@ -148,8 +148,8 @@ actor ImageManager {
 
     // MARK: - Build
 
-    func build(config: BuildConfig, progressHandler: @escaping (StreamEvent) -> Void) async throws -> ImageInfo {
-        let builder = DockerfileBuilder(imageManager: self, config: config, progressHandler: progressHandler)
+    func build(config: BuildConfig, vmRuntime: VMRuntime?, progressHandler: @escaping (StreamEvent) -> Void) async throws -> ImageInfo {
+        let builder = DockerfileBuilder(imageManager: self, vmRuntime: vmRuntime, config: config, progressHandler: progressHandler)
         return try await builder.build()
     }
 
@@ -318,6 +318,7 @@ actor ImageManager {
 
 actor DockerfileBuilder {
     private let imageManager: ImageManager
+    private let vmRuntime: VMRuntime?  // optionnel : nil → RUN log un warning au lieu d'exécuter
     private let config: BuildConfig
     private let progressHandler: (StreamEvent) -> Void
     private var stepCount = 0
@@ -332,8 +333,9 @@ actor DockerfileBuilder {
         let size: Int
     }
 
-    init(imageManager: ImageManager, config: BuildConfig, progressHandler: @escaping (StreamEvent) -> Void) {
+    init(imageManager: ImageManager, vmRuntime: VMRuntime?, config: BuildConfig, progressHandler: @escaping (StreamEvent) -> Void) {
         self.imageManager = imageManager
+        self.vmRuntime = vmRuntime
         self.config = config
         self.progressHandler = progressHandler
     }
@@ -409,10 +411,44 @@ actor DockerfileBuilder {
             case "RUN":
                 let command = resolveArg(instruction.args, env: env)
                 log(.stdout, " ---> Running: \(command)\n")
-                if let rootfs = currentRootfsPath {
-                    try await runBuildCommand(command, workdir: workdir, baseImage: baseImage, env: env, rootfsPath: rootfs)
+                guard let rootfs = currentRootfsPath else {
+                    log(.stderr, "Error: RUN before FROM — skipping\n")
+                    log(.stdout, " ---> \(shortID())\n")
+                    continue
+                }
+
+                if let vm = vmRuntime {
+                    // Mode "vraie VM" : on lance une VM éphémère, on capture les
+                    // changements filesystem, on crée un layer OCI.
+                    let before = try snapshotFiles(at: rootfs)
+                    let exitCode = try await vm.runEphemeral(
+                        rootfsPath: rootfs,
+                        command: ["/bin/sh", "-c", command],
+                        env: env,
+                        workdir: workdir,
+                        timeout: 600
+                    )
+                    if exitCode != 0 {
+                        throw CockerError.buildFailed("RUN '\(command)' exited with code \(exitCode)")
+                    }
+                    let after = try snapshotFiles(at: rootfs)
+                    let changed = after.filter { key, hash in before[key] != hash }.map { $0.key }
+                    let deleted = before.keys.filter { after[$0] == nil }
+                    if !changed.isEmpty || !deleted.isEmpty {
+                        let blobsDir = await imageManager.blobDir()
+                        let layer = try await createLayer(
+                            from: rootfs,
+                            changedPaths: changed,
+                            deletedPaths: Array(deleted),
+                            blobsDir: blobsDir
+                        )
+                        layers.append(layer)
+                        log(.stdout, " ---> Created layer \(String(layer.digest.prefix(19))) (\(changed.count) changed, \(deleted.count) deleted)\n")
+                    }
                 } else {
-                    log(.stderr, "Warning: RUN before FROM — skipping\n")
+                    // Fallback : exec via /bin/sh macOS (commandes manipulant
+                    // juste des fichiers — pas de binaires Linux ELF).
+                    try await runBuildCommand(command, workdir: workdir, baseImage: baseImage, env: env, rootfsPath: rootfs)
                 }
                 log(.stdout, " ---> \(shortID())\n")
 
@@ -600,6 +636,9 @@ actor DockerfileBuilder {
 
         let totalSize = layers.reduce(UInt64(0)) { $0 + UInt64($1.size) }
 
+        // Map env dict → ["KEY=VALUE", ...] (format OCI)
+        let envArray: [String]? = env.isEmpty ? nil : env.map { "\($0.key)=\($0.value)" }
+
         let imageInfo = ImageInfo(
             id: manifestDigest,
             repository: parseRepo(config.tag),
@@ -607,7 +646,13 @@ actor DockerfileBuilder {
             size: totalSize,
             architecture: arch,
             os: "linux",
-            layers: layers.map { $0.digest }
+            layers: layers.map { $0.digest },
+            cmd: cmd.isEmpty ? nil : cmd,
+            entrypoint: entrypoint.isEmpty ? nil : entrypoint,
+            env: envArray,
+            workdir: workdir == "/" ? nil : workdir,
+            labels: labels,
+            exposedPorts: exposedPorts.map { "\($0.containerPort)/\($0.proto.rawValue)" }
         )
 
         try await imageManager.storeBuiltImage(imageInfo)
@@ -746,14 +791,20 @@ actor DockerfileBuilder {
 
     private func snapshotFiles(at directory: URL) throws -> [String: Data] {
         var snapshot: [String: Data] = [:]
+        // Résout les liens symboliques (ex: /tmp → /private/tmp) pour que
+        // les paths capturés correspondent vraiment à ce que tar verra.
+        let resolved = directory.resolvingSymlinksInPath()
+        let prefix = resolved.path + "/"
         guard let enumerator = FileManager.default.enumerator(
-            at: directory,
+            at: resolved,
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
         ) else { return snapshot }
 
         for case let url as URL in enumerator {
-            let rel = url.path.replacingOccurrences(of: directory.path + "/", with: "")
-            if rel.isEmpty || rel == directory.path { continue }
+            let absolute = url.resolvingSymlinksInPath().path
+            guard absolute.hasPrefix(prefix) else { continue }
+            let rel = String(absolute.dropFirst(prefix.count))
+            if rel.isEmpty { continue }
             // Hash file contents
             if let data = try? Data(contentsOf: url) {
                 snapshot[rel] = Data(SHA256.hash(data: data))

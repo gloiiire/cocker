@@ -274,7 +274,7 @@ actor ComposeEngine {
             var config = BuildConfig(contextPath: context, tag: tag)
             config.dockerfile = dockerfile
             config.buildArgs = buildSpec.args ?? [:]
-            _ = try await containerEngine.images.build(config: config) { event in
+            _ = try await containerEngine.images.build(config: config, vmRuntime: containerEngine.vmRuntime) { event in
                 progressHandler(event)
             }
             progressHandler(StreamEvent(stream: .status, data: "Built \(tag)\n"))

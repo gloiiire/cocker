@@ -26,7 +26,13 @@ final class ContainerEngine {
         self.volumes = VolumeManager(store: state, rootDir: rootDir)
         self.l2Switch = L2Switch()
         self.vmRuntime = try VMRuntime(rootDir: rootDir, l2Switch: self.l2Switch)
-        self.portForwarder = PortForwarder()
+
+        // Cherche cocker-portfwd : à côté de cockerd dans le bundle,
+        // ou dans le même PREFIX bin/ (cas Homebrew + install.sh).
+        let daemonURL = URL(fileURLWithPath: CommandLine.arguments[0])
+        let daemonDir = daemonURL.deletingLastPathComponent()
+        let portFwdBinary = daemonDir.appendingPathComponent("cocker-portfwd")
+        self.portForwarder = PortForwarder(portFwdBinary: portFwdBinary)
     }
 
     // MARK: - Container lifecycle
@@ -63,16 +69,42 @@ final class ContainerEngine {
             }
         }
 
+        // Resolve image defaults (CMD, ENV, WORKDIR…) si l'user n'a pas overridé.
+        // Sinon `cocker run my-built-image` ignore le CMD du Dockerfile.
+        let imageInfo = try? await images.find(config.image)
+        var resolvedCommand = config.command
+        if resolvedCommand.isEmpty {
+            if let entrypoint = imageInfo?.entrypoint, !entrypoint.isEmpty {
+                resolvedCommand = entrypoint + (imageInfo?.cmd ?? [])
+            } else if let cmd = imageInfo?.cmd, !cmd.isEmpty {
+                resolvedCommand = cmd
+            }
+        }
+
+        var resolvedEnv = config.env
+        for entry in imageInfo?.env ?? [] {
+            let parts = entry.split(separator: "=", maxSplits: 1).map(String.init)
+            if parts.count == 2, resolvedEnv[parts[0]] == nil {
+                resolvedEnv[parts[0]] = parts[1]
+            }
+        }
+
+        let resolvedWorkdir = config.workdir ?? imageInfo?.workdir
+
+        // Merge labels image + user
+        var resolvedLabels = imageInfo?.labels ?? [:]
+        for (k, v) in config.labels { resolvedLabels[k] = v }
+
         // Create container record
         var container = Container(
             id: id,
             name: name,
             image: config.image,
-            command: config.command,
+            command: resolvedCommand,
             ports: ports,
             volumes: resolvedVolumes,
-            env: config.env,
-            labels: config.labels,
+            env: resolvedEnv,
+            labels: resolvedLabels,
             networkMode: config.networkMode,
             networkName: config.network,
             cpuCount: config.cpuCount,
@@ -80,6 +112,7 @@ final class ContainerEngine {
             hostname: config.hostname ?? String(id.prefix(12)),
             restartPolicy: config.restartPolicy
         )
+        if let workdir = resolvedWorkdir { container.env["WORKDIR"] = workdir }
 
         fputs("[eng] container struct created\n", stderr); fflush(stderr)
         // Allocate IP

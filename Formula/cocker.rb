@@ -30,9 +30,12 @@ class Cocker < Formula
       end
     end
 
-    # 3. Install binaries
+    # 3. Install binaries (cocker-portfwd = subprocess séparé pour le port
+    #    forwarding, signé ad-hoc sans entitlement virtualization → évite
+    #    le sandbox macOS qui bloque connect() vers les IPs vmnet privées)
     bin.install ".build/release/cocker"
     bin.install ".build/release/cockerd"
+    bin.install ".build/release/cocker-portfwd"
 
     # 4. Generate + install man pages (one per subcommand)
     system "swift", "package", "--allow-writing-to-package-directory",
