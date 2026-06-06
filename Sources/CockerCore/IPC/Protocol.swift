@@ -396,7 +396,7 @@ public struct UpdateRequest: Codable, Sendable {
 // MARK: - Version
 
 public enum CockerVersion {
-    public static let version = "0.1.0"
+    public static let version = "0.2.1"
     public static let apiVersion = "1.0"
     public static let buildTime = "2026-06-06"
     public static let minAPIVersion = "1.0"

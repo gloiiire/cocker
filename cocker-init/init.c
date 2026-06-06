@@ -166,6 +166,10 @@ int main(int argc, char **argv) {
 
     net_setup_eth1_static(cmdline);
 
+    /* Cross-platform builds : register QEMU user-mode emulator if cockerd
+     * told us about a foreign architecture target. No-op for native builds. */
+    qemu_register_binfmt(cmdline);
+
     /* Load the container spec (argv + env + workdir). */
     char *child_argv[128];
     int argc_count = spec_load(child_argv, 128);
