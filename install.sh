@@ -4,6 +4,7 @@ set -e
 
 PREFIX="${PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
+MAN_DIR="$PREFIX/share/man/man1"
 COCKER_ROOT="$HOME/.cocker"
 SIGNING_IDENTITY="${COCKER_SIGN_ID:-}"
 APPLE_CONTAINER_KERNEL="$HOME/Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
@@ -53,6 +54,12 @@ info "Building cocker + cockerd (release)..."
 swift build -c release
 ok "Swift build OK"
 
+info "Generating man pages..."
+swift package --allow-writing-to-package-directory generate-manual --multi-page >/dev/null
+MAN_SRC=".build/plugins/GenerateManual/outputs/CockerCLI"
+[ -d "$MAN_SRC" ] && [ "$(ls -A "$MAN_SRC" 2>/dev/null | wc -l)" -gt 0 ] || err "Man page generation produced no output"
+ok "$(ls "$MAN_SRC"/*.1 | wc -l | tr -d ' ') man pages generated"
+
 info "Building cocker-init (Linux ARM64 static)..."
 (cd cocker-init &&
  zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init init.c &&
@@ -71,10 +78,11 @@ ok "cockerd signé"
 
 # 6. Install
 info "Installation dans $BIN_DIR..."
-mkdir -p "$BIN_DIR"
+mkdir -p "$BIN_DIR" "$MAN_DIR"
 install -m 755 .build/release/cocker "$BIN_DIR/cocker"
 install -m 755 .build/release/cockerd "$BIN_DIR/cockerd"
-ok "Binaires installés"
+install -m 644 "$MAN_SRC"/*.1 "$MAN_DIR/"
+ok "Binaires + man pages installés ($MAN_DIR)"
 
 # 7. Cocker data dir
 info "Configuration $COCKER_ROOT..."
@@ -133,6 +141,15 @@ case ":$PATH:" in
     echo "        export PATH=\"$BIN_DIR:\$PATH\""
     ;;
 esac
+
+MAN_ROOT="$PREFIX/share/man"
+if ! manpath 2>/dev/null | tr ':' '\n' | grep -qx "$MAN_ROOT"; then
+  warn "$MAN_ROOT n'est pas dans ton MANPATH (man cocker ne fonctionnera pas)"
+  echo "    Ajoute à ton ~/.zshrc :"
+  echo "        export MANPATH=\"$MAN_ROOT:\$(manpath 2>/dev/null)\""
+else
+  ok "$MAN_ROOT dans MANPATH — essaye : man cocker"
+fi
 
 echo
 color "1;32" "🎉 Cocker installé. Essaye :"
