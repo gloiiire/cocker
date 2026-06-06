@@ -100,6 +100,12 @@ func main() async {
     let dns = DNSServer(state: engine.state, port: dnsPort)
     engine.dnsServer = dns
 
+    // DNS over vsock — the in-VM proxy connects here for resolution because
+    // macOS App Sandbox blocks UDP/TCP DNS data over vmnet to user-signed
+    // daemons. vsock bypasses vmnet.
+    let dnsVsockListener = DNSVsockListener(dnsServer: dns)
+    engine.vmRuntime.dnsVsockListener = dnsVsockListener.makeListener()
+
     // Start all servers
     let server = DaemonServer(socketPath: socketPath, engine: engine)
     let dockerAPI = DockerAPIServer(socketPath: dockerSocketPath, engine: engine)

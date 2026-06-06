@@ -23,6 +23,11 @@ final class VMRuntime: NSObject {
     private let initrdPath: URL
     private let rootDir: URL
     let l2Switch: L2Switch
+    // Injected by ContainerEngine after DNSServer exists. Registered on each
+    // VM's socket device right after the VM boots so the in-VM DNS proxy
+    // can reach cockerd over vsock instead of UDP/TCP via vmnet (which the
+    // App Sandbox blocks for user-signed daemons).
+    var dnsVsockListener: VZVirtioSocketListener?
 
     init(rootDir: URL, l2Switch: L2Switch) throws {
         self.rootDir = rootDir
@@ -205,6 +210,7 @@ final class VMRuntime: NSObject {
             "cocker.name=\(container.name)",
             "cocker.dns=\(dnsIP)",
             "cocker.dns_port=\(dnsPort)",
+            "cocker.dns_vsock_port=5353",
         ]
 
         if let hostname = container.hostname.isEmpty ? nil : container.hostname {
@@ -289,6 +295,15 @@ final class VMRuntime: NSObject {
                     continuation.resume(throwing: CockerError.vmStartFailed(error.localizedDescription))
                 }
             }
+        }
+
+        // Register the DNS vsock listener on this VM's socket device. Done
+        // after start so vm.socketDevices is populated. Same listener
+        // instance is shared across all VMs.
+        if let listener = dnsVsockListener,
+           let socketDev = vm.socketDevices.first as? VZVirtioSocketDevice {
+            socketDev.setSocketListener(listener, forPort: 5353)
+            fputs("[vm] DNS vsock listener attached on port 5353\n", stderr); fflush(stderr)
         }
     }
 

@@ -31,6 +31,7 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <errno.h>
+#include <linux/vm_sockets.h>  /* AF_VSOCK, struct sockaddr_vm */
 
 #define die(fmt, ...) do { \
     fprintf(stderr, "[cocker-init] FATAL: " fmt "\n", ##__VA_ARGS__); \
@@ -122,35 +123,40 @@ static int parse_argv(char *cmd, char **argv, int max) {
 
 /* Tiny inline DNS proxy.
  *
- * The cockerd DNS resolver binds on the host at <dns_ip>:<dns_port> (default
- * 5300 — port 53 is reserved on macOS). Inside the container, libc reads
- * /etc/resolv.conf which has no port column, so apps query port 53 by
- * default. We spawn this proxy as a child of PID 1, bind UDP 0.0.0.0:53
- * (works because PID 1 runs as root inside the VM) and tunnel every datagram
- * to the host's cockerd resolver — but over TCP (DNS-over-TCP, RFC 1035
- * §4.2.2). Why TCP and not UDP : Apple's App Sandbox silently drops UDP
- * packets that reach a user-signed daemon (cockerd) via the vmnet kernel
- * extension. TCP from VM to host works fine. Same wire format, two extra
- * bytes for length prefix.
+ * Apps in the container read /etc/resolv.conf which has no port column, so
+ * they query 127.0.0.1:53. We spawn this proxy as a child of PID 1, bind
+ * UDP 0.0.0.0:53 (works because PID 1 runs as root) and tunnel every
+ * datagram to cockerd over vsock (DNS-over-TCP framing, RFC 1035 §4.2.2).
  *
- * Iterative — fine for a sub-second resolution rate. Caller continues; child
- * runs forever until VM shutdown sends SIGTERM.
+ * Why vsock and not TCP/UDP via vmnet : Apple's App Sandbox silently
+ * drops payload data from the vmnet kernel extension to user-signed
+ * daemons (cockerd). UDP packets are dropped outright ; TCP accept()
+ * succeeds but read() returns 0 immediately. vsock bypasses vmnet —
+ * it's a direct host↔VM channel via Apple's Virtualization.framework.
+ *
+ * Iterative — fine for a sub-second resolution rate. Child runs forever
+ * until VM shutdown sends SIGTERM.
  */
-static int dns_tcp_forward(const char *dns_ip, int dns_port,
-                           const char *query, size_t qlen,
-                           char *response, size_t resp_max) {
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
+/* Forward a DNS query to the host's cockerd resolver via vsock.
+ *
+ * Wire format : DNS-over-TCP (RFC 1035 §4.2.2) — 2-byte length prefix,
+ * then the DNS message. cockerd's VZVirtioSocketListener on port 5353
+ * accepts one connection per query. AF_VSOCK CID 2 = the host. */
+static int dns_vsock_forward(unsigned int vsock_port,
+                             const char *query, size_t qlen,
+                             char *response, size_t resp_max) {
+    int sfd = socket(AF_VSOCK, SOCK_STREAM, 0);
     if (sfd < 0) return -1;
 
     struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
     setsockopt(sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    struct sockaddr_in dst;
+    struct sockaddr_vm dst;
     memset(&dst, 0, sizeof(dst));
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(dns_port);
-    inet_pton(AF_INET, dns_ip, &dst.sin_addr);
+    dst.svm_family = AF_VSOCK;
+    dst.svm_cid = 2;  /* VMADDR_CID_HOST */
+    dst.svm_port = vsock_port;
 
     if (connect(sfd, (struct sockaddr *)&dst, sizeof(dst)) < 0) { close(sfd); return -1; }
 
@@ -186,15 +192,15 @@ static int dns_tcp_forward(const char *dns_ip, int dns_port,
     return (int)resp_len;
 }
 
-static void start_dns_proxy(const char *dns_ip, int dns_port) {
+static void start_dns_proxy(unsigned int vsock_port) {
     pid_t pid = fork();
     if (pid < 0) {
         info("dns-proxy fork: %s", strerror(errno));
         return;
     }
     if (pid != 0) {
-        info("dns-proxy spawned (pid=%d, upstream=%s:%d via TCP)",
-             pid, dns_ip, dns_port);
+        info("dns-proxy spawned (pid=%d, upstream=vsock CID=2 port=%u)",
+             pid, vsock_port);
         return;
     }
 
@@ -224,9 +230,9 @@ static void start_dns_proxy(const char *dns_ip, int dns_port) {
                              (struct sockaddr *)&client, &cl);
         if (n <= 0) continue;
 
-        int m = dns_tcp_forward(dns_ip, dns_port, query, (size_t)n,
-                                response, sizeof(response));
-        if (m <= 0) continue;  // silent — upstream may be a stub for now
+        int m = dns_vsock_forward(vsock_port, query, (size_t)n,
+                                  response, sizeof(response));
+        if (m <= 0) continue;  // silent ; cockerd may be temporarily down
 
         sendto(listen_fd, response, m, 0, (struct sockaddr *)&client, cl);
     }
@@ -403,34 +409,31 @@ int main(int argc, char **argv) {
 
         /* udhcpc overwrites /etc/resolv.conf with the vmnet gateway DNS
          * (192.168.64.1) which short-circuits container name resolution.
-         * We instead point libc at our local DNS proxy on 127.0.0.1:53 and
-         * spawn the proxy which tunnels to the cockerd resolver at
-         * <cocker.dns>:<cocker.dns_port>. */
+         * We instead point libc at our local DNS proxy on 127.0.0.1:53.
+         * The proxy tunnels every query to cockerd's vsock DNS listener
+         * (host CID=2, port from cocker.dns_vsock_port — default 5353). */
         {
-            char *dns_ip = cmdline_get(cmdline, "dns");
-            char *dns_port_s = cmdline_get(cmdline, "dns_port");
-            int dns_port = dns_port_s ? atoi(dns_port_s) : 5300;
-            if (dns_port <= 0 || dns_port > 65535) dns_port = 5300;
+            char *vsock_port_s = cmdline_get(cmdline, "dns_vsock_port");
+            unsigned int vsock_port = vsock_port_s ? (unsigned int)atoi(vsock_port_s) : 5353;
+            if (vsock_port == 0) vsock_port = 5353;
 
-            if (dns_ip) {
-                start_dns_proxy(dns_ip, dns_port);
+            start_dns_proxy(vsock_port);
 
-                int rc_fd = open("/etc/resolv.conf",
-                                 O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (rc_fd >= 0) {
-                    const char *rc =
-                        "# generated by cocker-init (post-DHCP)\n"
-                        "nameserver 127.0.0.1\n"
-                        "search cocker\n"
-                        "options ndots:0 timeout:1 attempts:2\n";
-                    write(rc_fd, rc, strlen(rc));
-                    close(rc_fd);
-                    info("pinned /etc/resolv.conf to 127.0.0.1 "
-                         "(proxy → %s:%d)", dns_ip, dns_port);
-                }
-                free(dns_ip);
+            int rc_fd = open("/etc/resolv.conf",
+                             O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (rc_fd >= 0) {
+                const char *rc =
+                    "# generated by cocker-init (post-DHCP)\n"
+                    "nameserver 127.0.0.1\n"
+                    "search cocker\n"
+                    "options ndots:0 timeout:1 attempts:2\n";
+                write(rc_fd, rc, strlen(rc));
+                close(rc_fd);
+                info("pinned /etc/resolv.conf to 127.0.0.1 "
+                     "(proxy → vsock CID=2 port=%u)", vsock_port);
             }
-            if (dns_port_s) free(dns_port_s);
+
+            if (vsock_port_s) free(vsock_port_s);
         }
 
         /* Lit l'IP eth0 — retry rapide au cas où DHCP en cours */
