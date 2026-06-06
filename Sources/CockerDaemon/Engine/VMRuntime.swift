@@ -253,6 +253,104 @@ final class VMRuntime: NSObject {
 
     // MARK: - Start/Stop
 
+    /// Lance une VM éphémère pour exécuter une commande (RUN dans Dockerfile),
+    /// attend la fin du process container (PID 1 reboot via cocker-init fork+wait),
+    /// puis retourne. Le rootfs est modifié en place (virtiofs rw).
+    ///
+    /// Pour le build seulement — pas tracké dans runningVMs.
+    func runEphemeral(
+        rootfsPath: URL,
+        command: [String],
+        env: [String: String],
+        workdir: String?,
+        timeout: TimeInterval = 600
+    ) async throws -> Int32 {
+        fputs("[vm-build] runEphemeral cmd=\(command.joined(separator: " ")) rootfs=\(rootfsPath.path)\n", stderr)
+        fflush(stderr)
+        try ensureKernelAvailable()
+
+        // Build un Container synthétique pour réutiliser la même config
+        let ephID = "build-" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased()
+        var container = Container(
+            id: ephID,
+            name: ephID,
+            image: "build-context",
+            command: command,
+            ports: [],
+            volumes: [],
+            env: env,
+            labels: ["com.cocker.build": "true"],
+            networkMode: .nat,
+            cpuCount: 2,
+            memoryMB: 1024,
+            hostname: ephID
+        )
+        if let w = workdir { container.env["WORKDIR"] = w }
+
+        // Écrit /cocker-spec + /etc/resolv.conf dans le rootfs partagé
+        try writeResolvConf(to: rootfsPath, container: container)
+        try writeContainerSpec(to: rootfsPath, container: container)
+
+        // Crée et démarre la VM
+        let pipe = Pipe()
+        let vm = try await createVM(for: container, rootfsPath: rootfsPath, stdoutPipe: pipe)
+
+        // Capture la sortie via une closure (qui doit être appelée sans capture
+        // d'actor pour pouvoir l'invoquer depuis le readability handler).
+        let outputBuffer = OutputBuffer()
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            outputBuffer.append(chunk)
+        }
+
+        // Boot la VM
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            vm.start { result in
+                switch result {
+                case .success: continuation.resume()
+                case .failure(let error): continuation.resume(throwing: CockerError.vmStartFailed(error.localizedDescription))
+                }
+            }
+        }
+        fputs("[vm-build] VM booted\n", stderr); fflush(stderr)
+
+        // Attendre que la VM s'arrête d'elle-même (cocker-init reboot après le
+        // child exit) — poll vm.state avec timeout.
+        let deadline = Date().addingTimeInterval(timeout)
+        while vm.state != .stopped && vm.state != .error && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+
+        if vm.state == .running {
+            fputs("[vm-build] timeout after \(timeout)s — force stopping\n", stderr); fflush(stderr)
+            try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                vm.stop { _ in continuation.resume() }
+            }
+        }
+
+        pipe.fileHandleForReading.readabilityHandler = nil
+
+        // Parse l'exit code dans la sortie de cocker-init :
+        //   "[cocker-init] container exited with code N"
+        let output = outputBuffer.text()
+        let exitCode = parseExitCode(from: output) ?? 0
+        fputs("[vm-build] VM stopped, exitCode=\(exitCode)\n", stderr); fflush(stderr)
+
+        // Cleanup spec/resolv files for next iteration
+        try? FileManager.default.removeItem(at: rootfsPath.appendingPathComponent("cocker-spec"))
+
+        return exitCode
+    }
+
+    private func parseExitCode(from log: String) -> Int32? {
+        // Cherche "exited with code N"
+        guard let range = log.range(of: "exited with code ") else { return nil }
+        let after = log[range.upperBound...]
+        let codeStr = after.prefix { $0.isNumber }
+        return Int32(codeStr)
+    }
+
     func start(container: Container, rootfsPath: URL) async throws {
         fputs("[vm] start: container=\(container.id) rootfs=\(rootfsPath.path)\n", stderr)
         fflush(stderr)
@@ -574,4 +672,23 @@ final class VMRuntime: NSObject {
 private extension Container {
     var config_workdir: String? { env["WORKDIR"] }
     var config_user: String? { env["USER"] }
+}
+
+/// Buffer thread-safe pour accumuler la sortie d'une VM ephémère.
+/// Le readabilityHandler de Pipe tourne sur une queue dédiée non-actor.
+final class OutputBuffer: @unchecked Sendable {
+    private var data = Data()
+    private let lock = NSLock()
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    func text() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(data: data, encoding: .utf8) ?? ""
+    }
 }
