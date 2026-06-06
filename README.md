@@ -87,6 +87,40 @@ swift package --allow-writing-to-package-directory generate-manual --multi-page
 # output: .build/plugins/GenerateManual/outputs/CockerCLI/*.1
 ```
 
+## Known limitations
+
+### Inbound port forwarding (`-p 8080:80`)
+
+The TCP forwarding from the host to a container's exposed port doesn't work
+through `localhost`. macOS Sequoia restricts `connect()` to private vmnet
+bridges (`192.168.64.0/24`) to Apple-signed binaries only — `curl` and `nc`
+from `/usr/bin/` succeed, but anything user-built (Homebrew Python,
+cocker-portfwd, ...) gets `EHOSTUNREACH`.
+
+**Workaround**: connect directly to the container's IP, which `curl` and
+`nc` from the system can reach :
+
+```bash
+$ cocker run -d nginx:alpine
+$ cocker inspect <id> | jq -r '.[0].ip'
+192.168.64.5
+$ curl http://192.168.64.5/                 # ← works
+```
+
+Container-to-container traffic on the same network works without any
+workaround (internal DNS resolves service names automatically) — only the
+host → container hop on `localhost` is affected.
+
+A proper fix would require either a privileged `pf` rule helper installed
+via `sudo`, or the `com.apple.vm.networking` entitlement (which needs a
+paid Apple Developer account and a provisioning profile).
+
+### `RUN` directives in Dockerfiles
+
+`COPY`, `ADD`, `ENV`, `WORKDIR`, `CMD`, `ENTRYPOINT`, `LABEL`, `EXPOSE`,
+and `ARG` build correctly. `RUN` is parsed but currently logs a warning
+instead of executing inside a temporary VM — coming in a follow-up release.
+
 ## Usage
 
 ```bash
