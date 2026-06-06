@@ -159,8 +159,57 @@ struct DNSResponseBuilder {
         data.append(contentsOf: parts)
     }
 
-    // AAAA record — return nothing (containers are IPv4 only)
-    // NXDomain response
+    // AAAA record answer: name pointer + type 28 + IPv6 (16 bytes)
+    mutating func appendAAAARecord(ip: String, ttl: UInt32 = 10) {
+        // NAME: pointer to question name (0xC00C)
+        data.writeUInt16BE(0xC00C, appendingAt: data.count)
+        // TYPE: AAAA (28)
+        data.writeUInt16BE(28, appendingAt: data.count)
+        // CLASS: IN (1)
+        data.writeUInt16BE(1, appendingAt: data.count)
+        // TTL
+        data.writeUInt32BE(ttl, appendingAt: data.count)
+        // RDLENGTH: 16 bytes for IPv6
+        data.writeUInt16BE(16, appendingAt: data.count)
+        // RDATA: IPv6 address as 16 bytes
+        let groups = expandIPv6(ip)
+        for group in groups {
+            data.writeUInt16BE(group, appendingAt: data.count)
+        }
+    }
+
+    private func expandIPv6(_ ip: String) -> [UInt16] {
+        // Parse compressed IPv6 like fd00:c0c4::1 → 8 groups of UInt16
+        var result = [UInt16](repeating: 0, count: 8)
+        let parts = ip.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+
+        // Find the :: (empty part) position
+        var left: [String] = []
+        var right: [String] = []
+        var foundEmpty = false
+
+        for part in parts {
+            if part.isEmpty {
+                foundEmpty = true
+            } else if foundEmpty {
+                right.append(part)
+            } else {
+                left.append(part)
+            }
+        }
+
+        // Fill left side
+        for (i, part) in left.enumerated() {
+            result[i] = UInt16(part, radix: 16) ?? 0
+        }
+        // Fill right side from the end
+        for (i, part) in right.reversed().enumerated() {
+            result[7 - i] = UInt16(part, radix: 16) ?? 0
+        }
+
+        return result
+    }
+
     mutating func build() -> Data { data }
 }
 

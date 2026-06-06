@@ -61,6 +61,18 @@ struct CockerCLI: AsyncParsableCommand {
             // Compose
             ComposeCommand.self,
 
+            // Buildx (multi-platform)
+            BuildxCommand.self,
+
+            // Context
+            ContextCommand.self,
+
+            // Swarm / Stack / Node / Service
+            SwarmCommand.self,
+            StackCommand.self,
+            NodeCommand.self,
+            ServiceCommand.self,
+
             // System
             VersionCommand.self,
             InfoCommand.self,

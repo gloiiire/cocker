@@ -127,8 +127,13 @@ actor DNSServer {
             response = buildAResponse(header: header, question: question, ip: ip)
             logDNS(question.name, result: ip, authoritative: true)
         } else if question.isAAAA {
-            // AAAA → NOERROR vide (pas d'IPv6 pour les containers)
-            response = buildEmptyResponse(header: header, question: question)
+            // AAAA → chercher l'adresse IPv6 du container si elle existe
+            if let ipv6 = await resolveIPv6(name: question.name) {
+                response = buildAAAAResponse(header: header, question: question, ipv6: ipv6)
+                logDNS(question.name, result: ipv6, authoritative: true)
+            } else {
+                response = buildEmptyResponse(header: header, question: question)
+            }
         } else {
             // Forwarding vers upstream DNS
             response = forwardToUpstream(data, upstream: Self.upstreamDNS) ?? buildNXDomain(header: header, question: question)
@@ -208,6 +213,22 @@ actor DNSServer {
         return candidates
     }
 
+    // MARK: - IPv6 resolution
+
+    private func resolveIPv6(name: String) async -> String? {
+        let candidates = normalizedNames(from: name)
+        let containers = await state.allContainers(includeAll: false)
+        for container in containers {
+            guard let ipv6 = container.ipv6 else { continue }
+            if candidates.contains(container.name) { return ipv6 }
+            if let service = container.labels["com.cocker.service"],
+               candidates.contains(service) { return ipv6 }
+            if candidates.contains(String(container.id.prefix(12))) { return ipv6 }
+            if candidates.contains(container.hostname) { return ipv6 }
+        }
+        return nil
+    }
+
     // MARK: - Response builders
 
     private func buildAResponse(header: DNSHeader, question: DNSQuestion, ip: String) -> Data {
@@ -230,6 +251,18 @@ actor DNSServer {
         var builder = DNSResponseBuilder()
         builder.appendHeader(responseHeader)
         builder.appendQuestion(question)
+        return builder.build()
+    }
+
+    private func buildAAAAResponse(header: DNSHeader, question: DNSQuestion, ipv6: String) -> Data {
+        var responseHeader = header
+        responseHeader.flags = header.responseFlags(rcode: 0, authoritative: true)
+        responseHeader.anCount = 1
+
+        var builder = DNSResponseBuilder()
+        builder.appendHeader(responseHeader)
+        builder.appendQuestion(question)
+        builder.appendAAAARecord(ip: ipv6, ttl: 10)
         return builder.build()
     }
 

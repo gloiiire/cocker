@@ -73,6 +73,7 @@ final class ContainerEngine {
 
         // Allocate IP
         container.ip = await networks.allocateIP(for: id)
+        container.ipv6 = await networks.allocateIPv6(for: id)
         try await state.store(container: container)
         emitEvent("container", action: "create", id: id)
 

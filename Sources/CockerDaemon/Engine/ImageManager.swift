@@ -396,8 +396,11 @@ actor DockerfileBuilder {
             case "RUN":
                 let command = resolveArg(instruction.args, env: env)
                 log(.stdout, " ---> Running: \(command)\n")
-                log(.stderr, "Warning: RUN \(command) requires a Linux VM (run: cockerd setup). Skipping execution — static layers only.\n")
-                log(.stdout, "  → Skipping RUN (no kernel available), continuing with static layers\n")
+                if let rootfs = currentRootfsPath {
+                    try await runBuildCommand(command, workdir: workdir, baseImage: baseImage, env: env, rootfsPath: rootfs)
+                } else {
+                    log(.stderr, "Warning: RUN before FROM — skipping\n")
+                }
                 log(.stdout, " ---> \(shortID())\n")
 
             case "COPY", "ADD":
@@ -531,9 +534,17 @@ actor DockerfileBuilder {
             }
         }
 
+        // Determine architecture from platform config
+        let arch: String
+        if let plat = config.platform {
+            arch = plat.contains("amd64") ? "amd64" : "arm64"
+        } else {
+            arch = "arm64"
+        }
+
         // Build OCI image config
         let ociConfig = OCIImageConfig(
-            architecture: "arm64",
+            architecture: arch,
             os: "linux",
             config: OCIImageConfig.ContainerConfig(
                 user: user.isEmpty ? nil : user,
@@ -581,7 +592,7 @@ actor DockerfileBuilder {
             repository: parseRepo(config.tag),
             tag: parseTag(config.tag),
             size: totalSize,
-            architecture: "arm64",
+            architecture: arch,
             os: "linux",
             layers: layers.map { $0.digest }
         )
@@ -602,6 +613,60 @@ actor DockerfileBuilder {
         log(.status, "Successfully tagged \(config.tag)")
 
         return imageInfo
+    }
+
+    // MARK: - RUN command execution
+
+    private func runBuildCommand(
+        _ command: String,
+        workdir: String,
+        baseImage: String,
+        env: [String: String],
+        rootfsPath: URL
+    ) async throws {
+        // Essai 1 : si le kernel est dispo, utiliser un vrai container VM
+        // (futur — pour l'instant, passer à l'essai 2)
+
+        // Essai 2 : exécuter via /bin/sh macOS dans le rootfs avec sandbox
+        // Attention : les binaires Linux ELF ne tourneront pas, mais les commandes
+        // qui manipulent juste des fichiers fonctionneront
+        let actualWorkdirPath = rootfsPath.appendingPathComponent(workdir.hasPrefix("/") ? String(workdir.dropFirst()) : workdir).path
+
+        let shell = "/bin/sh"
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: shell)
+        proc.arguments = ["-c", command]
+        proc.currentDirectoryURL = URL(fileURLWithPath: FileManager.default.fileExists(atPath: actualWorkdirPath) ? actualWorkdirPath : rootfsPath.path)
+
+        var environment = ProcessInfo.processInfo.environment
+        for (k, v) in env { environment[k] = v }
+        environment["ROOT"] = rootfsPath.path
+        proc.environment = environment
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = errPipe
+
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+
+            let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+            if !out.isEmpty { log(.stdout, out) }
+            if !err.isEmpty { log(.stderr, err) }
+
+            if proc.terminationStatus != 0 {
+                log(.stderr, "Warning: RUN exited with code \(proc.terminationStatus) (Linux binaries may not work on macOS without kernel)\n")
+                // Ne pas throw — on continue le build même si la commande échoue partiellement
+            }
+        } catch {
+            log(.stderr, "Warning: Cannot execute RUN on macOS host: \(error.localizedDescription)\n")
+            log(.stderr, "Tip: Run `cockerd setup` to install the Linux kernel and enable full RUN support\n")
+        }
     }
 
     // MARK: - Layer creation

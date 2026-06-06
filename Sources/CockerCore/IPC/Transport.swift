@@ -12,7 +12,12 @@ public actor IPCClient {
     }
 
     public static var defaultSocketPath: String {
-        "\(NSHomeDirectory())/.cocker/cocker.sock"
+        // Respecte COCKER_HOST env var en premier (ou DOCKER_HOST pour compatibilité)
+        if let host = ProcessInfo.processInfo.environment["COCKER_HOST"] ?? ProcessInfo.processInfo.environment["DOCKER_HOST"] {
+            if host.hasPrefix("unix://") { return String(host.dropFirst(7)) }
+        }
+        // Ensuite le contexte actuel
+        return ContextStore.load().currentSocketPath
     }
 
     public func connect() throws {

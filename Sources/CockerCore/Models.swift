@@ -21,6 +21,7 @@ public struct Container: Codable, Sendable, Identifiable {
     public var startedAt: Date?
     public var finishedAt: Date?
     public var exitCode: Int32?
+    public var ipv6: String?
     public var hostname: String
     public var restartPolicy: RestartPolicy
     public var healthStatus: HealthStatus
@@ -56,6 +57,7 @@ public struct Container: Codable, Sendable, Identifiable {
         self.networkMode = networkMode
         self.networkName = networkName
         self.ip = ip
+        self.ipv6 = nil
         self.cpuCount = cpuCount
         self.restartPolicy = restartPolicy
         self.memoryMB = memoryMB
@@ -182,6 +184,8 @@ public struct NetworkInfo: Codable, Sendable, Identifiable {
     public var driver: NetworkDriver
     public var subnet: String
     public var gateway: String
+    public var subnet6: String
+    public var gateway6: String
     public var containers: [String]
     public var createdAt: Date
 
@@ -198,6 +202,8 @@ public struct NetworkInfo: Codable, Sendable, Identifiable {
         self.driver = driver
         self.subnet = subnet
         self.gateway = gateway
+        self.subnet6 = "fd00:c0c4::/48"
+        self.gateway6 = "fd00:c0c4::1"
         self.containers = containers
         self.createdAt = Date()
     }
