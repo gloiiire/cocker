@@ -132,7 +132,8 @@ public actor ImageStore {
 
     private func extractLayer(at source: URL, to destination: URL, isGzip: Bool) async throws {
         // Use tar to extract (handles whiteout files properly via --delete-before)
-        var args = ["-x", "--overwrite", "-f", source.path, "-C", destination.path]
+        // BSD tar (macOS) — overwrite est le défaut, pas besoin du flag
+        var args = ["-x", "-f", source.path, "-C", destination.path]
         if isGzip { args.insert("-z", at: 0) }
 
         let process = Process()

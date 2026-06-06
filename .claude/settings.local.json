@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//private/tmp/**)",
+      "Bash(mkdir -p test_extract)",
+      "Bash(rm -rf test_extract/*)",
+      "Bash(tar -x -z -f ~/.cocker/images/blobs/sha256/d17f077ada118cc762df373ff803592abf2dfa3ddafaa7381e364dd27a88fca7 -C test_extract)"
+    ]
+  }
+}
