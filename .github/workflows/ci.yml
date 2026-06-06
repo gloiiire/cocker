@@ -103,7 +103,7 @@ jobs:
         # cross-compilé via zig cc depuis macOS. Il sert d'init (PID 1)
         # dans les VMs container.
         working-directory: cocker-init
-        run: zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init init.c cmdline.c net.c dns_proxy.c spec.c
+        run: zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init init.c cmdline.c net.c dns_proxy.c spec.c qemu.c
       - name: Verify ELF
         working-directory: cocker-init
         run: |

@@ -12,6 +12,7 @@ final class ContainerEngine {
     let vmRuntime: VMRuntime
     let portForwarder: PortForwarder
     let l2Switch: any L2Switching
+    let tracer: CockerTracer
     private let rootDir: URL
     var dnsServer: DNSServer?  // injecté par main après init
 
@@ -21,7 +22,8 @@ final class ContainerEngine {
     init(
         rootDir: URL,
         portForwarder: PortForwarder,
-        l2Switch: any L2Switching = L2Switch()
+        l2Switch: any L2Switching = L2Switch(),
+        tracer: CockerTracer = CockerTracer.fromEnvironment()
     ) async throws {
         self.rootDir = rootDir
         self.state = try StateStore(rootDir: rootDir)
@@ -32,16 +34,35 @@ final class ContainerEngine {
         self.l2Switch = l2Switch
         self.vmRuntime = try VMRuntime(rootDir: rootDir, l2Switch: self.l2Switch)
         self.portForwarder = portForwarder
+        self.tracer = tracer
     }
 
     // MARK: - Container lifecycle
 
     func run(config: RunConfig) async throws -> String {
+        let runSpan = tracer.startSpan("container.run", attributes: [
+            "image": config.image,
+            "detach": String(config.detach),
+        ])
+        var spanStatus: SpanStatus = .ok
+        defer { runSpan.end(status: spanStatus) }
+
         fputs("[eng] run() image=\(config.image)\n", stderr); fflush(stderr)
         // Pull image if not present
         if !(await images.exists(config.image)) {
+            let pullSpan = tracer.startSpan("image.pull",
+                                            parentSpanID: runSpan.id,
+                                            attributes: ["image": config.image])
+            do {
+                _ = try await images.pull(reference: config.image) { _ in }
+                pullSpan.end(status: .ok)
+            } catch {
+                pullSpan.setAttribute("error", "\(error)")
+                pullSpan.end(status: .error)
+                spanStatus = .error
+                throw error
+            }
             fputs("[eng] image not present, pulling\n", stderr); fflush(stderr)
-            _ = try await images.pull(reference: config.image) { _ in }
         }
         fputs("[eng] image exists\n", stderr); fflush(stderr)
 
@@ -202,8 +223,16 @@ final class ContainerEngine {
     }
 
     func start(id: String) async throws {
-        guard let container = await state.container(id: id) else { throw CockerError.containerNotFound(id) }
+        let span = tracer.startSpan("container.start", attributes: ["container.id": id])
+        var status: SpanStatus = .ok
+        defer { span.end(status: status) }
+
+        guard let container = await state.container(id: id) else {
+            status = .error; span.setAttribute("error", "container_not_found")
+            throw CockerError.containerNotFound(id)
+        }
         guard container.status == .stopped || container.status == .created else {
+            status = .error; span.setAttribute("error", "already_running")
             throw CockerError.containerAlreadyRunning(id)
         }
 
@@ -218,7 +247,12 @@ final class ContainerEngine {
             _ = try await images.rootfsPath(for: container.image)
             rootfsPath = try await images.cloneRootfs(for: container.image, containerID: id)
         }
-        try await vmRuntime.start(container: container, rootfsPath: rootfsPath)
+        do {
+            try await vmRuntime.start(container: container, rootfsPath: rootfsPath)
+        } catch {
+            status = .error; span.setAttribute("error", "\(error)")
+            throw error
+        }
         try await state.updateContainer(id: id) { c in
             c.status = .running
             c.startedAt = Date()
@@ -228,14 +262,23 @@ final class ContainerEngine {
     }
 
     func stop(id: String, timeout: TimeInterval = 10) async throws {
+        let span = tracer.startSpan("container.stop", attributes: ["container.id": id])
+        var status: SpanStatus = .ok
+        defer { span.end(status: status) }
+
         guard let container = await state.container(id: id) else {
-            throw CockerError.containerNotFound(id)
+            status = .error; throw CockerError.containerNotFound(id)
         }
         guard container.status == .running else {
-            throw CockerError.containerNotRunning(id)
+            status = .error; throw CockerError.containerNotRunning(id)
         }
 
-        try await vmRuntime.stop(containerID: container.id, timeout: timeout)
+        do {
+            try await vmRuntime.stop(containerID: container.id, timeout: timeout)
+        } catch {
+            status = .error; span.setAttribute("error", "\(error)")
+            throw error
+        }
         await portForwarder.stop(containerID: container.id)
         try await state.updateContainer(id: id) { c in
             c.status = .stopped
