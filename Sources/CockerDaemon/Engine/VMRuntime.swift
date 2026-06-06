@@ -187,15 +187,9 @@ final class VMRuntime: NSObject {
             parts.append("cocker.hostname=\(hostname)")
         }
 
-        if !container.command.isEmpty {
-            let cmd = container.command.joined(separator: " ")
-            parts.append("cocker.cmd=\(cmd)")
-        }
-
-        // Environment variables
-        for (key, value) in container.env {
-            parts.append("cocker.env.\(key)=\(value)")
-        }
+        // La commande container et les env vars sont écrites dans /cocker-spec
+        // au lieu de la kernel cmdline (qui ne supporte pas les espaces / quotes
+        // dans les valeurs). Voir writeContainerSpec().
 
         // Port forward info (handled by host-side vmnet, but pass info to init)
         for port in container.ports {
@@ -229,6 +223,11 @@ final class VMRuntime: NSObject {
         // Écrit resolv.conf dans le rootfs pour que le container utilise le DNS interne
         try writeResolvConf(to: rootfsPath, container: container)
         fputs("[vm] resolv.conf OK\n", stderr); fflush(stderr)
+
+        // Écrit la spec container (cmd, env, workdir) dans /cocker-spec
+        // car la kernel cmdline ne supporte pas les espaces/quotes
+        try writeContainerSpec(to: rootfsPath, container: container)
+        fputs("[vm] cocker-spec OK\n", stderr); fflush(stderr)
 
         // Pipes pour capturer console (stdout) du VM
         let stdoutPipe = Pipe()
@@ -344,6 +343,60 @@ final class VMRuntime: NSObject {
     }
 
     // MARK: - DNS resolv.conf injection
+
+    // Écrit /cocker-spec dans le rootfs. Format: NUL-séparé (comme /proc/PID/cmdline).
+    // cocker-init lit ce fichier au lieu de parser la kernel cmdline pour la commande,
+    // ce qui évite tous les problèmes de quoting/spaces.
+    //
+    // Structure:
+    //   Section ARGV : args du child terminé par "\n\0\n\0" (marqueur fin)
+    //   Section ENV  : KEY=VALUE\0 par variable, terminé par "\n\0" final
+    //   Section WORKDIR : workdir\0
+    //
+    // Représentation simple : 3 lignes, chaque champ NUL-séparé :
+    //   <argv0>\0<argv1>\0...\n
+    //   <env0>\0<env1>\0...\n
+    //   <workdir>\n
+    private func writeContainerSpec(to rootfsPath: URL, container: Container) throws {
+        let specPath = rootfsPath.appendingPathComponent("cocker-spec")
+
+        var data = Data()
+
+        // Ligne 1 : argv (NUL séparé)
+        for (i, arg) in container.command.enumerated() {
+            if i > 0 { data.append(0) }
+            data.append(arg.data(using: .utf8) ?? Data())
+        }
+        data.append(0x0A)  // \n
+
+        // Ligne 2 : env (KEY=VALUE NUL séparé)
+        var envEntries: [String] = []
+        // Default PATH/HOME/TERM si absents
+        if container.env["PATH"] == nil {
+            envEntries.append("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        }
+        if container.env["HOME"] == nil {
+            envEntries.append("HOME=/root")
+        }
+        if container.env["TERM"] == nil {
+            envEntries.append("TERM=xterm")
+        }
+        for (k, v) in container.env {
+            envEntries.append("\(k)=\(v)")
+        }
+        for (i, entry) in envEntries.enumerated() {
+            if i > 0 { data.append(0) }
+            data.append(entry.data(using: .utf8) ?? Data())
+        }
+        data.append(0x0A)  // \n
+
+        // Ligne 3 : workdir
+        let workdir = container.env["WORKDIR"] ?? "/"
+        data.append(workdir.data(using: .utf8) ?? Data())
+        data.append(0x0A)  // \n
+
+        try data.write(to: specPath, options: .atomic)
+    }
 
     private func writeResolvConf(to rootfsPath: URL, container: Container) throws {
         let etcDir = rootfsPath.appendingPathComponent("etc")

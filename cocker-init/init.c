@@ -75,7 +75,9 @@ static char *cmdline_get(const char *cmdline, const char *key) {
     return NULL;
 }
 
-/* Iterate all cocker.env.KEY=VALUE from cmdline and setenv() them */
+/* Iterate all cocker.env.KEY=VALUE from cmdline and setenv() them
+ * (legacy — env vient maintenant de /cocker-spec) */
+__attribute__((unused))
 static void setup_env_from_cmdline(const char *cmdline) {
     const char *p = cmdline;
     while ((p = strstr(p, "cocker.env."))) {
@@ -96,7 +98,9 @@ static void setup_env_from_cmdline(const char *cmdline) {
     }
 }
 
-/* Tokenize a command string into argv[] */
+/* Tokenize a command string into argv[]
+ * (legacy — argv vient maintenant de /cocker-spec NUL-séparé) */
+__attribute__((unused))
 static int parse_argv(char *cmd, char **argv, int max) {
     int argc = 0;
     char *p = cmd;
@@ -220,39 +224,72 @@ int main(int argc, char **argv) {
     /* Mount any volume shares */
     mount_volumes(cmdline);
 
-    /* Setup environment from cocker.env.* params */
-    setup_env_from_cmdline(cmdline);
-
-    /* Default PATH if not set */
-    if (!getenv("PATH"))
-        setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
-    if (!getenv("HOME"))
-        setenv("HOME", "/root", 1);
-    if (!getenv("TERM"))
-        setenv("TERM", "xterm", 1);
-
-    /* chdir to workdir if specified */
-    char *workdir = cmdline_get(cmdline, "workdir");
-    if (workdir) {
-        if (chdir(workdir) < 0)
-            info("chdir %s failed: %s", workdir, strerror(errno));
-        free(workdir);
-    }
-
-    /* Get the command to run */
-    char *cmd = cmdline_get(cmdline, "cmd");
-    if (!cmd) {
-        info("no cocker.cmd in cmdline, defaulting to /bin/sh");
-        cmd = strdup("/bin/sh");
-    }
-
-    info("exec: %s", cmd);
-
+    /*
+     * Lit /cocker-spec écrit par cockerd avant le boot.
+     * Format (3 lignes, chaque champ NUL-séparé) :
+     *   argv0\0argv1\0...\n
+     *   env0\0env1\0...\n
+     *   workdir\n
+     * Plus robuste que la kernel cmdline (qui mange les espaces/quotes).
+     */
     char *child_argv[128];
-    parse_argv(cmd, child_argv, 128);
+    int argc_count = 0;
+    int spec_fd = open("/cocker-spec", O_RDONLY);
+    if (spec_fd < 0) {
+        info("no /cocker-spec found, defaulting to /bin/sh");
+        child_argv[0] = "/bin/sh";
+        child_argv[1] = NULL;
+        argc_count = 1;
+    } else {
+        static char spec_buf[65536];
+        ssize_t spec_len = read(spec_fd, spec_buf, sizeof(spec_buf) - 1);
+        close(spec_fd);
+        if (spec_len < 0) die("read /cocker-spec: %s", strerror(errno));
+        spec_buf[spec_len] = '\0';
 
-    if (child_argv[0] == NULL)
-        die("empty command");
+        /* Ligne 1 : argv (champs NUL séparés, ligne terminée par \n) */
+        char *p = spec_buf;
+        char *line_end = memchr(p, '\n', spec_len);
+        if (line_end) {
+            *line_end = '\0';  /* termine la ligne pour les strlen() suivants */
+            char *q = p;
+            while (q < line_end && argc_count < 127) {
+                child_argv[argc_count++] = q;
+                q += strlen(q) + 1;  /* saute le NUL séparateur */
+            }
+            child_argv[argc_count] = NULL;
+            p = line_end + 1;
+        }
+
+        /* Ligne 2 : env (KEY=VALUE NUL séparés, ligne terminée par \n) */
+        ssize_t remaining = spec_buf + spec_len - p;
+        line_end = remaining > 0 ? memchr(p, '\n', remaining) : NULL;
+        if (line_end) {
+            *line_end = '\0';
+            char *q = p;
+            while (q < line_end) {
+                if (*q && strchr(q, '=')) {
+                    putenv(q);  /* le buffer static reste valide pour l'environnement */
+                }
+                q += strlen(q) + 1;
+            }
+            p = line_end + 1;
+        }
+
+        /* Ligne 3 : workdir */
+        remaining = spec_buf + spec_len - p;
+        line_end = remaining > 0 ? memchr(p, '\n', remaining) : NULL;
+        if (line_end) {
+            *line_end = '\0';
+            if (*p && chdir(p) < 0)
+                info("chdir %s failed: %s", p, strerror(errno));
+        }
+    }
+
+    if (argc_count == 0 || child_argv[0] == NULL)
+        die("empty command in /cocker-spec");
+
+    info("exec: %s (argc=%d)", child_argv[0], argc_count);
 
     /* exec the container's command as PID 1 */
     execvp(child_argv[0], child_argv);
