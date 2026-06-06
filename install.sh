@@ -62,7 +62,7 @@ ok "$(ls "$MAN_SRC"/*.1 | wc -l | tr -d ' ') man pages generated"
 
 info "Building cocker-init (Linux ARM64 static)..."
 (cd cocker-init &&
- zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init init.c cmdline.c net.c dns_proxy.c spec.c &&
+ zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init init.c cmdline.c net.c dns_proxy.c spec.c qemu.c &&
  strip cocker-init &&
  cp cocker-init initrd-staging/init &&
  chmod +x initrd-staging/init &&

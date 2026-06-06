@@ -63,6 +63,14 @@ void net_setup_eth1_static(const char *cmdline);
  * child pid (parent), or 0 in the child. */
 pid_t dns_proxy_spawn(unsigned int vsock_port);
 
+/* MARK: - qemu.c */
+
+/* Register a QEMU user-mode emulator with the kernel's binfmt_misc facility so
+ * the VM can transparently execute foreign-architecture binaries (e.g. x86_64
+ * ELFs on an arm64 host kernel). Reads cocker.qemu_path / cocker.qemu_arch from
+ * the kernel cmdline. No-op if either is absent. */
+void qemu_register_binfmt(const char *cmdline);
+
 /* MARK: - spec.c */
 
 /* Read and parse /cocker-spec written by cockerd. Sets argv (NULL-terminated)
