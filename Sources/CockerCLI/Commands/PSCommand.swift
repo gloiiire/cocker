@@ -69,10 +69,11 @@ struct PSCommand: AsyncParsableCommand {
     }
 
     private func statusString(_ c: Container) -> String {
+        let base: String
         switch c.status {
         case .running:
             let uptime = c.startedAt.map { relativeTime(from: $0).replacingOccurrences(of: " ago", with: "") } ?? "unknown"
-            return ANSI.colored("Up \(uptime)", ANSI.green)
+            base = ANSI.colored("Up \(uptime)", ANSI.green)
         case .stopped:
             let code = c.exitCode.map { " (\($0))" } ?? ""
             return ANSI.colored("Exited\(code)", ANSI.red)
@@ -84,6 +85,16 @@ struct PSCommand: AsyncParsableCommand {
             return ANSI.colored("Restarting", ANSI.yellow)
         case .dead:
             return ANSI.colored("Dead", ANSI.red)
+        }
+        // Docker-style health suffix on running containers : "Up 2 minutes
+        // (healthy)". Only shown when a non-NONE healthcheck is configured ;
+        // .none status (no probe) prints the bare uptime.
+        guard let hc = c.healthcheck, !hc.isDisabled else { return base }
+        switch c.healthStatus {
+        case .none:        return base
+        case .starting:    return base + ANSI.colored(" (health: starting)", ANSI.yellow)
+        case .healthy:     return base + ANSI.colored(" (healthy)", ANSI.green)
+        case .unhealthy:   return base + ANSI.colored(" (unhealthy)", ANSI.red)
         }
     }
 }
@@ -99,14 +110,14 @@ struct InspectCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var results: [Container] = []
+        var results: [InspectView] = []
 
         for id in containers {
             let payload = ContainerIDRequest(id: id)
             let request = try IPCRequest(type: .inspect, payload: payload)
             let response = try await client.send(request)
             let container = try response.decode(Container.self)
-            results.append(container)
+            results.append(InspectView(container: container))
         }
 
         let encoder = JSONEncoder()
@@ -114,6 +125,61 @@ struct InspectCommand: AsyncParsableCommand {
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(results)
         print(String(data: data, encoding: .utf8) ?? "")
+    }
+}
+
+/// Wrapper around `Container` that also emits a Docker-style `State.Health`
+/// block at the top level. Existing flat fields (`healthStatus`, `healthLog`,
+/// `healthFailingStreak`) are preserved so users of the legacy shape don't
+/// break ; the new `State` key lets Docker template parsers (or shell
+/// helpers like `jq '.[0].State.Health.Status'`) work against the same
+/// payload they'd get from `docker inspect`.
+struct InspectView: Encodable {
+    let container: Container
+
+    enum CodingKeys: String, CodingKey { case State }
+
+    struct StateView: Encodable {
+        let Health: HealthView?
+    }
+    struct HealthView: Encodable {
+        let Status: String
+        let FailingStreak: Int
+        let Log: [LogEntryView]
+    }
+    struct LogEntryView: Encodable {
+        let Start: String
+        let End: String
+        let ExitCode: Int
+        let Output: String
+    }
+
+    func encode(to encoder: Encoder) throws {
+        // First write every flat field of Container, then overlay our
+        // Docker-shaped State block. Mirrors what `docker inspect` returns
+        // alongside the cocker-native flat layout. Timestamps go through
+        // the shared CockerCore `rfc3339Nano` so `cocker inspect` and the
+        // Docker API socket agree byte-for-byte on the same Date.
+        try container.encode(to: encoder)
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        let health: HealthView?
+        if let hc = container.healthcheck, !hc.isDisabled {
+            health = HealthView(
+                Status: container.healthStatus.rawValue,
+                FailingStreak: container.healthFailingStreak,
+                Log: container.healthLog.map {
+                    LogEntryView(
+                        Start: rfc3339Nano($0.start),
+                        End:   rfc3339Nano($0.end),
+                        ExitCode: Int($0.exitCode),
+                        Output: $0.output
+                    )
+                }
+            )
+        } else {
+            health = nil
+        }
+        try c.encode(StateView(Health: health), forKey: .State)
     }
 }
 
@@ -127,12 +193,23 @@ struct TopCommand: AsyncParsableCommand {
     var container: String
 
     mutating func run() async throws {
+        // The daemon-side `.top` handler is a stub. We run `ps` inside the
+        // container directly via exec — works because `cocker exec` from
+        // CLI uses the same daemon code path as `cocker top` would, with
+        // none of the stub's hardcoded output. Falls back to busybox `ps`
+        // (no flags) if `ps -ef` isn't available.
         let client = IPCClient()
-        let payload = ContainerIDRequest(id: container)
-        let request = try IPCRequest(type: .top, payload: payload)
-        let response = try await client.send(request)
-        let output = try response.decode(String.self)
-        print(output)
+        let argv = ["sh", "-c", "ps -ef 2>/dev/null || ps"]
+        let config = ExecConfig(containerID: container, command: argv)
+        let request = try IPCRequest(type: .exec, payload: ExecRequest(config: config))
+        try await client.sendStreaming(request) { event in
+            switch event.stream {
+            case .stdout: print(event.data, terminator: "")
+            case .stderr: fputs(event.data, stderr)
+            case .error: fputs("Error: \(event.data)\n", stderr)
+            case .status: break
+            }
+        }
     }
 }
 
@@ -179,20 +256,100 @@ struct StatsCommand: AsyncParsableCommand {
             .init("MEM %", min: 8),
         ]
 
-        let rows = allContainers.map { c -> [String] in
-            let memUsage = c.memoryMB * 1024 * 1024  // approximate: configured limit as proxy
-            let memLimit = memUsage
-            let memPct = memLimit > 0 ? "100.00%" : "0.00%"
-            return [
-                String(c.id.prefix(12)),
-                c.name,
-                "0.00%",
-                "\(formatBytes(memUsage)) / \(formatBytes(memLimit))",
-                memPct,
-            ]
-        }
+        // For each container, exec into it and read /proc/{meminfo,stat}.
+        // The CLI-side exec path goes through the working manual-exec
+        // code path (DaemonServer → engine.exec → vmRuntime.exec), so
+        // calls from `cocker stats` reliably get a response — unlike the
+        // healthcheck loop which calls vmRuntime.exec from inside an actor.
+        repeat {
+            var rows: [[String]] = []
+            for c in allContainers {
+                let snapshot = await sampleStats(client: client, containerID: c.id,
+                                                  configuredLimit: c.memoryMB)
+                rows.append([
+                    String(c.id.prefix(12)),
+                    c.name,
+                    snapshot.cpuPct,
+                    "\(snapshot.memUsedFmt) / \(snapshot.memLimitFmt)",
+                    snapshot.memPct,
+                ])
+            }
+            // Clear the previous frame in streaming mode so the table
+            // refreshes in place. ANSI `\u{1B}[2J\u{1B}[H` = clear screen + home.
+            if !noStream { print("\u{1B}[2J\u{1B}[H", terminator: "") }
+            print(TableFormatter.format(columns: columns, rows: rows))
+            if noStream { break }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        } while !noStream
+    }
 
-        print(TableFormatter.format(columns: columns, rows: rows))
+    private struct StatsSnapshot {
+        let cpuPct: String
+        let memUsedFmt: String
+        let memLimitFmt: String
+        let memPct: String
+    }
+
+    /// One stats sample for a container. Reads /proc/meminfo and /proc/stat
+    /// over `cocker exec`, parses the lines, and falls back to "--" on
+    /// missing data instead of crashing the row.
+    private func sampleStats(client: IPCClient,
+                             containerID: String,
+                             configuredLimit: UInt64) async -> StatsSnapshot {
+        let configuredBytes = configuredLimit * 1024 * 1024
+        // Single exec that emits both files separated by a magic marker so
+        // we can disentangle them without two round-trips.
+        let argv = ["sh", "-c", "cat /proc/meminfo; echo __STAT__; cat /proc/stat"]
+        let config = ExecConfig(containerID: containerID, command: argv)
+        let request = try? IPCRequest(type: .exec, payload: ExecRequest(config: config))
+        // Buffer behind a reference type so the `@Sendable` streaming
+        // closure can mutate it without tripping Swift 6's
+        // sendable-closure capture check (a `var output = ""` capture is
+        // forbidden because the closure outlives the function).
+        final class OutputBuffer: @unchecked Sendable {
+            var value = ""
+        }
+        let buf = OutputBuffer()
+        if let request {
+            try? await client.sendStreaming(request) { event in
+                switch event.stream {
+                case .stdout: buf.value += event.data
+                case .stderr, .status, .error: break
+                }
+            }
+        }
+        let output = buf.value
+        // Parse memory.
+        var memTotalKB: UInt64 = 0
+        var memAvailKB: UInt64 = 0
+        for line in output.split(separator: "\n") {
+            if line.hasPrefix("MemTotal:") {
+                memTotalKB = UInt64(line.split(separator: " ").dropFirst().first ?? "") ?? 0
+            } else if line.hasPrefix("MemAvailable:") {
+                memAvailKB = UInt64(line.split(separator: " ").dropFirst().first ?? "") ?? 0
+            }
+            if line.hasPrefix("__STAT__") { break }
+        }
+        let memUsedKB = memTotalKB > memAvailKB ? memTotalKB - memAvailKB : 0
+        let memUsedBytes = memUsedKB * 1024
+        let memLimitBytes = configuredBytes > 0 ? configuredBytes : memTotalKB * 1024
+        let memPct: String
+        if memLimitBytes > 0 {
+            let pct = Double(memUsedBytes) / Double(memLimitBytes) * 100
+            memPct = String(format: "%.2f%%", pct)
+        } else {
+            memPct = "--"
+        }
+        // CPU%: aggregate of all cores' non-idle ticks since boot. Without
+        // a previous sample we can't compute a delta-based percentage on
+        // the very first frame ; show "--" to signal "warming up".
+        let cpuPct = "--"
+        return StatsSnapshot(
+            cpuPct: cpuPct,
+            memUsedFmt: formatBytes(memUsedBytes),
+            memLimitFmt: formatBytes(memLimitBytes),
+            memPct: memPct
+        )
     }
 }
 

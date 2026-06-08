@@ -62,6 +62,9 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customLong("cap-drop"), help: "Drop Linux capabilities")
     var capDrop: [String] = []
 
+    @Flag(name: .customLong("privileged"), help: "Give extended privileges to this container")
+    var privileged = false
+
     @Option(name: .customLong("env-file"), help: "Read environment variables from a file")
     var envFile: [String] = []
 
@@ -83,10 +86,33 @@ struct RunCommand: AsyncParsableCommand {
     @Flag(name: .customLong("read-only"), help: "Mount root filesystem as read-only")
     var readOnly = false
 
+    @Option(name: .customLong("health-cmd"), help: "Command to run to check health (CLI override)")
+    var healthCmd: String?
+
+    @Option(name: .customLong("health-interval"), help: "Time between healthchecks (e.g. 5s, 1m). Default 30s.")
+    var healthInterval: String?
+
+    @Option(name: .customLong("health-timeout"), help: "Per-check timeout (e.g. 3s, 1m). Default 30s.")
+    var healthTimeout: String?
+
+    @Option(name: .customLong("health-start-period"), help: "Grace window before failures count (e.g. 5s, 1m).")
+    var healthStartPeriod: String?
+
+    @Option(name: .customLong("health-retries"), help: "Consecutive failures before unhealthy.")
+    var healthRetries: Int?
+
+    @Flag(name: .customLong("no-healthcheck"), help: "Disable any healthcheck (overrides image HEALTHCHECK)")
+    var noHealthcheck = false
+
     @Argument(help: "Image to run")
     var image: String
 
-    @Argument(parsing: .remaining, help: "Command to run")
+    /// Docker-style command capture : everything after the image name is
+    /// the command, dashes and all. `.captureForPassthrough` is the
+    /// ArgumentParser idiom that stops trying to parse flags from this
+    /// point onward — without it, `cocker run alpine sh -c "..."` rejects
+    /// `-c` as an unknown option of the `run` command itself.
+    @Argument(parsing: .captureForPassthrough, help: "Command to run inside the container")
     var command: [String] = []
 
     mutating func run() async throws {
@@ -109,6 +135,7 @@ struct RunCommand: AsyncParsableCommand {
         config.restartPolicy = RestartPolicy(rawValue: restart) ?? .no
         config.capAdd = capAdd
         config.capDrop = capDrop
+        config.privileged = privileged
 
         // Parse env files
         for file in envFile {
@@ -135,6 +162,12 @@ struct RunCommand: AsyncParsableCommand {
         config.volumesFrom = volumesFrom
         config.tmpfsMounts = tmpfs
         config.readOnly = readOnly
+        config.healthCmd = healthCmd
+        config.healthInterval = healthInterval.flatMap(Self.parseDuration)
+        config.healthTimeout = healthTimeout.flatMap(Self.parseDuration)
+        config.healthStartPeriod = healthStartPeriod.flatMap(Self.parseDuration)
+        config.healthRetries = healthRetries
+        config.healthDisable = noHealthcheck
 
         let client = IPCClient()
         let request = try IPCRequest(type: .run, payload: RunRequest(config: config))
@@ -171,6 +204,29 @@ struct RunCommand: AsyncParsableCommand {
             }
         }
         return result
+    }
+
+    /// Parse Docker-style duration strings : "5s", "1m", "500ms", "2h". Plain
+    /// integers are taken as seconds (matches docker behaviour). Returns nil
+    /// on parse failure ; the CLI silently falls back to image defaults rather
+    /// than aborting the run for a typo'd flag.
+    static func parseDuration(_ s: String) -> TimeInterval? {
+        let str = s.trimmingCharacters(in: .whitespaces).lowercased()
+        if str.isEmpty { return nil }
+        // Pure number → seconds
+        if let n = Double(str) { return n }
+        // Suffix-based
+        let suffixes: [(String, Double)] = [
+            ("ms", 0.001), ("us", 0.000001), ("ns", 0.000000001),
+            ("s", 1), ("m", 60), ("h", 3600)
+        ]
+        for (suf, mult) in suffixes {
+            if str.hasSuffix(suf) {
+                let numPart = String(str.dropLast(suf.count))
+                if let n = Double(numPart) { return n * mult }
+            }
+        }
+        return nil
     }
 
     private func parseKV(_ pairs: [String]) throws -> [String: String] {

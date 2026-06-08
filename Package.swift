@@ -57,7 +57,11 @@ let package = Package(
         ),
         .testTarget(
             name: "CockerTests",
-            dependencies: ["CockerCore"],
+            // Tests everything that can be reached without firing up a real
+            // VZVirtualMachine — including the daemon (StateStore, HTTP
+            // parser, types, allocator helpers) and the CLI (command
+            // configurations, daemon helper logic).
+            dependencies: ["CockerCore", "CockerDaemon", "CockerCLI"],
             path: "Tests/CockerTests"
         ),
     ]

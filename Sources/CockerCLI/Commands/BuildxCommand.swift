@@ -12,9 +12,153 @@ struct BuildxCommand: AsyncParsableCommand {
             BuildxCreateCommand.self,
             BuildxUseCommand.self,
             BuildxRmCommand.self,
+            BuildxInstallQemuCommand.self,
         ],
         defaultSubcommand: BuildxBuildCommand.self
     )
+}
+
+/// Fetches a qemu-user emulator binary from `tonistiigi/binfmt`'s
+/// release tarball and drops it into `~/.cocker/qemu/` where
+/// `cocker-init`'s binfmt_misc registration expects it (see
+/// `cocker-init/qemu.c`).
+///
+/// Cocker runs every container in a Linux aarch64 VM (Apple Silicon
+/// only). To execute a foreign-arch image (e.g. `linux/amd64`) inside
+/// that VM, we need the qemu-user emulator binary built **for
+/// aarch64** — not for x86_64. The classic `multiarch/qemu-user-static`
+/// releases only ship x86_64-hosted variants ; tonistiigi/binfmt is
+/// the same binfmt bundle Docker Desktop uses and DOES ship a
+/// `qemu_*_linux-arm64.tar.gz` archive containing aarch64-hosted
+/// emulators (qemu-x86_64, qemu-arm, qemu-s390x, …). That's what we
+/// pull from here.
+///
+/// We download the bundle once (~28 MB), extract just the requested
+/// `qemu-<arch>` binary, and rename it to `qemu-<arch>-static`
+/// (the suffix the binfmt registration in `cocker-init/qemu.c`
+/// expects). Bundling these in the release tree would tip the cocker
+/// install over 50 MB and pull GPLv2 onto the repo — fetching from a
+/// pinned upstream tag keeps the supply chain auditable.
+struct BuildxInstallQemuCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "install-qemu",
+        abstract: "Download a qemu-user emulator for cross-arch builds")
+
+    @Option(name: .customLong("arch"),
+            help: "Foreign target architecture to install (x86_64, i386, arm, s390x, ppc64le, riscv64, mips64).")
+    var arch: String = "x86_64"
+
+    @Option(name: .customLong("version"),
+            help: "tonistiigi/binfmt release tag (defaults to a known-good pin).")
+    var version: String = "deploy/v10.2.3-68"
+
+    @Option(name: .customLong("qemu-version"),
+            help: "QEMU version embedded in the release tarball name.")
+    var qemuVersion: String = "v10.2.3"
+
+    @Flag(name: .customLong("all"),
+          help: "Install every emulator in the bundle, not just --arch.")
+    var all = false
+
+    @Flag(name: .customLong("force"), help: "Overwrite existing binaries.")
+    var force = false
+
+    mutating func run() async throws {
+        // The supported list mirrors what tonistiigi/binfmt ships in
+        // the aarch64 bundle. Misspellings hit a "no such member of
+        // tarball" error after a 28 MB download — fail fast instead.
+        let supported: Set<String> = [
+            "x86_64", "i386", "arm", "s390x", "ppc64le", "riscv64", "mips64", "mips64el", "loongarch64",
+        ]
+        if !all {
+            guard supported.contains(arch) else {
+                print("Error: unsupported arch '\(arch)'. Choose one of: \(supported.sorted().joined(separator: ", "))")
+                throw ExitCode.failure
+            }
+        }
+
+        let qemuDir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".cocker/qemu", isDirectory: true)
+        try FileManager.default.createDirectory(at: qemuDir, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o755])
+
+        // Bail early if everything we'd write already exists and the
+        // operator didn't pass --force.
+        if !force {
+            let want = all ? supported : [arch]
+            let alreadyHave = want.allSatisfy {
+                FileManager.default.fileExists(atPath:
+                    qemuDir.appendingPathComponent("qemu-\($0)-static").path)
+            }
+            if alreadyHave {
+                print("All requested emulators already installed under \(qemuDir.path). Pass --force to overwrite.")
+                return
+            }
+        }
+
+        // tonistiigi/binfmt assets : a single tarball for each host
+        // platform packs every supported user-mode emulator. We fetch
+        // the arm64-host one — the VM kernel arch — and extract the
+        // emulator that corresponds to the requested target arch.
+        let assetName = "qemu_\(qemuVersion)_linux-arm64.tar.gz"
+        let urlStr = "https://github.com/tonistiigi/binfmt/releases/download/\(version)/\(assetName)"
+        guard let url = URL(string: urlStr) else {
+            print("Error: could not form release URL")
+            throw ExitCode.failure
+        }
+
+        let tarball = qemuDir.appendingPathComponent(".\(assetName)")
+        print("Downloading \(url.absoluteString)…")
+        let curl = Process()
+        curl.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+        curl.arguments = ["-fL", "--progress-bar", "-o", tarball.path, url.absoluteString]
+        try curl.run()
+        curl.waitUntilExit()
+        guard curl.terminationStatus == 0 else {
+            try? FileManager.default.removeItem(at: tarball)
+            print("Error: download failed (curl exit \(curl.terminationStatus))")
+            throw ExitCode.failure
+        }
+
+        // Extract one or all binaries. The tarball is flat — entries
+        // are just "qemu-x86_64", "qemu-arm", … so tar -x on the
+        // qemuDir is enough.
+        let tar = Process()
+        tar.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        if all {
+            tar.arguments = ["-xzf", tarball.path, "-C", qemuDir.path]
+        } else {
+            tar.arguments = ["-xzf", tarball.path, "-C", qemuDir.path, "qemu-\(arch)"]
+        }
+        try tar.run()
+        tar.waitUntilExit()
+        try? FileManager.default.removeItem(at: tarball)
+        guard tar.terminationStatus == 0 else {
+            print("Error: tar extract failed (exit \(tar.terminationStatus))")
+            throw ExitCode.failure
+        }
+
+        // Rename qemu-<arch> → qemu-<arch>-static so the binfmt
+        // registration in `cocker-init/qemu.c` finds them at the
+        // expected path. Also enforce 0755.
+        let wantArches: Set<String> = all ? supported : [arch]
+        for a in wantArches {
+            let src = qemuDir.appendingPathComponent("qemu-\(a)")
+            let dst = qemuDir.appendingPathComponent("qemu-\(a)-static")
+            if FileManager.default.fileExists(atPath: src.path) {
+                if FileManager.default.fileExists(atPath: dst.path) {
+                    try? FileManager.default.removeItem(at: dst)
+                }
+                try FileManager.default.moveItem(at: src, to: dst)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                                      ofItemAtPath: dst.path)
+                let size = (try? FileManager.default.attributesOfItem(atPath: dst.path)[.size] as? Int) ?? 0
+                print("Installed \(dst.lastPathComponent) (\(size / 1024) KiB).")
+            }
+        }
+        let suggested = arch == "x86_64" ? "amd64" : arch
+        print("Cross-arch build is now available — try `cocker buildx build --platform linux/\(suggested) …`.")
+    }
 }
 
 struct BuildxBuildCommand: AsyncParsableCommand {
@@ -47,6 +191,21 @@ struct BuildxBuildCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let platforms = platform.split(separator: ",").map(String.init)
         let imageTag = tag.isEmpty ? "buildx-\(Int(Date().timeIntervalSince1970))" : tag
+
+        // Warn when the user asks for a foreign target arch — multi-arch
+        // requires qemu-user-static binaries on the rootfs path that
+        // cocker-init's binfmt registration points at, and we don't bundle
+        // those yet. Native (`linux/arm64` on Apple Silicon) always works.
+        let hostArch = "linux/arm64"  // Apple Silicon only
+        for plat in platforms where plat != hostArch {
+            fputs(
+                "Warning: cross-arch build (\(plat)) requires qemu-user-static binaries " +
+                "inside the build rootfs at /opt/cocker/qemu/qemu-<arch>-static. " +
+                "Cocker doesn't bundle these yet — RUN steps with foreign binaries will fail. " +
+                "Native arch (\(hostArch)) always works.\n",
+                stderr
+            )
+        }
 
         print("Building \(ANSI.colored(imageTag, ANSI.cyan)) for platforms: \(platforms.joined(separator: ", "))")
 
