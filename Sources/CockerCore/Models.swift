@@ -19,6 +19,11 @@ public struct Container: Codable, Sendable, Identifiable {
     public var cockerIP: String?
     /// MAC assigned to the container's switch-side NIC (02:42:0A:2A:xx:xx)
     public var cockerMAC: String?
+    /// MAC pinned on the eth0 (vmnet NAT) side. Set explicitly by cockerd
+    /// so the host can look up the corresponding DHCP lease in
+    /// `/var/db/dhcpd_leases` when the in-VM `/cocker-ip` write loses the
+    /// DHCP race.
+    public var natMAC: String?
     public var cpuCount: Int
     public var memoryMB: UInt64
     public var createdAt: Date
@@ -29,6 +34,27 @@ public struct Container: Codable, Sendable, Identifiable {
     public var hostname: String
     public var restartPolicy: RestartPolicy
     public var healthStatus: HealthStatus
+    public var healthcheck: Healthcheck?
+    /// Consecutive healthcheck failures since the last success. Persisted so
+    /// the Docker API's `State.Health.FailingStreak` matches what Docker
+    /// surfaces (resets to 0 on the next healthy probe).
+    public var healthFailingStreak: Int
+    /// Rolling history of the last `healthLogMax` probe results. Mirrors
+    /// Docker's `State.Health.Log[]` shape. Bounded to the same 5 entries
+    /// Docker uses so JSON payloads stay reasonable.
+    public var healthLog: [HealthLogEntry]
+    /// Number of times watchContainer restarted this container after a
+    /// non-zero exit. Persisted so `cocker inspect` and the Docker API's
+    /// RestartCount field match across daemon restarts.
+    public var restartCount: Int
+    public var privileged: Bool
+    public var capAdd: [String]
+    public var capDrop: [String]
+    /// Dockerfile `STOPSIGNAL` (or runtime `--stop-signal`) propagated to
+    /// the container init so a `cocker stop` sends the right signal to the
+    /// container's main process. Empty/nil = init's default (SIGTERM).
+    /// Examples : "SIGQUIT" for nginx, "SIGINT" for some PHP-FPM setups.
+    public var stopSignal: String?
 
     public init(
         id: String = UUID().uuidString.prefix(12).lowercased(),
@@ -47,7 +73,15 @@ public struct Container: Codable, Sendable, Identifiable {
         memoryMB: UInt64 = 512,
         hostname: String? = nil,
         restartPolicy: RestartPolicy = .no,
-        healthStatus: HealthStatus = .none
+        healthStatus: HealthStatus = .none,
+        healthcheck: Healthcheck? = nil,
+        healthFailingStreak: Int = 0,
+        healthLog: [HealthLogEntry] = [],
+        restartCount: Int = 0,
+        privileged: Bool = false,
+        capAdd: [String] = [],
+        capDrop: [String] = [],
+        stopSignal: String? = nil
     ) {
         self.id = String(id.prefix(12))
         self.name = name
@@ -68,11 +102,149 @@ public struct Container: Codable, Sendable, Identifiable {
         self.createdAt = Date()
         self.hostname = hostname ?? String(id.prefix(12))
         self.healthStatus = healthStatus
+        self.healthcheck = healthcheck
+        self.healthFailingStreak = healthFailingStreak
+        self.healthLog = healthLog
+        self.restartCount = restartCount
+        self.privileged = privileged
+        self.capAdd = capAdd
+        self.capDrop = capDrop
+        self.stopSignal = stopSignal
+    }
+
+    // MARK: - Codable with forward-migration defaults
+    //
+    // Container is persisted to ~/.cocker/state.json. New fields added in
+    // later cocker releases must NOT cause the entire state file to be
+    // rejected — that would silently wipe every container the user has
+    // when they upgrade. We implement init(from:) explicitly so any new
+    // field added later defaults gracefully instead of throwing.
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.name = try c.decode(String.self, forKey: .name)
+        self.image = try c.decode(String.self, forKey: .image)
+        self.command = try c.decodeIfPresent([String].self, forKey: .command) ?? []
+        self.status = try c.decodeIfPresent(ContainerStatus.self, forKey: .status) ?? .stopped
+        self.ports = try c.decodeIfPresent([PortMapping].self, forKey: .ports) ?? []
+        self.volumes = try c.decodeIfPresent([VolumeMount].self, forKey: .volumes) ?? []
+        self.env = try c.decodeIfPresent([String: String].self, forKey: .env) ?? [:]
+        self.labels = try c.decodeIfPresent([String: String].self, forKey: .labels) ?? [:]
+        self.networkMode = try c.decodeIfPresent(NetworkMode.self, forKey: .networkMode) ?? .nat
+        self.networkName = try c.decodeIfPresent(String.self, forKey: .networkName)
+        self.ip = try c.decodeIfPresent(String.self, forKey: .ip)
+        self.cockerIP = try c.decodeIfPresent(String.self, forKey: .cockerIP)
+        self.cockerMAC = try c.decodeIfPresent(String.self, forKey: .cockerMAC)
+        self.natMAC = try c.decodeIfPresent(String.self, forKey: .natMAC)
+        self.cpuCount = try c.decodeIfPresent(Int.self, forKey: .cpuCount) ?? 2
+        self.memoryMB = try c.decodeIfPresent(UInt64.self, forKey: .memoryMB) ?? 512
+        self.createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        self.startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt)
+        self.finishedAt = try c.decodeIfPresent(Date.self, forKey: .finishedAt)
+        self.exitCode = try c.decodeIfPresent(Int32.self, forKey: .exitCode)
+        self.ipv6 = try c.decodeIfPresent(String.self, forKey: .ipv6)
+        self.hostname = try c.decodeIfPresent(String.self, forKey: .hostname)
+            ?? String(self.id.prefix(12))
+        self.restartPolicy = try c.decodeIfPresent(RestartPolicy.self, forKey: .restartPolicy) ?? .no
+        self.healthStatus = try c.decodeIfPresent(HealthStatus.self, forKey: .healthStatus) ?? .none
+        self.healthcheck = try c.decodeIfPresent(Healthcheck.self, forKey: .healthcheck)
+        // Fields added after the initial release : default to safe zeros
+        // when missing instead of failing the whole decode.
+        self.healthFailingStreak = try c.decodeIfPresent(Int.self, forKey: .healthFailingStreak) ?? 0
+        self.healthLog = try c.decodeIfPresent([HealthLogEntry].self, forKey: .healthLog) ?? []
+        self.restartCount = try c.decodeIfPresent(Int.self, forKey: .restartCount) ?? 0
+        self.privileged = try c.decodeIfPresent(Bool.self, forKey: .privileged) ?? false
+        self.capAdd = try c.decodeIfPresent([String].self, forKey: .capAdd) ?? []
+        self.capDrop = try c.decodeIfPresent([String].self, forKey: .capDrop) ?? []
+        self.stopSignal = try c.decodeIfPresent(String.self, forKey: .stopSignal)
     }
 }
 
 public enum HealthStatus: String, Codable, Sendable {
     case none, starting, healthy, unhealthy
+}
+
+/// RFC 3339 with nanosecond precision, matching Go's `time.RFC3339Nano`
+/// formatter (trailing zeros trimmed). Docker emits this format for
+/// `State.Health.Log[].Start/End` and `Created` ; Go template parsers
+/// reading the result as `time.Time` need at least one nano digit when
+/// sub-second precision is present, otherwise they fall back to RFC3339
+/// and silently round.
+///
+/// Lives in CockerCore so both CockerDaemon (Docker API) and CockerCLI
+/// (`cocker inspect`) emit identical timestamps for the same Date.
+public func rfc3339Nano(_ date: Date) -> String {
+    let calendar = Calendar(identifier: .gregorian)
+    var c = calendar.dateComponents(in: TimeZone(identifier: "UTC")!, from: date)
+    let nano = Int(date.timeIntervalSince1970.truncatingRemainder(dividingBy: 1) * 1_000_000_000)
+    c.nanosecond = nano
+    let mainPart = String(format: "%04d-%02d-%02dT%02d:%02d:%02d",
+                          c.year ?? 0, c.month ?? 0, c.day ?? 0,
+                          c.hour ?? 0, c.minute ?? 0, c.second ?? 0)
+    if nano == 0 { return "\(mainPart)Z" }
+    var frac = String(format: "%09d", nano)
+    while frac.hasSuffix("0") { frac.removeLast() }
+    return "\(mainPart).\(frac)Z"
+}
+
+/// Single healthcheck probe outcome. Mirrors Docker's
+/// `Health.Log[]` entry shape so the Docker API translation is a 1:1
+/// field copy.
+public struct HealthLogEntry: Codable, Sendable, Equatable {
+    public var start: Date
+    public var end: Date
+    public var exitCode: Int32
+    public var output: String
+
+    public init(start: Date, end: Date, exitCode: Int32, output: String) {
+        self.start = start
+        self.end = end
+        self.exitCode = exitCode
+        self.output = output
+    }
+}
+
+/// HEALTHCHECK spec, mirrors Docker's `Healthcheck` shape in the OCI image
+/// config. Cocker runs the command inside the container via the existing
+/// `cocker exec` vsock listener at each `interval` and flips
+/// `Container.healthStatus` based on the exit code.
+public struct Healthcheck: Codable, Sendable, Equatable {
+    /// argv to execute. The first element is by convention either
+    /// "NONE" (disabled), "CMD" (raw exec), or "CMD-SHELL" (run via
+    /// `/bin/sh -c`). See parseDockerfile for how raw Dockerfile lines map
+    /// here.
+    public var test: [String]
+    /// Time between checks, seconds. Docker default: 30.
+    public var interval: TimeInterval
+    /// Per-check timeout, seconds. Docker default: 30.
+    public var timeout: TimeInterval
+    /// Grace window after container start before checks count. Default: 0.
+    public var startPeriod: TimeInterval
+    /// Consecutive failures before the container is marked unhealthy.
+    public var retries: Int
+
+    public init(test: [String],
+                interval: TimeInterval = 30,
+                timeout: TimeInterval = 30,
+                startPeriod: TimeInterval = 0,
+                retries: Int = 3) {
+        self.test = test
+        self.interval = interval
+        self.timeout = timeout
+        self.startPeriod = startPeriod
+        self.retries = retries
+    }
+
+    /// True when this spec represents a disabled healthcheck — the user
+    /// passed `--no-healthcheck`, the image declared `HEALTHCHECK NONE`, or
+    /// the test argv is empty. Case-insensitive on "NONE" because some
+    /// hand-written OCI image configs and compose files use lowercase
+    /// `"none"` even though Docker's canonical form is uppercase.
+    public var isDisabled: Bool {
+        guard let first = test.first else { return true }
+        return first.uppercased() == "NONE"
+    }
 }
 
 public enum ContainerStatus: String, Codable, Sendable {
@@ -164,8 +336,14 @@ public struct ImageInfo: Codable, Sendable, Identifiable {
     public var entrypoint: [String]?
     public var env: [String]?       // ["KEY=VALUE", ...]
     public var workdir: String?
+    public var user: String?        // OCI config.User — Dockerfile USER
     public var labels: [String: String]
     public var exposedPorts: [String]
+    public var healthcheck: Healthcheck?
+    /// Dockerfile `STOPSIGNAL` value (e.g. "SIGQUIT", "SIGTERM"). Forwarded
+    /// to `Container.stopSignal` at run-time and from there to cocker-init
+    /// via the v5 spec format.
+    public var stopSignal: String?
 
     public var reference: String { "\(repository):\(tag)" }
 
@@ -182,8 +360,11 @@ public struct ImageInfo: Codable, Sendable, Identifiable {
         entrypoint: [String]? = nil,
         env: [String]? = nil,
         workdir: String? = nil,
+        user: String? = nil,
         labels: [String: String] = [:],
-        exposedPorts: [String] = []
+        exposedPorts: [String] = [],
+        healthcheck: Healthcheck? = nil,
+        stopSignal: String? = nil
     ) {
         self.id = id
         self.repository = repository
@@ -197,8 +378,11 @@ public struct ImageInfo: Codable, Sendable, Identifiable {
         self.entrypoint = entrypoint
         self.env = env
         self.workdir = workdir
+        self.user = user
         self.labels = labels
         self.exposedPorts = exposedPorts
+        self.healthcheck = healthcheck
+        self.stopSignal = stopSignal
     }
 }
 
@@ -291,12 +475,24 @@ public struct RunConfig: Codable, Sendable {
     public var restartPolicy: RestartPolicy
     public var capAdd: [String]
     public var capDrop: [String]
+    public var privileged: Bool
     public var addHosts: [String]
     public var dnsServers: [String]
     public var dnsSearch: [String]
     public var volumesFrom: [String]
     public var tmpfsMounts: [String]
     public var readOnly: Bool
+    /// CLI healthcheck overrides — mirror Docker's `--health-*` and
+    /// `--no-healthcheck` flags. Any non-nil value here wins over the
+    /// HEALTHCHECK declared in the image. `disable=true` mirrors
+    /// `--no-healthcheck` and produces a `["NONE"]` test, suppressing
+    /// the image's healthcheck entirely.
+    public var healthCmd: String?
+    public var healthInterval: TimeInterval?
+    public var healthTimeout: TimeInterval?
+    public var healthStartPeriod: TimeInterval?
+    public var healthRetries: Int?
+    public var healthDisable: Bool
 
     public init(image: String, command: [String] = []) {
         self.image = image
@@ -320,12 +516,19 @@ public struct RunConfig: Codable, Sendable {
         self.restartPolicy = .no
         self.capAdd = []
         self.capDrop = []
+        self.privileged = false
         self.addHosts = []
         self.dnsServers = []
         self.dnsSearch = []
         self.volumesFrom = []
         self.tmpfsMounts = []
         self.readOnly = false
+        self.healthCmd = nil
+        self.healthInterval = nil
+        self.healthTimeout = nil
+        self.healthStartPeriod = nil
+        self.healthRetries = nil
+        self.healthDisable = false
     }
 }
 
@@ -368,6 +571,18 @@ public struct ExecConfig: Codable, Sendable {
     public var user: String?
     public var workdir: String?
     public var env: [String: String]
+    /// One-shot stdin blob forwarded to the in-VM child process. The CLI
+    /// drains its own stdin into this field when `--interactive` is set
+    /// and stdin is non-TTY (a pipe, file redirection, or heredoc). The
+    /// daemon writes these bytes onto the same vsock connection it used
+    /// for the JSON request — the in-VM listener `dup2`'s that fd onto
+    /// the child's STDIN_FILENO in the non-TTY branch so anything past
+    /// the request terminator newline is consumed as stdin.
+    ///
+    /// Capped at 64 MiB to avoid OOM on accidental `cocker exec -i c sh`
+    /// against `/dev/zero` ; anything bigger should use `cocker cp`.
+    /// Empty / nil means "no stdin forwarded" (the legacy behaviour).
+    public var stdin: Data?
 
     public init(containerID: String, command: [String]) {
         self.containerID = containerID
@@ -377,5 +592,6 @@ public struct ExecConfig: Codable, Sendable {
         self.user = nil
         self.workdir = nil
         self.env = [:]
+        self.stdin = nil
     }
 }

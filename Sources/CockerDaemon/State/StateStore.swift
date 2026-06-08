@@ -5,10 +5,37 @@ import CockerCore
 // Stored in ~/.cocker/state.json
 
 actor StateStore {
+    /// Schema version persisted alongside the state payload. Bumping
+    /// it is a hard contract : older cockerd binaries must refuse to
+    /// load newer files (forward-compat is unsafe — they don't know
+    /// the new fields' invariants), and newer cockerd binaries must
+    /// migrate older files into the current shape during load. v1 is
+    /// the legacy unversioned shape (pre-0.4.x, no `schemaVersion`
+    /// key in JSON) ; v2 introduced after 0.4.1 to carry the new
+    /// `stopSignal` field and any future Container additions
+    /// behind an explicit migration story.
+    static let currentSchemaVersion: Int = 2
+
     struct State: Codable {
+        var schemaVersion: Int = StateStore.currentSchemaVersion
         var containers: [String: Container] = [:]
         var networks: [String: NetworkInfo] = [:]
         var volumes: [String: VolumeInfo] = [:]
+
+        enum CodingKeys: String, CodingKey {
+            case schemaVersion, containers, networks, volumes
+        }
+
+        init() {}
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            // Older files (pre-0.4.2) didn't write schemaVersion — assume v1.
+            self.schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+            self.containers = try c.decodeIfPresent([String: Container].self, forKey: .containers) ?? [:]
+            self.networks = try c.decodeIfPresent([String: NetworkInfo].self, forKey: .networks) ?? [:]
+            self.volumes = try c.decodeIfPresent([String: VolumeInfo].self, forKey: .volumes) ?? [:]
+        }
     }
 
     private let stateFile: URL
@@ -37,6 +64,15 @@ actor StateStore {
             c.status = .stopped
             c.finishedAt = now
             if c.exitCode == nil { c.exitCode = -1 }
+            // Healthcheck loop died with the previous daemon. Reset the
+            // persisted failing-streak ; auto-restart (if policy says so)
+            // will spawn a fresh loop and walk from "starting" through to
+            // the next outcome. We preserve `healthStatus` itself to match
+            // Docker, which freezes the last known status on a stopped
+            // container — a container that was healthy before the daemon
+            // bounce keeps reporting "healthy" until it actually runs and
+            // probes again.
+            c.healthFailingStreak = 0
             state.containers[id] = c
             dirty = true
         }
@@ -52,7 +88,28 @@ actor StateStore {
 
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        state = (try? decoder.decode(State.self, from: data)) ?? State()
+        guard let loaded = try? decoder.decode(State.self, from: data) else {
+            // Corrupted / truncated state.json — preserve the broken file
+            // for forensics and start fresh instead of silently wiping
+            // every container the user had.
+            let backup = stateFile.appendingPathExtension("corrupted.\(Int(Date().timeIntervalSince1970))")
+            try? FileManager.default.copyItem(at: stateFile, to: backup)
+            fputs("[state] WARN : state.json failed to decode ; preserved as \(backup.path) and starting empty\n", stderr)
+            return
+        }
+        // Refuse to load future versions — we don't know the new fields'
+        // invariants and silently downgrading them could corrupt data.
+        if loaded.schemaVersion > Self.currentSchemaVersion {
+            fputs("[state] FATAL : state.json schemaVersion=\(loaded.schemaVersion) exceeds this cockerd's max (\(Self.currentSchemaVersion)). Upgrade cockerd or roll back the file.\n", stderr)
+            exit(64)  // EX_USAGE — operator must intervene
+        }
+        state = loaded
+        // Migrate older files in-memory. The next save() writes back at
+        // currentSchemaVersion.
+        if state.schemaVersion < Self.currentSchemaVersion {
+            fputs("[state] migrating state.json from v\(state.schemaVersion) → v\(Self.currentSchemaVersion)\n", stderr)
+            state.schemaVersion = Self.currentSchemaVersion
+        }
     }
 
     func save() throws {
@@ -61,6 +118,13 @@ actor StateStore {
         encoder.outputFormatting = .prettyPrinted
         let data = try encoder.encode(state)
         try data.write(to: stateFile, options: .atomic)
+        // state.json carries container labels + env vars + restart policy.
+        // env can hold secrets (DB passwords, API tokens) — make the file
+        // owner-only readable so other local users can't enumerate them.
+        // 0o600 mirrors the credentials.json secrecy contract we already
+        // enforce in CredentialStore.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                 ofItemAtPath: stateFile.path)
     }
 
     // MARK: - Containers

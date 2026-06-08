@@ -15,17 +15,32 @@ public struct KernelCommandLineParams: Sendable {
     public let dnsPort: UInt16
     public let dnsVsockPort: UInt32
     public let cockerSwitchGateway: String
+    /// Foreign target arch (e.g. "x86_64") when this VM runs a
+    /// cross-architecture build. nil for native arm64 → arm64. cocker-init
+    /// reads this from the cmdline and registers a binfmt_misc handler
+    /// so foreign-arch ELF binaries get transparently routed through
+    /// qemu-user-static for emulation.
+    public let qemuArch: String?
+    /// In-VM path to the qemu-user-static binary (e.g.
+    /// `/opt/cocker/qemu/qemu-x86_64-static`). cockerd mounts the host
+    /// directory containing it as a virtiofs share named "qemu" at
+    /// `/opt/cocker/qemu/`. nil when cross-arch isn't requested.
+    public let qemuPath: String?
 
     public init(container: Container,
                 dnsIP: String,
                 dnsPort: UInt16,
                 dnsVsockPort: UInt32 = 5353,
-                cockerSwitchGateway: String) {
+                cockerSwitchGateway: String,
+                qemuArch: String? = nil,
+                qemuPath: String? = nil) {
         self.container = container
         self.dnsIP = dnsIP
         self.dnsPort = dnsPort
         self.dnsVsockPort = dnsVsockPort
         self.cockerSwitchGateway = cockerSwitchGateway
+        self.qemuArch = qemuArch
+        self.qemuPath = qemuPath
     }
 }
 
@@ -78,6 +93,14 @@ public enum KernelCommandLine {
 
         if let user = params.container.env["USER"] {
             parts.append("cocker.user=\(user)")
+        }
+
+        // Cross-arch build : tell cocker-init what foreign-arch ELFs to
+        // route through qemu-user-static. Without these two params the
+        // qemu_register_binfmt path in qemu.c is a no-op.
+        if let arch = params.qemuArch, let path = params.qemuPath {
+            parts.append("cocker.qemu_arch=\(arch)")
+            parts.append("cocker.qemu_path=\(path)")
         }
 
         return parts.joined(separator: " ")

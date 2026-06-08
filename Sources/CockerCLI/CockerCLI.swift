@@ -73,6 +73,16 @@ struct CockerCLI: AsyncParsableCommand {
             NodeCommand.self,
             ServiceCommand.self,
 
+            // Daemon lifecycle (start/stop/restart/status/logs)
+            DaemonCommand.self,
+
+            // Secrets & configs
+            SecretCommand.self,
+            ConfigCommand.self,
+
+            // Plugins (registration stubs)
+            PluginCommand.self,
+
             // System
             VersionCommand.self,
             InfoCommand.self,
@@ -87,9 +97,16 @@ struct CockerCLI: AsyncParsableCommand {
         //    (ArgumentParser.CleanExit error 1.)"
         // because the outer catch only got error.localizedDescription. Show
         // the help text instead — that's what users (and `docker` itself) expect.
-        if CommandLine.arguments.count <= 1 {
-            Banner.printCockerWelcome(version: CockerVersion.version)
-            print(Self.helpMessage())
+        // Bare `cocker` and top-level `-h`/`--help` both get our beautified
+        // warm-palette help screen instead of ArgumentParser's flat list.
+        // Subcommand-level helps (e.g. `cocker run -h`) still go through
+        // ArgumentParser since we don't override those.
+        if CommandLine.arguments.count <= 1
+            || (CommandLine.arguments.count == 2
+                && (CommandLine.arguments[1] == "-h"
+                 || CommandLine.arguments[1] == "--help")) {
+            let colored = isatty(fileno(stdout)) == 1
+            print(Banner.cockerCLIHelp(version: CockerVersion.version, colored: colored))
             return
         }
 
@@ -102,25 +119,51 @@ struct CockerCLI: AsyncParsableCommand {
             return
         }
 
+        // One unified error funnel that handles every case ArgumentParser
+        // can throw at us — including help requests bubbling out of `run()`
+        // on commands like `cocker compose` that have subcommands but no
+        // default. The previous code only caught CleanExit at parseAsRoot()
+        // time, so calling a subcommand-less parent surfaced the ugly
+        // localizedDescription :
+        //   "The operation couldn't be completed. (ArgumentParser.CleanExit error 1.)"
         do {
-            var cmd = try parseAsRoot()
+            let cmd = try parseAsRoot()
             if var async = cmd as? AsyncParsableCommand {
-                do {
-                    try await async.run()
-                } catch let error as CockerError {
-                    fputs("\(ANSI.colored("Error:", ANSI.red)) \(error.description)\n", stderr)
-                    throw ExitCode.failure
-                } catch let error as ExitCode {
-                    throw error
-                } catch {
-                    fputs("\(ANSI.colored("Error:", ANSI.red)) \(error.localizedDescription)\n", stderr)
-                    throw ExitCode.failure
-                }
+                try await async.run()
             } else {
-                try cmd.run()
+                var mutable = cmd
+                try mutable.run()
             }
         } catch {
-            exit(withError: error)
+            let colored = isatty(fileno(stdout)) == 1
+            let raw = Self.fullMessage(for: error)
+            let code = Self.exitCode(for: error)
+
+            // CockerError surfaces as a typed value — print it in red,
+            // exit 1. (`fullMessage` would already include it, but we
+            // want the consistent "Error:" prefix the rest of the codebase
+            // uses for application-level failures.)
+            if let cockerErr = error as? CockerError {
+                fputs("\(ANSI.colored("Error:", ANSI.red)) \(cockerErr.description)\n", stderr)
+                Foundation.exit(1)
+            }
+
+            // ExitCode propagated from inside run() — pass through.
+            if let exitCode = error as? ExitCode {
+                Foundation.exit(Int32(exitCode.rawValue))
+            }
+
+            // Everything else (CleanExit help requests, parse errors,
+            // missing-subcommand errors). We colorize the help/error text
+            // and route to the right stream based on the exit code.
+            let painted = Banner.colorizeArgumentParserHelp(raw, colored: colored)
+            if code == .success {
+                print(painted)
+                Foundation.exit(0)
+            } else {
+                FileHandle.standardError.write(Data((painted + "\n").utf8))
+                Foundation.exit(Int32(code.rawValue))
+            }
         }
     }
 }

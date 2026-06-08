@@ -152,7 +152,7 @@ struct RmCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let client = IPCClient()
         for id in containers {
-            let payload = ContainerIDRequest(id: id)
+            let payload = ContainerIDRequest(id: id, force: force)
             let request = try IPCRequest(type: .rm, payload: payload)
             do {
                 _ = try await client.send(request)
@@ -238,7 +238,11 @@ struct ExecCommand: AsyncParsableCommand {
     @Argument(help: "Container ID or name")
     var container: String
 
-    @Argument(parsing: .remaining, help: "Command to execute")
+    /// Docker-style capture : everything after the container name belongs
+    /// to the in-VM command. `.captureForPassthrough` prevents
+    /// ArgumentParser from rejecting dashes like
+    /// `cocker exec my-c sh -c "echo hi"` as unknown flags of `exec`.
+    @Argument(parsing: .captureForPassthrough, help: "Command to execute inside the container")
     var command: [String]
 
     mutating func run() async throws {
@@ -247,6 +251,50 @@ struct ExecCommand: AsyncParsableCommand {
         config.tty = tty
         config.user = user
         config.workdir = workdir
+        // Parse --env KEY=VALUE pairs into the config's env dict. Without
+        // this, `cocker exec --env FOO=bar c sh -c 'echo $FOO'` silently
+        // dropped the variable instead of injecting it into the child env.
+        for entry in env {
+            let parts = entry.split(separator: "=", maxSplits: 1).map(String.init)
+            if parts.count == 2 {
+                config.env[parts[0]] = parts[1]
+            } else if parts.count == 1 {
+                // Bare KEY passthrough — take the daemon's value.
+                config.env[parts[0]] = ProcessInfo.processInfo.environment[parts[0]] ?? ""
+            }
+        }
+
+        // Drain piped / redirected stdin into a one-shot blob the daemon
+        // will forward onto the in-VM child. Three cases :
+        //   1. `-i` set + stdin is NOT a TTY (pipe / file / heredoc) :
+        //      slurp until EOF and stash in `config.stdin`. Caps at
+        //      64 MiB to avoid runaway `< /dev/zero`.
+        //   2. `-i` set + stdin IS a TTY (user typing) : we can't do
+        //      real-time interactive yet (needs duplex IPC + PTY relay).
+        //      Print a clear warning and leave stdin empty.
+        //   3. `-i` not set : skip stdin handling entirely.
+        if interactive {
+            if isatty(fileno(stdin)) == 1 {
+                fputs("Warning: live interactive stdin (TTY) isn't supported yet — pipe input via `echo … | cocker exec -i …` or file redirection. For now your typed input will not reach the container.\n",
+                      stderr)
+            } else {
+                let maxBytes = 64 * 1024 * 1024
+                var collected = Data()
+                var buf = [UInt8](repeating: 0, count: 64 * 1024)
+                while collected.count < maxBytes {
+                    let n = read(fileno(stdin), &buf, buf.count)
+                    if n <= 0 { break }
+                    collected.append(contentsOf: buf.prefix(Int(n)))
+                }
+                if collected.count >= maxBytes {
+                    fputs("Warning: stdin truncated at 64 MiB. Use `cocker cp` for larger inputs.\n",
+                          stderr)
+                }
+                if !collected.isEmpty {
+                    config.stdin = collected
+                }
+            }
+        }
 
         let client = IPCClient()
         let payload = ExecRequest(config: config)

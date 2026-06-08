@@ -93,6 +93,26 @@ public struct OCIImageConfig: Codable, Sendable {
         public let labels: [String: String]?
         public let stopSignal: String?
         public let volumes: [String: Empty]?
+        public let healthcheck: HealthcheckSpec?
+
+        public struct HealthcheckSpec: Codable, Sendable {
+            // OCI JSON uses Test/Interval/Timeout/Retries/StartPeriod, with
+            // intervals expressed in nanoseconds (Go time.Duration).
+            public let Test: [String]?
+            public let Interval: Int64?
+            public let Timeout: Int64?
+            public let StartPeriod: Int64?
+            public let Retries: Int?
+
+            public init(Test: [String]?, Interval: Int64?, Timeout: Int64?,
+                        StartPeriod: Int64?, Retries: Int?) {
+                self.Test = Test
+                self.Interval = Interval
+                self.Timeout = Timeout
+                self.StartPeriod = StartPeriod
+                self.Retries = Retries
+            }
+        }
 
         enum CodingKeys: String, CodingKey {
             case user = "User"
@@ -104,11 +124,13 @@ public struct OCIImageConfig: Codable, Sendable {
             case labels = "Labels"
             case stopSignal = "StopSignal"
             case volumes = "Volumes"
+            case healthcheck = "Healthcheck"
         }
 
         public init(user: String?, exposedPorts: [String: Empty]?, env: [String]?, cmd: [String]?,
                     entrypoint: [String]?, workingDir: String?, labels: [String: String]?,
-                    stopSignal: String?, volumes: [String: Empty]?) {
+                    stopSignal: String?, volumes: [String: Empty]?,
+                    healthcheck: HealthcheckSpec? = nil) {
             self.user = user
             self.exposedPorts = exposedPorts
             self.env = env
@@ -118,6 +140,7 @@ public struct OCIImageConfig: Codable, Sendable {
             self.labels = labels
             self.stopSignal = stopSignal
             self.volumes = volumes
+            self.healthcheck = healthcheck
         }
     }
 
@@ -199,12 +222,16 @@ public struct ImageReference: Sendable {
             ref = String(ref[..<atIdx])
         }
 
-        // Split tag
+        // Split tag — the `:` separator is the LAST one, and only if it
+        // sits AFTER the last `/`. Otherwise it's a registry port like
+        // `127.0.0.1:5555/myapp:smoke`, where the first `:` belongs to the
+        // hostname and the second to the tag.
         var tag = "latest"
-        let parts = ref.split(separator: ":", maxSplits: 1)
-        if parts.count == 2 {
-            ref = String(parts[0])
-            tag = String(parts[1])
+        let lastSlash = ref.lastIndex(of: "/")
+        let searchStart = lastSlash.map(ref.index(after:)) ?? ref.startIndex
+        if let tagColon = ref[searchStart...].lastIndex(of: ":") {
+            tag = String(ref[ref.index(after: tagColon)...])
+            ref = String(ref[..<tagColon])
         }
 
         // Detect registry vs repository

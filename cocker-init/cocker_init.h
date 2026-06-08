@@ -71,6 +71,19 @@ pid_t dns_proxy_spawn(unsigned int vsock_port);
  * the kernel cmdline. No-op if either is absent. */
 void qemu_register_binfmt(const char *cmdline);
 
+/* MARK: - exec_listener.c */
+
+/* Spawn the in-VM vsock listener that accepts `cocker exec` requests on
+ * port 9000. Returns the child pid (parent) or 0 in the listener child. */
+pid_t exec_listener_spawn(void);
+
+/* MARK: - health_poll.c */
+
+/* Spawn the guest-side healthcheck polling worker. The worker watches
+ * /healthcheck/cmd-* files (written by cockerd via virtiofs), runs each
+ * command, and writes the exit code to /healthcheck/result-<seq>. */
+pid_t health_poll_spawn(void);
+
 /* MARK: - spec.c */
 
 /* Read and parse /cocker-spec written by cockerd. Sets argv (NULL-terminated)
@@ -80,5 +93,41 @@ void qemu_register_binfmt(const char *cmdline);
  * Returns the number of argv entries (>= 1 on success), or 0 if the spec
  * file is missing — in which case the caller should default to /bin/sh. */
 int spec_load(char **argv, int max);
+
+/* Populated by spec_load() from the v3 `user` trailer. Empty string ↔ no
+ * setuid (run as root). Format mirrors Docker : "name", "uid", or "uid:gid".
+ * init.c reads this to resolve and apply credentials before execvp(). */
+extern char user_spec[256];
+
+/* Resolve `spec` ("user", "uid", or "uid:gid") into uid+gid by consulting
+ * /etc/passwd if necessary. Returns 0 on success, -1 on failure. */
+int spec_resolve_user(const char *spec, unsigned int *uid, unsigned int *gid);
+
+/* MARK: - caps.c */
+
+/* Resolve a cap name (with or without "CAP_" prefix) to its kernel cap
+ * number. Returns -1 on unknown. */
+int cap_resolve_name(const char *name);
+
+/* Apply the cap policy : narrow the bounded set to (defaults ∪ cap_add) −
+ * cap_drop. Privileged mode skips the dropping entirely. Must be called
+ * before execvp() in the container child. */
+void caps_apply(int privileged,
+                const int *cap_add, int cap_add_len,
+                const int *cap_drop, int cap_drop_len);
+
+/* Populated by spec_load() from the v4 caps trailer. The arrays hold cap
+ * numbers (not names) and are usable directly by caps_apply. */
+extern int cap_add_spec[64];
+extern int cap_add_spec_len;
+extern int cap_drop_spec[64];
+extern int cap_drop_spec_len;
+extern int privileged_spec;
+/// POSIX signal number (e.g. 3 = SIGQUIT). 0 = default (SIGTERM).
+/// Populated by spec_load() from the v5 spec format trailer. Consumed by
+/// init.c's SIGTERM handler : when the host issues `VZ requestStop` /
+/// `cocker stop` (sends SIGTERM to PID 1), we relay this signal to the
+/// container child instead so STOPSIGNAL Dockerfiles work.
+extern int stop_signal_spec;
 
 #endif /* COCKER_INIT_H */
