@@ -1,7 +1,9 @@
+require "etc"
+
 class Cocker < Formula
   desc "Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework"
   homepage "https://github.com/gloiiire/cocker"
-  version "0.5.2"
+  version "0.5.5"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
   # Placeholder — replace with `shasum -a 256` of the actual release tarball.
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
@@ -94,17 +96,21 @@ class Cocker < Formula
       opoo <<~EOS
         No "Apple Development" signing certificate found in your Keychain.
 
-        cockerd uses Virtualization.framework, which macOS only permits for
-        binaries signed by a real Apple developer certificate. Create one
-        (free, requires only an Apple ID):
+        Falling back to ad-hoc signing with the virtualization entitlement.
+        macOS still honours that entitlement for binaries compiled on the
+        same machine (the local-development case Homebrew is doing here),
+        so cockerd will be able to boot VMs. Upgrade to a real Apple
+        Development cert if you want to copy the binary across machines :
 
           1. Open Xcode → Settings → Accounts
-          2. Sign in with your Apple ID
+          2. Sign in with your Apple ID (free)
           3. Click "Manage Certificates" → "+" → "Apple Development"
-
-        Then finish setup by running:
-          brew postinstall cocker
+          4. Then: brew postinstall cocker
       EOS
+      ohai "Ad-hoc signing cockerd with virtualization entitlement"
+      system "codesign", "--force", "--sign", "-",
+             "--entitlements", share/"cocker/cockerd.entitlements",
+             bin/"cockerd"
     else
       ohai "Signing cockerd with: #{cert}"
       system "codesign", "--force", "--sign", cert,
@@ -113,11 +119,20 @@ class Cocker < Formula
     end
 
     # --- 2. Provision ~/.cocker/kernel/ (kernel symlink + initrd copy) ---
-    cocker_root = Pathname.new(Dir.home)/".cocker"
+    # IMPORTANT : `Dir.home` returns Homebrew's fake-home sandbox in the
+    # postinstall context (something like /private/tmp/cocker-postinstall-XXXX/),
+    # so writing relative to it lands files in a tmpdir that vanishes when
+    # the install ends — exactly the bug we shipped through v0.5.4 where
+    # the initrd was being "installed" to /private/tmp/.../.cocker/kernel/
+    # instead of the user's real ~/.cocker/kernel/.
+    # `Etc.getpwuid(Process.uid).dir` always returns the real home of the
+    # user running brew, regardless of any HOME env override.
+    real_home   = Pathname.new(Etc.getpwuid(Process.uid).dir)
+    cocker_root = real_home/".cocker"
     kernel_dir  = cocker_root/"kernel"
     kernel_dir.mkpath
 
-    apple_kernel = Pathname.new(Dir.home)/"Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
+    apple_kernel = real_home/"Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
     if apple_kernel.exist?
       vmlinuz = kernel_dir/"vmlinuz"
       vmlinuz.unlink if vmlinuz.symlink? || vmlinuz.exist?
