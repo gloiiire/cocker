@@ -475,6 +475,21 @@ private func kernelRootsFromContainerBinary() -> [String] {
     ]
 }
 
+/// Look for cocker's own bundled initrd.img in the Homebrew share tree.
+/// `brew install gloiiire/cocker/cocker` drops the initrd at
+/// `<prefix>/share/cocker/initrd.img` (intermediate staging before the
+/// postinstall step symlinks it into `~/.cocker/kernel/`). If the
+/// postinstall stranded the file there (HOME-sandbox bug pre-0.5.5),
+/// `cockerd setup` calls this to recover. Returns nil if no Homebrew
+/// install is present (= the user is on a source/install.sh build).
+private func discoverShippedCockerInitrd() -> String? {
+    let candidates = [
+        "/opt/homebrew/share/cocker/initrd.img",   // Apple Silicon (default brew prefix)
+        "/usr/local/share/cocker/initrd.img",      // Intel Mac (legacy brew prefix)
+    ]
+    return candidates.first { FileManager.default.fileExists(atPath: $0) }
+}
+
 private func which(_ tool: String) -> String? {
     let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
     for dir in path.split(separator: ":") {
@@ -571,14 +586,35 @@ func runSetup(rootURL: URL) async {
         if linkKernel(discovered, into: kernelDir) {
             print("✓ Kernel linked successfully")
             let cockerInitrd = kernelDir.appendingPathComponent("initrd.img").path
+            // If Apple's kernel didn't ship an initrd alongside (which is the
+            // normal case — Apple's `container` builds per-container init fs
+            // and doesn't need a global one), fall back to discovering cocker's
+            // OWN shipped initrd in the Homebrew share tree. The Homebrew
+            // postinstall is supposed to drop it directly in ~/.cocker/kernel/,
+            // but historical bugs have left it stranded at /opt/homebrew/share/
+            // cocker/initrd.img — this code path rescues that situation so
+            // users running `cockerd setup` on a half-broken install get
+            // a fully working setup without manual symlinks.
             if !FileManager.default.fileExists(atPath: cockerInitrd) {
-                print("")
-                print("⚠ initrd.img is still missing at \(cockerInitrd)")
-                print("  Apple's `container` doesn't ship a Linux initrd next to its kernel")
-                print("  (it builds per-container init filesystems instead). Cocker needs")
-                print("  its own initrd. Either run `./install.sh` from the cocker checkout")
-                print("  (it copies cocker-init/initrd.img into place), or copy it manually:")
-                print("    cp cocker-init/initrd.img \(cockerInitrd)")
+                if let shippedInitrd = discoverShippedCockerInitrd() {
+                    do {
+                        try FileManager.default.createSymbolicLink(
+                            at: URL(fileURLWithPath: cockerInitrd),
+                            withDestinationURL: URL(fileURLWithPath: shippedInitrd)
+                        )
+                        print("✓ Linked cocker's shipped initrd: \(shippedInitrd)")
+                    } catch {
+                        print("Warning: found shipped initrd at \(shippedInitrd) but failed to symlink: \(error)")
+                    }
+                } else {
+                    print("")
+                    print("⚠ initrd.img is still missing at \(cockerInitrd)")
+                    print("  Apple's `container` doesn't ship a Linux initrd next to its kernel")
+                    print("  (it builds per-container init filesystems instead). Cocker needs")
+                    print("  its own initrd. Either run `./install.sh` from the cocker checkout")
+                    print("  (it copies cocker-init/initrd.img into place), or copy it manually:")
+                    print("    cp cocker-init/initrd.img \(cockerInitrd)")
+                }
             }
             print("")
             print("Setup complete! Run `cocker daemon start` (or restart it if already running).")
