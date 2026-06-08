@@ -151,8 +151,15 @@ class Cocker < Formula
       EOS
     end
 
-    cp share/"cocker/initrd.img", kernel_dir/"initrd.img"
-    ohai "Installed initrd: #{kernel_dir}/initrd.img"
+    # Earlier formulas (≤ v0.5.5) symlinked kernel_dir/"initrd.img" to
+    # share/cocker/initrd.img instead of copying it. FileUtils.cp refuses
+    # to copy a file over a symlink that resolves to itself ("same file"
+    # ArgumentError), which silently broke every subsequent upgrade's
+    # post_install. Unlink first so we always end up with a real file.
+    target = kernel_dir/"initrd.img"
+    target.unlink if target.symlink? || target.exist?
+    cp share/"cocker/initrd.img", target
+    ohai "Installed initrd: #{target}"
 
     # --- 3. Lease-pool helper LaunchDaemon (one-time root install) ---
     # macOS vmnet's bootpd saturates around 256 DHCP leases ; without
