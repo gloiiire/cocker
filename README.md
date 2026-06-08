@@ -362,6 +362,31 @@ docker ps
 docker run --rm alpine echo hello
 ```
 
+## MCP (Claude Desktop / agents)
+
+`cocker-mcp` is a stdio JSON-RPC bridge that exposes cockerd to any MCP-compatible
+client (Claude Desktop, Claude Code, custom agents). It speaks the
+[Model Context Protocol](https://spec.modelcontextprotocol.io/) on stdin/stdout
+and forwards calls to the Docker socket + native IPC.
+
+29 tools across containers (`cocker_ps`, `cocker_logs`, `cocker_run`,
+`cocker_exec`…), images, volumes, networks, compose (`cocker_compose_up/down/ps/ls`),
+and system (`cocker_info`, `cocker_version`, `cocker_events`).
+
+Wire it up in `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "cocker": { "command": "/opt/homebrew/bin/cocker-mcp" }
+  }
+}
+```
+
+Restart Claude Desktop and the tools appear in the tool picker. The bridge
+talks to the Docker socket by default (`~/.cocker/docker.sock`); set
+`DOCKER_HOST=unix://…` in the env block if you point it elsewhere.
+
 ## Architecture
 
 ```
