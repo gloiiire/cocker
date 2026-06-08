@@ -130,4 +130,18 @@ extern int privileged_spec;
 /// container child instead so STOPSIGNAL Dockerfiles work.
 extern int stop_signal_spec;
 
+/* MARK: - etc_overlay.c */
+
+/* Bind-mount a tmpfs copy of /etc over the virtiofs /etc to work around
+ * an Apple virtiofsd bug that breaks shadow-utils (groupadd, useradd,
+ * usermod). See etc_overlay.c for the full diagnosis. Best-effort : on
+ * failure logs and continues — caller behaviour is unaffected. */
+void etc_overlay_setup(void);
+
+/* Reverse the overlay : copy tmpfs /etc back to virtiofs /etc so the
+ * container's modifications persist into the rootfs. Skips runtime-only
+ * files (resolv.conf, hostname, hosts). Safe to call even if setup
+ * never ran or failed. Called from init.c just before sync()+reboot(). */
+void etc_overlay_sync_back(void);
+
 #endif /* COCKER_INIT_H */
