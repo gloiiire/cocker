@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.5.5 — Three install-time bugs you actually hit on `brew install`
+
+### 1. Postinstall installed the initrd in `/private/tmp/...`, not in `~/.cocker/`
+Homebrew runs postinstall in a sandbox where `Dir.home` returns the
+formula's fake home (`/private/tmp/cocker-postinstall-XXXX/`), not the
+user's actual home. The 0.5.1-0.5.4 formula used `Dir.home` directly,
+so `cp share/"cocker/initrd.img", kernel_dir/"initrd.img"` happily
+created `/private/tmp/cocker-postinstall-XXXX/.cocker/kernel/initrd.img`
+— a file that vanished the instant brew cleaned up its temp tree. The
+user's real `~/.cocker/kernel/` ended up without an initrd, and
+`cocker daemon start` failed at first VM boot with
+`initrd not found at ~/.cocker/kernel/initrd.img`.
+
+Fix : `Etc.getpwuid(Process.uid).dir` returns the real home regardless
+of HOME env overrides. The postinstall now uses that.
+
+### 2. Postinstall left cockerd completely unsigned without an Apple Dev cert
+Same era. If the formula couldn't find an `Apple Development` cert in
+the user's keychain (the default — most people don't have one until
+they're prompted), it printed a warning and **did not codesign at
+all**. The cockerd binary ended up without any entitlements, and the
+binary's startup self-check refused to spawn VMs : `cockerd is missing
+the com.apple.security.virtualization entitlement`.
+
+Fix : when no Apple Dev cert is available, the postinstall now falls
+back to ad-hoc signing **with the virtualization entitlement attached**
+(`codesign --force --sign - --entitlements …`). macOS honours the
+entitlement on ad-hoc-signed binaries for the local-development case
+(binaries compiled on the same machine they run on, which is exactly
+what Homebrew does — it builds cocker from source). The caveat text
+still asks the user to set up a real Apple Dev cert if they want to
+copy the binary across machines.
+
+### 3. `cockerd setup` only knew about Apple's container kernel dir
+The kernel-discovery code in `cockerd setup` searched Homebrew's
+`share/container/`, `libexec/container/`, and the user's `~/Library/
+Application Support/com.apple.container/`. It never looked in
+`/opt/homebrew/share/cocker/initrd.img`, which is where the brew
+postinstall stages cocker's own initrd before the (formerly broken)
+symlink step. So a user running `cockerd setup` after a postinstall
+hiccup got told to copy the initrd manually, even though the file
+was sitting an inch away on the disk.
+
+Fix : new `discoverShippedCockerInitrd()` checks
+`/opt/homebrew/share/cocker/initrd.img` and `/usr/local/share/cocker/
+initrd.img` (Intel Mac legacy prefix). When the Apple-kernel symlink
+step finishes and no initrd was found alongside, this helper rescues
+the file. With the formula fix in #1 you don't normally need this
+fallback ; it exists so users running `cockerd setup` on an older
+half-broken install get rescued without manual symlinks.
+
+## 0.5.4 — `cocker-mcp` MCP server shipped via Homebrew
+
+(see git log f4657c7)
+
+## 0.5.3 — `cocker-mcp` server + kernel discovery rewrite
+
+(see git log 8a172c1)
+
 ## 0.5.2 — Homebrew formula man-page fix
 
 Patch release. The 0.5.1 formula tried to regenerate the man pages at
