@@ -24,15 +24,37 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <unistd.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/reboot.h>
 #include "cocker_init.h"
+
+/* Set right before the child fork so the SIGTERM handler in PID 1 can
+ * relay the container's STOPSIGNAL to it. Volatile because the handler
+ * runs in async signal context. */
+static volatile pid_t g_child_pid = 0;
+
+/* SIGTERM handler installed only when stop_signal_spec is set. Forwards
+ * the configured signal (e.g. SIGQUIT for nginx) to the container's main
+ * process so STOPSIGNAL semantics actually reach the workload. */
+static void forward_stop_signal_to_child(int sig) {
+    /* Note : runs in async signal context — only write(2) is safe. We
+     * skip fprintf/info() and emit one terse marker line so console
+     * tail tells us the relay is alive. */
+    const char *msg = "[cocker-init] forwarding stop signal to child\n";
+    write(2, msg, strlen(msg));
+    (void)sig;
+    if (g_child_pid > 0 && stop_signal_spec > 0) {
+        kill(g_child_pid, stop_signal_spec);
+    }
+}
 
 /* Mount the virtiofs rootfs tag "root" at /newroot, then switch_root */
 static void switch_to_virtiofs(void) {
@@ -58,6 +80,13 @@ static void switch_to_virtiofs(void) {
           "mode=755,size=64m");
     mount("tmpfs", "/newroot/tmp", "tmpfs", MS_NOSUID | MS_NODEV,
           "mode=1777,size=64m");
+
+    /* devpts : required for openpty()/openpty-allocated /dev/pts/N pairs.
+     * Without this `cocker exec -t` fails at openpty() inside the listener. */
+    mkdir("/newroot/dev/pts", 0755);
+    mount("devpts", "/newroot/dev/pts", "devpts",
+          MS_NOSUID | MS_NOEXEC,
+          "mode=620,ptmxmode=000");
 
     if (chdir("/newroot") < 0) die("chdir /newroot: %s", strerror(errno));
     if (mount("/newroot", "/", NULL, MS_MOVE, NULL) < 0)
@@ -94,6 +123,23 @@ static void mount_volumes(const char *cmdline) {
         else
             info("mounted volume %s at %s", tag, path);
         free(spec);
+    }
+}
+
+/* Cross-arch builds : cockerd shares ~/.cocker/qemu via virtiofs tag "qemu"
+ * when the build container is labelled with com.cocker.qemu-arch. We
+ * mount that tag at /opt/cocker/qemu/ so qemu.c's binfmt_register can
+ * find the binary on the path it advertises to the kernel. No-op on
+ * native-arch runs. */
+static void mount_qemu_share(void) {
+    if (access("/opt/cocker/qemu", F_OK) == 0) return;
+    if (mkdir("/opt", 0755) < 0 && errno != EEXIST) return;
+    if (mkdir("/opt/cocker", 0755) < 0 && errno != EEXIST) return;
+    if (mkdir("/opt/cocker/qemu", 0755) < 0 && errno != EEXIST) return;
+    /* Try mounting ; silently skip if the host didn't ship the share
+     * (every native-arch build hits this path — no log spam). */
+    if (mount("qemu", "/opt/cocker/qemu", "virtiofs", MS_RDONLY, NULL) == 0) {
+        info("mounted qemu-user-static share at /opt/cocker/qemu");
     }
 }
 
@@ -166,15 +212,32 @@ int main(int argc, char **argv) {
 
     net_setup_eth1_static(cmdline);
 
-    /* Cross-platform builds : register QEMU user-mode emulator if cockerd
-     * told us about a foreign architecture target. No-op for native builds. */
+    /* Cross-platform builds : mount the qemu-user-static share cockerd
+     * provided over virtiofs (no-op when share absent), then register
+     * the QEMU user-mode emulator via binfmt_misc so any foreign-arch
+     * ELF the build's RUN steps invoke gets transparently emulated. */
+    mount_qemu_share();
     qemu_register_binfmt(cmdline);
 
-    /* Load the container spec (argv + env + workdir). */
+    /* Spawn the in-VM vsock listener that serves `cocker exec` requests.
+     * Runs in a separate subprocess so it survives independently of the
+     * main container command. */
+    exec_listener_spawn();
+
+    /* Load the container spec (argv + env + workdir + user + caps). MUST
+     * happen before health_poll_spawn — the worker forks off this process
+     * and inherits a copy of the user_spec / cap arrays. Inverting the
+     * order leaves the worker with empty defaults and Dockerfile USER
+     * silently goes ignored for healthchecks. */
     char *child_argv[128];
     int argc_count = spec_load(child_argv, 128);
     if (argc_count == 0 || child_argv[0] == NULL)
         die("empty command in /cocker-spec");
+
+    /* Spawn the healthcheck polling worker. cockerd writes one cmd file
+     * per probe via virtiofs ; the worker runs it and writes the result
+     * back. Bypasses the VZ vsock callback flakiness entirely. */
+    health_poll_spawn();
 
     info("exec: %s (argc=%d)", child_argv[0], argc_count);
 
@@ -183,7 +246,74 @@ int main(int argc, char **argv) {
     pid_t child = fork();
     if (child < 0) die("fork: %s", strerror(errno));
 
+    /* When the container's STOPSIGNAL is set (e.g. nginx → SIGQUIT), arm
+     * every plausible shutdown signal in PID 1 so we can relay the
+     * configured signal to the child. VZ requestStop's exact mapping
+     * varies (kernel may turn the ACPI button into SIGINT, SIGTERM,
+     * SIGPWR, or SIGHUP depending on the configuration), so we catch
+     * the full set instead of guessing.
+     *
+     * If STOPSIGNAL is unset (== 0), we install the same handler with
+     * stop_signal_spec defaulting to SIGTERM, which preserves the prior
+     * behaviour : sh's default action on SIGTERM is to exit, so trap
+     * handlers run normally. */
+    g_child_pid = child;
+    if (stop_signal_spec <= 0) stop_signal_spec = 15;  /* default SIGTERM */
+    if (stop_signal_spec < 32) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = forward_stop_signal_to_child;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGINT,  &sa, NULL);
+        sigaction(SIGHUP,  &sa, NULL);
+        sigaction(SIGPWR,  &sa, NULL);
+    }
+
+    /* Publish the container child's PID to a well-known path so the
+     * exec_listener subprocess (separate address space — can't read
+     * g_child_pid directly) can find it for stop-signal delivery. The
+     * file is small and recreated on every boot ; nothing reads it
+     * before init writes it because the listener only forks AFTER
+     * spec_load + child fork. */
+    if (child > 0) {
+        FILE *cpf = fopen("/cocker-child.pid", "w");
+        if (cpf) {
+            fprintf(cpf, "%d\n", (int)child);
+            fclose(cpf);
+        }
+    }
+
     if (child == 0) {
+        /* Caps first — drop unwanted ones from the bounded set BEFORE
+         * setuid. With SECBIT_NOROOT off (the default), root keeps full
+         * caps on uid change ; once we setuid to an unprivileged user the
+         * surviving caps are bounded by what we narrowed here. */
+        caps_apply(privileged_spec,
+                   cap_add_spec, cap_add_spec_len,
+                   cap_drop_spec, cap_drop_spec_len);
+
+        /* Apply Dockerfile USER if the spec set one. Order matters :
+         * setgid() first (still root, can change gid), then setuid() locks
+         * in the unprivileged identity. Failures are fatal because silently
+         * running as root after the user asked for "appuser" is a security
+         * hazard. */
+        if (user_spec[0]) {
+            unsigned int uid = 0, gid = 0;
+            if (spec_resolve_user(user_spec, &uid, &gid) != 0) {
+                fprintf(stderr, "[cocker-init] unknown user '%s'\n", user_spec);
+                _exit(126);
+            }
+            if (setgid(gid) != 0) {
+                fprintf(stderr, "[cocker-init] setgid(%u): %s\n", gid, strerror(errno));
+                _exit(126);
+            }
+            if (setuid(uid) != 0) {
+                fprintf(stderr, "[cocker-init] setuid(%u): %s\n", uid, strerror(errno));
+                _exit(126);
+            }
+        }
         execvp(child_argv[0], child_argv);
         fprintf(stderr, "[cocker-init] execvp %s: %s\n",
                 child_argv[0], strerror(errno));
@@ -207,7 +337,37 @@ int main(int argc, char **argv) {
 
     info("container exited with code %d", exitcode);
 
+    /* Persist the exit code to the shared rootfs so cockerd can read
+     * it after the VM is gone. Console-based capture races VZ's
+     * teardown — the kernel sometimes powers off before init's stderr
+     * drains to the host-side pipe — and `cocker stop` then reports
+     * exit 0 regardless of what the container actually returned. The
+     * file path is fixed ("/cocker-exit-code") so the daemon can find
+     * it without coordination.
+     *
+     * fdatasync() + the rootfs-level sync below force the write to
+     * commit through the virtiofs server to the host filesystem before
+     * the VM is allowed to power off. Without it the kernel may buffer
+     * the dirty page and lose it on the abrupt teardown. */
+    int ecfd = open("/cocker-exit-code", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (ecfd >= 0) {
+        char buf[16];
+        int len = snprintf(buf, sizeof(buf), "%d\n", exitcode);
+        if (len > 0) write(ecfd, buf, (size_t)len);
+        fsync(ecfd);
+        close(ecfd);
+        info("wrote /cocker-exit-code = %d", exitcode);
+    } else {
+        info("FAILED to open /cocker-exit-code : %s", strerror(errno));
+    }
+
+    /* Belt-and-suspenders : flush stderr to the console too. The file
+     * is the source of truth ; the console line is for human inspection
+     * via `cocker logs`. */
+    fflush(stderr);
+    fflush(stdout);
     sync();
+
     reboot(RB_POWER_OFF);
     _exit(exitcode);
 }

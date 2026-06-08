@@ -103,6 +103,15 @@ public struct StreamEvent: Codable, Sendable {
         self.data = data
         self.timestamp = Date()
     }
+
+    /// Overload that preserves a known timestamp — used when replaying
+    /// events from the persisted json-file log instead of generating
+    /// them now. The streaming layer treats both inits identically.
+    public init(stream: Stream, data: String, timestamp: Date) {
+        self.stream = stream
+        self.data = data
+        self.timestamp = timestamp
+    }
 }
 
 // MARK: - Typed request/response payloads
@@ -130,13 +139,25 @@ public struct RunRequest: Codable, Sendable {
 
 public struct RunResponse: Codable, Sendable {
     public let containerID: String
-    public init(containerID: String) { self.containerID = containerID }
+    /// Non-fatal advisories from the daemon — surfaced to the CLI so a
+    /// `cocker run` user gets actionable feedback for half-broken
+    /// outcomes (e.g. lease pool saturation that produced a container
+    /// stuck on `127.0.0.1` port-forwarding). Empty in the happy path
+    /// so older CLI builds that ignore the field keep working.
+    public let warnings: [String]
+    public init(containerID: String, warnings: [String] = []) {
+        self.containerID = containerID
+        self.warnings = warnings
+    }
 }
 
 public struct ContainerIDRequest: Codable, Sendable {
     public let id: String
     public let signal: String?
-    public init(id: String, signal: String? = nil) { self.id = id; self.signal = signal }
+    public let force: Bool?
+    public init(id: String, signal: String? = nil, force: Bool? = nil) {
+        self.id = id; self.signal = signal; self.force = force
+    }
 }
 
 public struct PSRequest: Codable, Sendable {
@@ -248,9 +269,33 @@ public struct ComposeRequest: Codable, Sendable {
     public let projectName: String?
     public let services: [String]
     public let detach: Bool
-    public init(composePath: String, projectName: String? = nil, services: [String] = [], detach: Bool = false) {
+    public let activeProfiles: [String]?
+    /// `compose down --volumes` : also drop named volumes the project
+    /// created. Bind mounts are never touched (Docker semantics —
+    /// volumes the user mounted from host paths are theirs to manage).
+    public let removeVolumes: Bool
+    public init(composePath: String, projectName: String? = nil, services: [String] = [],
+                detach: Bool = false, activeProfiles: [String]? = nil,
+                removeVolumes: Bool = false) {
         self.composePath = composePath; self.projectName = projectName
         self.services = services; self.detach = detach
+        self.activeProfiles = activeProfiles
+        self.removeVolumes = removeVolumes
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case composePath, projectName, services, detach, activeProfiles, removeVolumes
+    }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.composePath    = try c.decode(String.self, forKey: .composePath)
+        self.projectName    = try c.decodeIfPresent(String.self, forKey: .projectName)
+        self.services       = try c.decodeIfPresent([String].self, forKey: .services) ?? []
+        self.detach         = try c.decodeIfPresent(Bool.self, forKey: .detach) ?? false
+        self.activeProfiles = try c.decodeIfPresent([String].self, forKey: .activeProfiles)
+        // Default false : older CLIs that don't send the field keep the
+        // pre-7.2 behaviour ("`down` never touches volumes").
+        self.removeVolumes  = try c.decodeIfPresent(Bool.self, forKey: .removeVolumes) ?? false
     }
 }
 
@@ -398,8 +443,8 @@ public struct UpdateRequest: Codable, Sendable {
 public enum CockerVersion {
     // Bumped manually with each tag. TODO : drive from a Version.generated.swift
     // produced by the release workflow so this can't drift again.
-    public static let version = "0.2.8"
+    public static let version = "0.5.0"
     public static let apiVersion = "1.0"
-    public static let buildTime = "2026-06-06"
+    public static let buildTime = "2026-06-08"
     public static let minAPIVersion = "1.0"
 }

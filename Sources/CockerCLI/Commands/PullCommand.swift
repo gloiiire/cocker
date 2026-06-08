@@ -21,7 +21,14 @@ struct PullCommand: AsyncParsableCommand {
         let payload = PullRequest(reference: image, platform: platform)
         let request = try IPCRequest(type: .pull, payload: payload)
 
-        var layerStates: [String: LayerProgress] = [:]
+        // Layer state behind a reference type so the @Sendable streaming
+        // closure can mutate it without tripping Swift 6's capture check
+        // (a `var layerStates: [String: ...]` capture is rejected because
+        // it outlives this function via the closure).
+        final class LayerBuffer: @unchecked Sendable {
+            var states: [String: LayerProgress] = [:]
+        }
+        let buf = LayerBuffer()
         let reporter = ProgressReporter()
 
         try await client.sendStreaming(request) { event in
@@ -34,8 +41,8 @@ struct PullCommand: AsyncParsableCommand {
                     let current = parts.count > 2 ? Int64(parts[2]) ?? 0 : 0
                     let total = parts.count > 3 ? Int64(parts[3]) ?? 0 : 0
                     let detail = total > 0 ? "\(formatBytes(UInt64(current)))/\(formatBytes(UInt64(total)))" : ""
-                    layerStates[id] = LayerProgress(status: status, current: current, total: total, detail: detail)
-                    reporter.update(layerStates)
+                    buf.states[id] = LayerProgress(status: status, current: current, total: total, detail: detail)
+                    reporter.update(buf.states)
                 }
             } else if event.stream == .error {
                 fputs("\nError: \(event.data)\n", stderr)
@@ -61,7 +68,14 @@ struct PushCommand: AsyncParsableCommand {
         let client = IPCClient()
         let payload = PullRequest(reference: image)
         let request = try IPCRequest(type: .push, payload: payload)
-        _ = try await client.send(request)
+        try await client.sendStreaming(request) { event in
+            switch event.stream {
+            case .stdout: print(event.data, terminator: "")
+            case .stderr: fputs(event.data, stderr)
+            case .status: print(ANSI.colored(event.data, ANSI.cyan))
+            case .error: fputs("Error: \(event.data)\n", stderr)
+            }
+        }
         print("Successfully pushed \(image)")
     }
 }

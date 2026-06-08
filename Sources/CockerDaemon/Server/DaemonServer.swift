@@ -54,8 +54,12 @@ final class DaemonServer {
             throw CockerError.internalError("listen() failed: \(String(cString: strerror(errno)))")
         }
 
-        // Set socket permissions so current user can connect
-        chmod(socketPath, 0o666)
+        // Socket perms : owner-only (0600). The previous 0666 let any
+        // local user on the machine talk to cockerd, which equates to
+        // root inside any container the daemon manages (kernel CAP_*
+        // bypass, host-bind mounts, etc.). 0600 keeps the contract
+        // consistent with credentials.json + state.json.
+        chmod(socketPath, 0o600)
 
         self.serverFD = fd
         self.isRunning = true
@@ -153,7 +157,7 @@ final class DaemonServer {
 
             case .rm:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
-                try await engine.remove(id: req.id)
+                try await engine.remove(id: req.id, force: req.force ?? false)
                 try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
 
             case .ps:
@@ -180,6 +184,14 @@ final class DaemonServer {
                 let req = try JSONDecoder().decode(PullRequest.self, from: request.payload)
                 try await sendStreamingOperation(requestId: request.id, to: fd) { send in
                     _ = try await self.engine.images.pull(reference: req.reference) { msg in
+                        send(StreamEvent(stream: .status, data: msg))
+                    }
+                }
+
+            case .push:
+                let req = try JSONDecoder().decode(PullRequest.self, from: request.payload)
+                try await sendStreamingOperation(requestId: request.id, to: fd) { send in
+                    try await self.engine.images.push(reference: req.reference) { msg in
                         send(StreamEvent(stream: .status, data: msg))
                     }
                 }
@@ -517,8 +529,18 @@ final class DaemonServer {
         guard let container = await engine.state.container(id: req.containerID) else {
             throw CockerError.containerNotFound(req.containerID)
         }
-        let img = try await engine.images.find(container.image)
-        let rootfsDir = await engine.images.store.rootfsDirectory(for: img)
+        // Resolve against the container's clonefile rootfs — the image's
+        // rootfs is shared between all containers of that image, so writing
+        // to it corrupts every sibling. Fall back to the image rootfs only
+        // if the container hasn't been cloned yet (very early lifecycle).
+        let clonedRootfs = await engine.images.store.containerRootfsDirectory(containerID: req.containerID)
+        let rootfsDir: URL
+        if FileManager.default.fileExists(atPath: clonedRootfs.path) {
+            rootfsDir = clonedRootfs
+        } else {
+            let img = try await engine.images.find(container.image)
+            rootfsDir = await engine.images.store.rootfsDirectory(for: img)
+        }
 
         let fm = FileManager.default
         let containerFull = rootfsDir.appendingPathComponent(
@@ -572,31 +594,38 @@ final class DaemonServer {
 
     private func handleSave(_ reference: String) async throws -> SaveResponse {
         let img = try await engine.images.find(reference)
-        let rootDir = await engine.images.store.rootDir
-        let blobDir = rootDir.appendingPathComponent("blobs/sha256")
         let rootfsDir = await engine.images.store.rootfsDirectory(for: img)
 
-        // Create temp tar
-        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cocker-save-\(UUID().uuidString).tar")
-        defer { try? FileManager.default.removeItem(at: tmpURL) }
-
-        // Write a manifest.json
-        let manifestURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("manifest-\(UUID().uuidString).json")
-        defer { try? FileManager.default.removeItem(at: manifestURL) }
+        // Stage a working tree so the produced tar has both `manifest.json`
+        // at the root AND a `rootfs/` directory carrying the extracted
+        // image. handleLoad reads both. The pre-fix code wrote the manifest
+        // to a sibling temp file but never tar'd it ; the resulting
+        // archive was just a rootfs blob with no way to recover the
+        // repo:tag or any of the OCI config defaults.
+        let staging = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cocker-save-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: staging) }
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = .prettyPrinted
         let manifestData = try encoder.encode(img)
-        try manifestData.write(to: manifestURL)
+        try manifestData.write(to: staging.appendingPathComponent("manifest.json"))
 
-        // tar the rootfs + manifest
+        if FileManager.default.fileExists(atPath: rootfsDir.path) {
+            let rootfsTarget = staging.appendingPathComponent("rootfs")
+            // Use clonefile for instant copy on APFS — falls back
+            // transparently to a regular copy on other filesystems.
+            try FileManager.default.copyItem(at: rootfsDir, to: rootfsTarget)
+        }
+
+        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cocker-save-\(UUID().uuidString).tar")
+        defer { try? FileManager.default.removeItem(at: tmpURL) }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        var args = ["-c", "-f", tmpURL.path]
-        if FileManager.default.fileExists(atPath: rootfsDir.path) {
-            args += ["-C", rootfsDir.path, "."]
-        }
-        process.arguments = args
+        process.arguments = ["-c", "-f", tmpURL.path, "-C", staging.path, "."]
         let pipe = Pipe()
         process.standardError = pipe
         try process.run()
@@ -620,26 +649,38 @@ final class DaemonServer {
         try process.run()
         process.waitUntilExit()
 
-        // Look for manifest.json
+        // Look for manifest.json at the tarball root.
         let manifestURL = tmpDir.appendingPathComponent("manifest.json")
-        if let data = try? Data(contentsOf: manifestURL),
-           let img = try? JSONDecoder().decode(ImageInfo.self, from: data) {
-            // Copy extracted content to rootfs
-            let destRootfs = await engine.images.store.rootfsDirectory(for: img)
-            if !FileManager.default.fileExists(atPath: destRootfs.path) {
-                try FileManager.default.createDirectory(at: destRootfs, withIntermediateDirectories: true)
-                // Copy all extracted files except manifest.json
-                if let files = try? FileManager.default.contentsOfDirectory(at: tmpDir, includingPropertiesForKeys: nil) {
-                    for f in files where f.lastPathComponent != "manifest.json" && f.lastPathComponent != "image.tar" {
-                        try? FileManager.default.copyItem(at: f, to: destRootfs.appendingPathComponent(f.lastPathComponent))
+        guard let data = try? Data(contentsOf: manifestURL),
+              let img = try? JSONDecoder().decode(ImageInfo.self, from: data) else {
+            return "Loaded image archive (manifest not found — use `cocker images` to verify)"
+        }
+        // Copy the bundled rootfs into the store. New-style archives (≥
+        // v0.4.2) ship a `rootfs/` subdirectory ; older flat archives put
+        // the filesystem entries at the tar root, so we accept both.
+        let destRootfs = await engine.images.store.rootfsDirectory(for: img)
+        if !FileManager.default.fileExists(atPath: destRootfs.path) {
+            try FileManager.default.createDirectory(at: destRootfs.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            let bundled = tmpDir.appendingPathComponent("rootfs")
+            if FileManager.default.fileExists(atPath: bundled.path) {
+                try FileManager.default.copyItem(at: bundled, to: destRootfs)
+            } else {
+                try FileManager.default.createDirectory(at: destRootfs,
+                                                         withIntermediateDirectories: true)
+                // Older flat shape : copy every entry except the manifest.
+                if let files = try? FileManager.default.contentsOfDirectory(
+                    at: tmpDir, includingPropertiesForKeys: nil) {
+                    for f in files where !["manifest.json", "image.tar"]
+                                            .contains(f.lastPathComponent) {
+                        try? FileManager.default.copyItem(
+                            at: f, to: destRootfs.appendingPathComponent(f.lastPathComponent))
                     }
                 }
             }
-            try await engine.images.storeBuiltImage(img)
-            return "Loaded image: \(img.repository):\(img.tag)"
         }
-
-        return "Loaded image archive (manifest not found — use `cocker images` to verify)"
+        try await engine.images.storeBuiltImage(img)
+        return "Loaded image: \(img.repository):\(img.tag)"
     }
 
     private func handleImagePrune() async throws -> PruneResponse {
@@ -738,7 +779,22 @@ final class DaemonServer {
             throw CockerError.containerNotFound(req.containerID)
         }
         let img = try await engine.images.find(container.image)
-        let rootfsDir = await engine.images.store.rootfsDirectory(for: img)
+        // Commit MUST snapshot the container's OVERLAY rootfs (where the
+        // container's filesystem changes live thanks to APFS clonefile),
+        // not the image's shared base. The earlier path read from the
+        // image's rootfs and silently lost every modification the
+        // container made — `echo modified > /custom.txt && cocker commit`
+        // produced an image identical to the base.
+        let containerRootfs = await engine.images.store.containerRootfsDirectory(containerID: container.id)
+        let rootfsDir: URL
+        if FileManager.default.fileExists(atPath: containerRootfs.path) {
+            rootfsDir = containerRootfs
+        } else {
+            // Container's overlay was already cleaned up (rare ; happens
+            // after `cocker rm` then attempted commit). Fall back to the
+            // image base — at least the image config gets a new tag.
+            rootfsDir = await engine.images.store.rootfsDirectory(for: img)
+        }
         guard FileManager.default.fileExists(atPath: rootfsDir.path) else {
             throw CockerError.imageNotFound("\(container.image) (rootfs not available)")
         }

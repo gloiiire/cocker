@@ -32,7 +32,12 @@ public func parseDockerfile(_ content: String) throws -> [DockerfileInstruction]
         currentLine = ""
     }
 
-    guard instructions.first?.keyword == "FROM" else {
+    // Standard Dockerfile syntax allows any number of `ARG` lines BEFORE the
+    // first FROM — they declare build args that can be substituted in the
+    // FROM line itself (e.g. `FROM alpine:${TAG}`). Skip them when locating
+    // the first "real" instruction.
+    let firstNonArg = instructions.first { $0.keyword != "ARG" }
+    guard firstNonArg?.keyword == "FROM" else {
         throw CockerError.invalidDockerfileInstruction("Dockerfile must start with FROM")
     }
 

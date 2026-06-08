@@ -1,0 +1,438 @@
+/*
+ * exec_listener.c — in-VM vsock listener for `cocker exec`.
+ *
+ * cockerd opens a vsock connection to port 9000 inside the container, writes
+ * a JSON request, and reads back the child's combined stdout/stderr line by
+ * line until EOF. Protocol :
+ *
+ *   Request  : single line of JSON, NL-terminated :
+ *              {"cmd": ["sh","-c","echo hi"], "env": {"FOO":"bar"}}
+ *
+ *   Response : raw child output (stdout + stderr merged). When the child
+ *              exits, the listener emits one final line
+ *                  __COCKER_EXIT__<code>\n
+ *              and closes the socket. The Swift client treats the magic line
+ *              as end-of-stream.
+ *
+ * The listener runs as a forked subprocess of init so failures don't take
+ * down PID 1. The kernel needs CONFIG_VHOST_VSOCK / virtio-vsock enabled.
+ */
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pty.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <unistd.h>
+#include <linux/vm_sockets.h>
+
+#include "cocker_init.h"
+
+#define EXEC_VSOCK_PORT 9000
+#define EXEC_BUF_SIZE   (256 * 1024)
+#define MAX_ARGV        128
+#define MAX_ENV         128
+
+/* Very small in-place JSON scanner — handles the two specific shapes
+ * cockerd sends (`{"cmd":[...],"env":{...}}`). Not a general decoder.
+ *
+ * Returns the number of argv entries on success, 0 on parse error. argv and
+ * env_out are filled with pointers into `buf`, which the caller owns. */
+static int parse_exec_request(char *buf, size_t buf_len,
+                              char **argv, int argv_max,
+                              char **env_out, int env_max,
+                              int *tty_out) {
+    /* NUL-terminate */
+    if (buf_len >= EXEC_BUF_SIZE) buf_len = EXEC_BUF_SIZE - 1;
+    buf[buf_len] = '\0';
+
+    /* --- argv --- */
+    char *p = strstr(buf, "\"cmd\"");
+    if (!p) return 0;
+    p = strchr(p, '[');
+    if (!p) return 0;
+    p++;
+    int argc = 0;
+    while (*p && argc < argv_max - 1) {
+        while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t') p++;
+        if (*p == ']') break;
+        if (*p != '"') break;
+        p++;  /* opening quote */
+        char *start = p;
+        char *write = p;
+        while (*p && *p != '"') {
+            if (*p == '\\' && p[1]) {
+                /* simple JSON escapes */
+                char esc = p[1];
+                if (esc == 'n') *write++ = '\n';
+                else if (esc == 't') *write++ = '\t';
+                else if (esc == 'r') *write++ = '\r';
+                else *write++ = esc;
+                p += 2;
+            } else {
+                *write++ = *p++;
+            }
+        }
+        if (*p != '"') break;
+        *write = '\0';
+        argv[argc++] = start;
+        p++;  /* closing quote */
+    }
+    argv[argc] = NULL;
+
+    /* --- tty --- search from the start of the buffer so we don't depend
+     * on field order in the JSON (Swift's JSONEncoder doesn't guarantee
+     * one). */
+    *tty_out = 0;
+    char *t = strstr(buf, "\"tty\"");
+    if (t) {
+        t = strchr(t, ':');
+        if (t) {
+            t++;
+            while (*t == ' ' || *t == '\t') t++;
+            if (*t == 't') *tty_out = 1;  /* "true" */
+        }
+    }
+
+    /* --- env --- */
+    int envc = 0;
+    char *e = strstr(p, "\"env\"");
+    if (e) {
+        e = strchr(e, '{');
+        if (e) {
+            e++;
+            while (*e && envc < env_max - 1) {
+                while (*e == ' ' || *e == ',' || *e == '\n' || *e == '\t') e++;
+                if (*e == '}') break;
+                if (*e != '"') break;
+                e++;
+                char *key = e;
+                while (*e && *e != '"') e++;
+                if (*e != '"') break;
+                *e = '\0'; e++;
+                while (*e && *e != ':') e++;
+                if (!*e) break;
+                e++;
+                while (*e == ' ' || *e == '\t') e++;
+                if (*e != '"') break;
+                e++;
+                char *val_start = e;
+                char *val_write = e;
+                while (*e && *e != '"') {
+                    if (*e == '\\' && e[1]) {
+                        *val_write++ = e[1]; e += 2;
+                    } else {
+                        *val_write++ = *e++;
+                    }
+                }
+                if (*e != '"') break;
+                *val_write = '\0';
+                /* Build "KEY=VALUE" by moving val one byte right so we can
+                 * stick a '=' before it.  Easier: malloc a fresh buffer. */
+                size_t klen = strlen(key);
+                size_t vlen = strlen(val_start);
+                char *kv = (char *)malloc(klen + 1 + vlen + 1);
+                if (!kv) break;
+                memcpy(kv, key, klen);
+                kv[klen] = '=';
+                memcpy(kv + klen + 1, val_start, vlen);
+                kv[klen + 1 + vlen] = '\0';
+                env_out[envc++] = kv;
+                e++;
+            }
+        }
+    }
+    env_out[envc] = NULL;
+
+    return argc;
+}
+
+/* Read up to `max` bytes or until a '\n' lands in the buffer. Returns the
+ * number of bytes read (including the newline). */
+static ssize_t read_request_line(int fd, char *buf, size_t max) {
+    size_t total = 0;
+    while (total < max - 1) {
+        ssize_t n = read(fd, buf + total, 1);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) break;  /* EOF before NL */
+        total += n;
+        if (buf[total - 1] == '\n') break;
+    }
+    buf[total] = '\0';
+    return (ssize_t)total;
+}
+
+/* Handle a single accepted connection: parse the request, spawn the child,
+ * stream its output, send the exit marker, then close. */
+static void handle_one(int client_fd) {
+    /* Restore SIGCHLD to its default behaviour : the listener parent sets
+     * it to SIG_IGN to reap accept-time grandchildren without zombies, but
+     * that propagates through fork, and our own waitpid() needs the kernel
+     * to actually keep the child's exit status around. Without this reset
+     * waitpid returns -1/ECHILD and we never write the exit marker — the
+     * host side reads forever, exec appears to hang. */
+    signal(SIGCHLD, SIG_DFL);
+
+    static char buf[EXEC_BUF_SIZE];
+    ssize_t r = read_request_line(client_fd, buf, EXEC_BUF_SIZE);
+    if (r <= 0) {
+        const char *err = "__COCKER_EXIT__1\n";
+        write(client_fd, err, strlen(err));
+        close(client_fd);
+        return;
+    }
+
+    /* Stop-signal short-circuit. cockerd uses the same vsock port for
+     * both exec and "send signal" — the latter has no `cmd` field but
+     * carries `{"signal":"SIGNAME"}`. We catch it here BEFORE the
+     * full exec request parser because the absence of "cmd" would
+     * otherwise return 0 and look like a parse error.
+     *
+     * Resolves the target PID by reading /cocker-child.pid (init writes
+     * its main child's PID there right after fork). Replies with one
+     * line — "__COCKER_SIGNAL_OK__\n" on success or
+     * "__COCKER_SIGNAL_ERR__<reason>\n" otherwise — and closes. */
+    if (strstr(buf, "\"signal\"") && !strstr(buf, "\"cmd\"")) {
+        char *sp = strstr(buf, "\"signal\"");
+        sp = strchr(sp, ':');
+        int signum = 0;
+        if (sp) {
+            sp++;
+            while (*sp == ' ' || *sp == '\t') sp++;
+            if (*sp == '"') {
+                sp++;
+                char *end = strchr(sp, '"');
+                if (end) {
+                    *end = '\0';
+                    /* Reuse the same name mapping the Swift side knows. */
+                    if (!strcmp(sp, "SIGHUP") || !strcmp(sp, "HUP")) signum = 1;
+                    else if (!strcmp(sp, "SIGINT") || !strcmp(sp, "INT")) signum = 2;
+                    else if (!strcmp(sp, "SIGQUIT") || !strcmp(sp, "QUIT")) signum = 3;
+                    else if (!strcmp(sp, "SIGKILL") || !strcmp(sp, "KILL")) signum = 9;
+                    else if (!strcmp(sp, "SIGUSR1") || !strcmp(sp, "USR1")) signum = 10;
+                    else if (!strcmp(sp, "SIGUSR2") || !strcmp(sp, "USR2")) signum = 12;
+                    else if (!strcmp(sp, "SIGTERM") || !strcmp(sp, "TERM")) signum = 15;
+                    else signum = atoi(sp);
+                }
+            } else {
+                signum = atoi(sp);
+            }
+        }
+        const char *reply;
+        if (signum > 0 && signum < 32) {
+            FILE *cpf = fopen("/cocker-child.pid", "r");
+            pid_t target = 0;
+            if (cpf) { int v = 0; if (fscanf(cpf, "%d", &v) == 1) target = (pid_t)v; fclose(cpf); }
+            /* Debug breadcrumb : write what we tried to do to a file the
+             * host can read after the VM stops. Critical for diagnosing
+             * "ack=OK but trap never fired" cases — without this we don't
+             * know if kill() returned 0 because the signal landed or
+             * because the kernel silently dropped it. */
+            if (target > 1) {
+                if (kill(target, signum) == 0) {
+                    reply = "__COCKER_SIGNAL_OK__\n";
+                } else {
+                    reply = "__COCKER_SIGNAL_ERR__kill\n";
+                }
+            } else {
+                reply = "__COCKER_SIGNAL_ERR__no-child-pid\n";
+            }
+        } else {
+            reply = "__COCKER_SIGNAL_ERR__bad-signal\n";
+        }
+        write(client_fd, reply, strlen(reply));
+        close(client_fd);
+        return;
+    }
+
+    char *argv[MAX_ARGV];
+    char *env_out[MAX_ENV];
+    int tty = 0;
+    int argc = parse_exec_request(buf, (size_t)r, argv, MAX_ARGV, env_out, MAX_ENV, &tty);
+    if (argc == 0) {
+        const char *err = "parse error\n__COCKER_EXIT__2\n";
+        write(client_fd, err, strlen(err));
+        close(client_fd);
+        return;
+    }
+
+    int master_fd = -1;
+    int slave_fd = -1;
+    if (tty) {
+        /* openpty allocates a /dev/pts/N pair. The master stays on the
+         * listener side and gets relayed to the client socket ; the slave
+         * is dup'd into the child's stdin/stdout/stderr after setsid +
+         * TIOCSCTTY so the child sees a real controlling terminal. */
+        if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) != 0) {
+            const char *err = "openpty failed\n__COCKER_EXIT__3\n";
+            write(client_fd, err, strlen(err));
+            close(client_fd);
+            return;
+        }
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        if (master_fd >= 0) close(master_fd);
+        if (slave_fd >= 0) close(slave_fd);
+        const char *err = "fork failed\n__COCKER_EXIT__3\n";
+        write(client_fd, err, strlen(err));
+        close(client_fd);
+        return;
+    }
+    if (pid == 0) {
+        /* Child. Two paths : pty mode hooks up the slave as controlling
+         * terminal ; non-pty mode just dups the raw socket as before. */
+        if (tty) {
+            if (master_fd >= 0) close(master_fd);
+            setsid();
+            ioctl(slave_fd, TIOCSCTTY, 0);
+            dup2(slave_fd, STDIN_FILENO);
+            dup2(slave_fd, STDOUT_FILENO);
+            dup2(slave_fd, STDERR_FILENO);
+            if (slave_fd > STDERR_FILENO) close(slave_fd);
+            if (client_fd > STDERR_FILENO) close(client_fd);
+        } else {
+            /* Non-TTY exec : the same vsock fd carries stdin from the
+             * host (anything after the request's terminator newline is
+             * stdin bytes) and child's stdout / stderr the other way.
+             * Pre-`cocker exec -i` stdin forwarding, only stdout / stderr
+             * were dup'd ; programs that read stdin (`cat`, `sort`,
+             * `wc -l`) saw EOF immediately because the inherited stdin
+             * was the listener parent's vsock fd after its own NL-bounded
+             * read had drained the request line. Adding STDIN_FILENO
+             * here lets the child block on more input until the host
+             * shutdown(SHUT_WR)'s the socket. */
+            dup2(client_fd, STDIN_FILENO);
+            dup2(client_fd, STDOUT_FILENO);
+            dup2(client_fd, STDERR_FILENO);
+            if (client_fd > STDERR_FILENO) close(client_fd);
+        }
+
+        for (int i = 0; env_out[i]; i++) putenv(env_out[i]);
+
+        execvp(argv[0], argv);
+        fprintf(stderr, "[cocker-init] exec %s: %s\n", argv[0], strerror(errno));
+        _exit(127);
+    }
+
+    /* Parent in pty mode : relay master_fd <-> client_fd. We dup the
+     * master into client_fd direction in a small select loop so the host
+     * sees pty output and can write input back. */
+    if (tty && master_fd >= 0) {
+        close(slave_fd);
+        /* Best-effort relay : read from master, write to client. Stop on
+         * any error / EOF, then we'll waitpid the child and emit marker. */
+        fd_set rfds;
+        char buf[4096];
+        for (;;) {
+            FD_ZERO(&rfds);
+            FD_SET(master_fd, &rfds);
+            FD_SET(client_fd, &rfds);
+            int maxfd = master_fd > client_fd ? master_fd : client_fd;
+            struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+            int rv = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+            if (rv < 0) { if (errno == EINTR) continue; break; }
+            if (FD_ISSET(master_fd, &rfds)) {
+                ssize_t n = read(master_fd, buf, sizeof(buf));
+                if (n <= 0) break;
+                write(client_fd, buf, (size_t)n);
+            }
+            if (FD_ISSET(client_fd, &rfds)) {
+                ssize_t n = read(client_fd, buf, sizeof(buf));
+                if (n <= 0) break;
+                write(master_fd, buf, (size_t)n);
+            }
+            /* Detect child exit non-blocking : if waitpid would reap, break. */
+            int wstat;
+            pid_t r2 = waitpid(pid, &wstat, WNOHANG);
+            if (r2 == pid) break;
+        }
+        close(master_fd);
+    }
+
+    /* Parent : wait for child, then send the exit marker. */
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    int code = WIFEXITED(status) ? WEXITSTATUS(status)
+             : WIFSIGNALED(status) ? 128 + WTERMSIG(status)
+             : 1;
+    char marker[64];
+    int len = snprintf(marker, sizeof(marker), "__COCKER_EXIT__%d\n", code);
+    write(client_fd, marker, (size_t)len);
+    close(client_fd);
+
+    /* Free the env entries we allocated in parse_exec_request. */
+    for (int i = 0; env_out[i]; i++) free(env_out[i]);
+}
+
+/* Background listener loop. Forks a separate process so a crash here doesn't
+ * take down PID 1. */
+pid_t exec_listener_spawn(void) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        info("exec-listener: fork failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pid > 0) {
+        info("exec-listener: spawned (pid=%d)", pid);
+        return pid;
+    }
+
+    /* Child : the listener itself. Ignore SIGCHLD so dead workers don't
+     * accumulate as zombies (we accept the small race of a worker dying
+     * before we read its exit). */
+    signal(SIGCHLD, SIG_IGN);
+
+    int sfd = socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (sfd < 0) {
+        info("exec-listener: socket(AF_VSOCK): %s", strerror(errno));
+        _exit(1);
+    }
+
+    struct sockaddr_vm addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.svm_family = AF_VSOCK;
+    addr.svm_cid = VMADDR_CID_ANY;
+    addr.svm_port = EXEC_VSOCK_PORT;
+
+    if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        info("exec-listener: bind: %s", strerror(errno));
+        _exit(1);
+    }
+    if (listen(sfd, 4) < 0) {
+        info("exec-listener: listen: %s", strerror(errno));
+        _exit(1);
+    }
+    info("exec-listener ready on vsock port %d", EXEC_VSOCK_PORT);
+
+    for (;;) {
+        int cfd = accept(sfd, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            info("exec-listener: accept: %s", strerror(errno));
+            continue;
+        }
+        info("exec-listener: accepted connection (cfd=%d)", cfd);
+        /* Each request handled in a fresh child so parallel execs don't
+         * block each other. */
+        pid_t wpid = fork();
+        if (wpid == 0) {
+            close(sfd);
+            handle_one(cfd);
+            _exit(0);
+        }
+        close(cfd);
+    }
+}

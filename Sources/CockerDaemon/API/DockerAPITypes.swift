@@ -156,6 +156,29 @@ struct DockerContainerState: Encodable {
     let Error: String
     let StartedAt: String
     let FinishedAt: String
+    /// Docker Engine API v1.41 healthcheck shape. Only populated when the
+    /// container has a non-NONE healthcheck — Docker omits the field
+    /// entirely when no probe is configured.
+    let Health: DockerHealth?
+}
+
+struct DockerHealth: Encodable {
+    /// One of "starting" / "healthy" / "unhealthy" / "none".
+    let Status: String
+    /// Consecutive failure count. Cocker doesn't surface this through state
+    /// today ; reported as 0 (matches a freshly-flipped healthy container).
+    let FailingStreak: Int
+    /// Recent probe history. Cocker doesn't persist per-probe output yet,
+    /// so this is always empty. Reported as `[]` (not omitted) so
+    /// `docker inspect` template parsers don't crash on missing field.
+    let Log: [DockerHealthLogEntry]
+}
+
+struct DockerHealthLogEntry: Encodable {
+    let Start: String
+    let End: String
+    let ExitCode: Int
+    let Output: String
 }
 
 struct DockerHostConfig: Encodable {

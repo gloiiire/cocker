@@ -34,6 +34,21 @@ struct ComposeFile: Decodable {
             case .dict(let d): return Array(d.keys)
             }
         }
+
+        /// Compose long-form `depends_on : <service> : { condition : ... }`
+        /// expanded into a [serviceName : conditionString] dict. Short-form
+        /// (just an array of names) is treated as `service_started`,
+        /// matching Docker Compose's default.
+        var conditions: [String: String] {
+            switch self {
+            case .array(let a):
+                return Dictionary(uniqueKeysWithValues: a.map { ($0, "service_started") })
+            case .dict(let d):
+                return Dictionary(uniqueKeysWithValues: d.map { name, spec in
+                    (name, spec.condition ?? "service_started")
+                })
+            }
+        }
     }
 
     struct NetworkServiceSpec: Decodable {
@@ -80,7 +95,9 @@ struct ComposeFile: Decodable {
         var networks: NetworksSpec?
         var depends_on: DependsOnSpec?
         var restart: String?
-        var labels: [String: String]?
+        // Compose accepts labels as a {key:value} map OR a ["key=value", ...]
+        // array. EnvSpec already implements that flexibility.
+        var labels: EnvSpec?
         var hostname: String?
         var user: String?
         var working_dir: String?
@@ -91,6 +108,7 @@ struct ComposeFile: Decodable {
         var container_name: String?
         var env_file: StringOrArray?
         var extra_hosts: [String]?
+        var profiles: [String]?
     }
 
     struct ComposeBuild: Decodable {
@@ -125,6 +143,28 @@ struct ComposeFile: Decodable {
         var interval: String?
         var timeout: String?
         var retries: Int?
+        var start_period: String?
+        var disable: Bool?
+
+        // Compose v3.4+ canonical is `start_period` (snake_case), but
+        // hand-written files and a few generators emit `startPeriod`
+        // (camelCase) — both reach us as the same field.
+        enum CodingKeys: String, CodingKey {
+            case test, interval, timeout, retries, disable
+            case start_period
+            case startPeriod
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            test     = try c.decodeIfPresent(StringOrArray.self, forKey: .test)
+            interval = try c.decodeIfPresent(String.self, forKey: .interval)
+            timeout  = try c.decodeIfPresent(String.self, forKey: .timeout)
+            retries  = try c.decodeIfPresent(Int.self, forKey: .retries)
+            disable  = try c.decodeIfPresent(Bool.self, forKey: .disable)
+            start_period = try c.decodeIfPresent(String.self, forKey: .start_period)
+                        ?? c.decodeIfPresent(String.self, forKey: .startPeriod)
+        }
     }
 
     struct ComposeDeploy: Decodable {
@@ -236,13 +276,74 @@ actor ComposeEngine {
             }
         }
 
+        // Filter out services in profiles that weren't activated. Docker
+        // Compose semantics : a service with `profiles:` only starts if one
+        // of its profiles is explicitly requested via --profile (or if the
+        // user listed the service name on the command line).
+        let activeProfiles = Set(request.activeProfiles ?? [])
+        let explicit = Set(request.services)
+        let candidateServices = compose.services.filter { name, svc in
+            // If the user asked for this service by name, run it regardless.
+            if explicit.contains(name) { return true }
+            // Service with no profiles → always part of the default project.
+            guard let profiles = svc.profiles, !profiles.isEmpty else { return true }
+            // Service has profiles → only run if at least one is active.
+            return !activeProfiles.isDisjoint(with: profiles)
+        }.map(\.key)
+
         // Sort services by dependency order
-        let services = request.services.isEmpty ? Array(compose.services.keys) : request.services
+        let services = request.services.isEmpty ? candidateServices : request.services
         let sorted = topologicalSort(services: services, dependencies: compose.services)
+
+        // Build images for any service with a `build:` block whose tag isn't
+        // already in the local store. Without this, `compose up` on a fresh
+        // project tries to pull a non-existent `<project>_<svc>:latest` from
+        // Docker Hub and falls over.
+        for serviceName in sorted {
+            guard let service = compose.services[serviceName],
+                  let buildSpec = service.build else { continue }
+            let tag = service.image ?? "\(projectName)_\(serviceName)"
+            if await containerEngine.images.exists(tag) { continue }
+            // Resolve build context relative to the compose file's directory.
+            let composeDir = (request.composePath as NSString).deletingLastPathComponent
+            let rawContext = buildSpec.context ?? "."
+            let absContext = rawContext.hasPrefix("/")
+                ? rawContext
+                : "\(composeDir)/\(rawContext)"
+            progressHandler(StreamEvent(stream: .status, data: "Building \(serviceName)...\n"))
+            var bc = BuildConfig(contextPath: absContext, tag: tag)
+            bc.dockerfile = buildSpec.dockerfile ?? "Dockerfile"
+            bc.buildArgs = buildSpec.args ?? [:]
+            _ = try await containerEngine.images.build(config: bc, vmRuntime: containerEngine.vmRuntime) { event in
+                progressHandler(event)
+            }
+        }
+
+        // Map serviceName → containerName for healthcheck waits below.
+        var startedContainers: [String: String] = [:]
 
         // Start services
         for serviceName in sorted {
             guard let service = compose.services[serviceName] else { continue }
+
+            // depends_on with condition: service_healthy / service_started /
+            // service_completed_successfully — block until the dependency is
+            // in the requested state before this service boots. Without
+            // this, an app starts before its database is reachable and
+            // crashes in a hot loop while compose declares success.
+            if let deps = service.depends_on?.conditions {
+                for (depName, condition) in deps {
+                    guard let depContainer = startedContainers[depName] else { continue }
+                    progressHandler(StreamEvent(stream: .status,
+                        data: " Waiting for \(depName) (\(condition))...\n"))
+                    try await waitForCondition(
+                        containerName: depContainer,
+                        condition: condition,
+                        progressHandler: progressHandler
+                    )
+                }
+            }
+
             progressHandler(StreamEvent(stream: .status, data: "Starting \(projectName)_\(serviceName)_1...\n"))
 
             let runConfig = try buildRunConfig(
@@ -253,10 +354,58 @@ actor ComposeEngine {
             )
 
             let id = try await containerEngine.run(config: runConfig)
+            startedContainers[serviceName] = runConfig.name ?? id
             progressHandler(StreamEvent(stream: .stdout, data: " Container \(projectName)_\(serviceName)_1 Started (id: \(String(id.prefix(12))))\n"))
         }
 
         progressHandler(StreamEvent(stream: .status, data: "All services started.\n"))
+    }
+
+    /// Block until the given container reaches the Compose `condition:`
+    /// state. Polls every 500 ms with a 5-minute ceiling — long enough for
+    /// real database boots, short enough that a stuck container surfaces
+    /// instead of compose hanging forever.
+    ///
+    /// - `service_started` : container.status == .running (Docker default)
+    /// - `service_healthy` : healthStatus == .healthy
+    /// - `service_completed_successfully` : container.status == .stopped
+    ///   with exitCode == 0
+    private func waitForCondition(containerName: String,
+                                  condition: String,
+                                  progressHandler: @escaping (StreamEvent) -> Void) async throws {
+        let deadline = Date().addingTimeInterval(5 * 60)
+        while Date() < deadline {
+            let c = await containerEngine.state.container(id: containerName)
+            switch condition {
+            case "service_started":
+                if c?.status == .running { return }
+            case "service_healthy":
+                if c?.healthStatus == .healthy { return }
+                // If the container has no healthcheck, behave like Docker
+                // and fall back to service_started after a sanity check.
+                if c?.healthcheck == nil && c?.status == .running {
+                    progressHandler(StreamEvent(stream: .status,
+                        data: "  (no healthcheck on \(containerName) ; treating as healthy)\n"))
+                    return
+                }
+                if c?.healthStatus == .unhealthy {
+                    throw CockerError.requestFailed("\(containerName) reported unhealthy")
+                }
+            case "service_completed_successfully":
+                if c?.status == .stopped && (c?.exitCode ?? 0) == 0 { return }
+                if c?.status == .stopped && (c?.exitCode ?? 0) != 0 {
+                    throw CockerError.requestFailed(
+                        "\(containerName) exited with code \(c?.exitCode ?? -1)")
+                }
+            default:
+                // Unknown condition → don't block (matches Docker's
+                // tolerant behaviour for forward-compat).
+                return
+            }
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        throw CockerError.requestFailed(
+            "Timeout waiting for \(containerName) (\(condition)) ; aborted after 5 minutes")
     }
 
     func build(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
@@ -320,9 +469,19 @@ actor ComposeEngine {
         let compose = try loadComposeFile(at: request.composePath)
         let projectName = request.projectName ?? inferProjectName(from: request.composePath)
 
-        // Stop containers in reverse dependency order
-        let services = Array(compose.services.keys)
-        for serviceName in services.reversed() {
+        // Find every container belonging to this project via the label we
+        // stamp at create-time. The previous name-based lookup missed
+        // services declared with an explicit `container_name:` and any
+        // future containers we add (e.g. one-off `compose run`).
+        let all = await containerEngine.list(all: true)
+        let projectContainers = all.filter { $0.labels["com.cocker.project"] == projectName }
+        for container in projectContainers {
+            try? await containerEngine.stop(id: container.id)
+            try? await containerEngine.remove(id: container.id, force: true)
+        }
+        // Fallback : also clean up by the conventional name pattern in case
+        // the labels were stripped (older containers from earlier versions).
+        for serviceName in compose.services.keys {
             let containerName = "\(projectName)_\(serviceName)_1"
             let containers = await containerEngine.list(all: true, filter: ["name": containerName])
             for container in containers {
@@ -337,6 +496,19 @@ actor ComposeEngine {
             for (name, netSpec) in networks where netSpec.external != true {
                 let fullName = "\(projectName)_\(name)"
                 try? await containerEngine.networks.remove(fullName, force: true)
+            }
+        }
+
+        // `--volumes` : drop named volumes the project created. External
+        // volumes (`external: true`) are left alone — the user opted into
+        // managing them outside compose's lifecycle. Bind mounts are never
+        // touched (they live on the host filesystem and aren't ours).
+        if request.removeVolumes, let volumes = compose.volumes {
+            for (name, volSpec) in volumes {
+                let spec = volSpec ?? ComposeFile.ComposeVolumeSpec()
+                if spec.external == true { continue }
+                let fullName = "\(projectName)_\(name)"
+                try? await containerEngine.volumes.remove(fullName)
             }
         }
     }
@@ -404,7 +576,7 @@ actor ComposeEngine {
             config.cpuCount = max(1, Int(cpus))
         }
 
-        config.labels = service.labels ?? [:]
+        config.labels = service.labels?.dict ?? [:]
         config.labels["com.cocker.project"] = projectName
         config.labels["com.cocker.service"] = serviceName
 
@@ -431,7 +603,56 @@ actor ComposeEngine {
         config.workdir = service.working_dir
         config.user = service.user
 
+        // Healthcheck. Compose accepts the test as either a string (run via
+        // shell) or an array. Array form may start with "CMD" / "CMD-SHELL"
+        // / "NONE" or be a raw exec argv. We translate into the same
+        // health* fields the CLI flags use ; ContainerEngine.mergeHealthcheck
+        // handles precedence vs. the image's HEALTHCHECK.
+        if let hc = service.healthcheck {
+            if hc.disable == true {
+                config.healthDisable = true
+            } else if let test = hc.test {
+                let arr = test.array
+                // Case-insensitive NONE : some hand-written compose files
+                // use lowercase even though the spec says uppercase.
+                if (arr.first?.uppercased() ?? "") == "NONE" {
+                    config.healthDisable = true
+                } else if arr.first == "CMD-SHELL", arr.count >= 2 {
+                    config.healthCmd = arr.dropFirst().joined(separator: " ")
+                } else if arr.first == "CMD", arr.count >= 2 {
+                    // Run the exec form via /bin/sh -c so health_poll's argv
+                    // splitter handles it the same way as CLI overrides.
+                    config.healthCmd = arr.dropFirst().joined(separator: " ")
+                } else {
+                    // Plain string OR bare argv (no CMD prefix).
+                    config.healthCmd = arr.joined(separator: " ")
+                }
+            }
+            config.healthInterval = hc.interval.flatMap(Self.parseDuration)
+            config.healthTimeout = hc.timeout.flatMap(Self.parseDuration)
+            config.healthStartPeriod = hc.start_period.flatMap(Self.parseDuration)
+            config.healthRetries = hc.retries
+        }
+
         return config
+    }
+
+    /// Parse Compose duration strings (same grammar as Docker CLI flags).
+    static func parseDuration(_ s: String) -> TimeInterval? {
+        let str = s.trimmingCharacters(in: .whitespaces).lowercased()
+        if str.isEmpty { return nil }
+        if let n = Double(str) { return n }
+        let suffixes: [(String, Double)] = [
+            ("ms", 0.001), ("us", 0.000001), ("ns", 0.000000001),
+            ("s", 1), ("m", 60), ("h", 3600)
+        ]
+        for (suf, mult) in suffixes {
+            if str.hasSuffix(suf) {
+                let numPart = String(str.dropLast(suf.count))
+                if let n = Double(numPart) { return n * mult }
+            }
+        }
+        return nil
     }
 
     private func topologicalSort(services: [String], dependencies: [String: ComposeFile.ComposeService]) -> [String] {

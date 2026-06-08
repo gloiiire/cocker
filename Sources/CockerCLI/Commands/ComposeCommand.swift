@@ -89,10 +89,17 @@ struct ComposeDownCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let composePath = resolvePath(file)
         let client = IPCClient()
-        let payload = ComposeRequest(composePath: composePath, projectName: projectName)
+        let payload = ComposeRequest(
+            composePath: composePath,
+            projectName: projectName,
+            removeVolumes: removeVolumes
+        )
         let request = try IPCRequest(type: .composeDown, payload: payload)
         _ = try await client.send(request)
         print("Compose project stopped and removed.")
+        if removeVolumes {
+            print("Named volumes removed.")
+        }
     }
 }
 
@@ -180,10 +187,23 @@ struct ComposePsCommand: AsyncParsableCommand {
             .init("STATUS", min: 12),
             .init("PORTS", min: 20),
         ]
-        let rows = containers.map { c -> [String] in [
-            c.name, c.image, c.status.rawValue,
-            c.ports.map { $0.description }.joined(separator: ", "),
-        ]}
+        let rows = containers.map { c -> [String] in
+            // Match `docker compose ps` : status suffixed with health
+            // when a non-NONE healthcheck is configured.
+            var statusStr = c.status.rawValue
+            if let hc = c.healthcheck, !hc.isDisabled {
+                switch c.healthStatus {
+                case .healthy:   statusStr += " (healthy)"
+                case .unhealthy: statusStr += " (unhealthy)"
+                case .starting:  statusStr += " (health: starting)"
+                case .none:      break
+                }
+            }
+            return [
+                c.name, c.image, statusStr,
+                c.ports.map { $0.description }.joined(separator: ", "),
+            ]
+        }
         if !rows.isEmpty { print(TableFormatter.format(columns: columns, rows: rows)) }
     }
 }
@@ -674,6 +694,20 @@ struct ComposeEventsCommand: AsyncParsableCommand {
 }
 
 private func resolvePath(_ path: String) -> String {
-    if path.hasPrefix("/") { return path }
-    return FileManager.default.currentDirectoryPath + "/" + path
+    let abs = path.hasPrefix("/") ? path
+        : FileManager.default.currentDirectoryPath + "/" + path
+    // If the user is using the default `cocker-compose.yml` but the file
+    // doesn't exist, fall back to the Docker-native filenames so that
+    // existing projects work out of the box. Order matches Docker Compose's
+    // own precedence (compose.yaml first since v2).
+    if !FileManager.default.fileExists(atPath: abs)
+        && path == "cocker-compose.yml" {
+        let cwd = FileManager.default.currentDirectoryPath
+        for candidate in ["compose.yaml", "compose.yml",
+                          "docker-compose.yaml", "docker-compose.yml"] {
+            let p = cwd + "/" + candidate
+            if FileManager.default.fileExists(atPath: p) { return p }
+        }
+    }
+    return abs
 }

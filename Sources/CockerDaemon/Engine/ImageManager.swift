@@ -82,7 +82,28 @@ actor ImageManager {
             size: totalSize,
             architecture: config.architecture ?? "arm64",
             os: config.os ?? "linux",
-            layers: manifest.layers.map { $0.digest }
+            layers: manifest.layers.map { $0.digest },
+            cmd: config.config?.cmd,
+            entrypoint: config.config?.entrypoint,
+            env: config.config?.env,
+            workdir: config.config?.workingDir,
+            user: config.config?.user,
+            labels: config.config?.labels ?? [:],
+            exposedPorts: Array(config.config?.exposedPorts?.keys ?? [:].keys),
+            healthcheck: {
+                guard let h = config.config?.healthcheck, let test = h.Test else { return nil }
+                // OCI durations are nanoseconds (Go time.Duration). Cap at
+                // sensible defaults to avoid pathological 10000s waits.
+                let ns: (Int64?) -> TimeInterval? = { v in v.map { TimeInterval($0) / 1_000_000_000 } }
+                return Healthcheck(
+                    test: test,
+                    interval: ns(h.Interval) ?? 30,
+                    timeout: ns(h.Timeout) ?? 30,
+                    startPeriod: ns(h.StartPeriod) ?? 0,
+                    retries: h.Retries ?? 3
+                )
+            }(),
+            stopSignal: config.config?.stopSignal
         )
 
         try await store.store(image: imageInfo)
@@ -95,6 +116,95 @@ actor ImageManager {
 
         progressHandler("status|\(ref.shortName)|Pull complete|\(totalSize)|\(totalSize)")
         return imageInfo
+    }
+
+    // MARK: - Push
+
+    /// Push a locally-stored image to its registry. Reconstructs the OCI
+    /// manifest (and config blob if missing) from ImageInfo + on-disk
+    /// layers, then delegates to RegistryClient. Built images already have
+    /// their config blob on disk ; pulled images don't, so we regenerate it.
+    func push(reference: String, progressHandler: @escaping (String) -> Void) async throws {
+        let ref = try ImageReference.parse(reference)
+        // The local index keys images by `repository:tag` (no registry
+        // prefix), so a user-supplied `127.0.0.1:5555/repo:tag` won't match
+        // directly. Fall back through the parsed form before giving up.
+        let candidates = [reference, "\(ref.repository):\(ref.tag)"]
+        var found: ImageInfo? = nil
+        for c in candidates {
+            if let img = try? await find(c) { found = img; break }
+        }
+        guard let img = found else { throw CockerError.imageNotFound(reference) }
+        progressHandler("status|\(ref.shortName)|Preparing manifest|0|0")
+
+        // Rebuild the OCI config from ImageInfo. The digest will differ from
+        // the original config IF the image was pulled (we don't keep the
+        // original bytes), but the manifest we push is internally consistent.
+        let ociConfig = OCIImageConfig(
+            architecture: img.architecture,
+            os: img.os,
+            config: OCIImageConfig.ContainerConfig(
+                user: nil,
+                exposedPorts: img.exposedPorts.isEmpty ? nil : Dictionary(
+                    uniqueKeysWithValues: img.exposedPorts.map { ($0, OCIImageConfig.Empty()) }
+                ),
+                env: img.env,
+                cmd: img.cmd,
+                entrypoint: img.entrypoint,
+                workingDir: img.workdir,
+                labels: img.labels.isEmpty ? nil : img.labels,
+                stopSignal: nil,
+                volumes: nil
+            ),
+            rootfs: OCIImageConfig.RootFS(type: "layers", diffIDs: img.layers),
+            history: nil
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let configData = try encoder.encode(ociConfig)
+        let configDigest = "sha256:" + SHA256.hash(data: configData).hexString
+
+        // Make sure the config blob is on disk so the loader can hand it
+        // back to RegistryClient.push.
+        let blobsDir = await store.rootDir.appendingPathComponent("blobs/sha256")
+        try FileManager.default.createDirectory(at: blobsDir, withIntermediateDirectories: true)
+        let configBlobPath = blobsDir.appendingPathComponent(String(configDigest.dropFirst(7)))
+        if !FileManager.default.fileExists(atPath: configBlobPath.path) {
+            try configData.write(to: configBlobPath)
+        }
+
+        // Manifest descriptors : config + each layer.
+        let layerDescriptors: [OCIDescriptor] = try img.layers.map { digest in
+            let path = blobsDir.appendingPathComponent(String(digest.dropFirst(7)))
+            guard FileManager.default.fileExists(atPath: path.path) else {
+                throw CockerError.layerDownloadFailed(digest, "Local blob missing — cannot push")
+            }
+            let attrs = try FileManager.default.attributesOfItem(atPath: path.path)
+            let size = (attrs[.size] as? Int) ?? 0
+            return OCIDescriptor(mediaType: MediaType.ociLayerGzip, digest: digest, size: size, urls: nil)
+        }
+        let configDescriptor = OCIDescriptor(mediaType: MediaType.ociConfig,
+                                             digest: configDigest, size: configData.count, urls: nil)
+        let manifest = OCIManifest(
+            schemaVersion: 2,
+            mediaType: MediaType.ociManifest,
+            config: configDescriptor,
+            layers: layerDescriptors
+        )
+        let manifestData = try encoder.encode(manifest)
+
+        // Push everything : blobs first, then manifest.
+        try await registry.push(
+            ref: ref,
+            manifestData: manifestData,
+            manifestMediaType: MediaType.ociManifest,
+            blobs: [configDescriptor] + layerDescriptors,
+            blobLoader: { digest in
+                let path = blobsDir.appendingPathComponent(String(digest.dropFirst(7)))
+                return try Data(contentsOf: path)
+            },
+            progress: progressHandler
+        )
     }
 
     // MARK: - Remove
@@ -182,21 +292,45 @@ actor ImageManager {
             try tarData.write(to: blobPath)
         }
 
-        // Build OCI config
+        // Build OCI config. Preserve the base image's CMD/ENTRYPOINT/ENV/
+        // WORKDIR/USER/HEALTHCHECK/EXPOSED_PORTS so a `cocker commit` of a
+        // stopped container produces an image that runs the same way as
+        // the base. Without this, `cocker run <committed>` would silently
+        // lose the healthcheck inherited from the original FROM.
         let now = ISO8601DateFormatter().string(from: Date())
+        let inheritedHealthcheck = baseImage?.healthcheck.map { hc in
+            OCIImageConfig.ContainerConfig.HealthcheckSpec(
+                Test: hc.test,
+                Interval: Int64(hc.interval * 1_000_000_000),
+                Timeout: Int64(hc.timeout * 1_000_000_000),
+                StartPeriod: Int64(hc.startPeriod * 1_000_000_000),
+                Retries: hc.retries
+            )
+        }
+        let exposedPortsDict: [String: OCIImageConfig.Empty]? = {
+            guard let ports = baseImage?.exposedPorts, !ports.isEmpty else { return nil }
+            var dict: [String: OCIImageConfig.Empty] = [:]
+            for p in ports { dict[p] = OCIImageConfig.Empty() }
+            return dict
+        }()
         let ociConfig = OCIImageConfig(
             architecture: "arm64",
             os: "linux",
             config: OCIImageConfig.ContainerConfig(
-                user: nil,
-                exposedPorts: nil,
-                env: nil,
-                cmd: nil,
-                entrypoint: nil,
-                workingDir: nil,
-                labels: author.map { ["author": $0] },
+                user: baseImage?.user,
+                exposedPorts: exposedPortsDict,
+                env: baseImage?.env,
+                cmd: baseImage?.cmd,
+                entrypoint: baseImage?.entrypoint,
+                workingDir: baseImage?.workdir,
+                labels: {
+                    var l = baseImage?.labels ?? [:]
+                    if let a = author { l["author"] = a }
+                    return l.isEmpty ? nil : l
+                }(),
                 stopSignal: nil,
-                volumes: nil
+                volumes: nil,
+                healthcheck: inheritedHealthcheck
             ),
             rootfs: OCIImageConfig.RootFS(
                 type: "layers",
@@ -327,6 +461,16 @@ actor DockerfileBuilder {
     // Build state
     private var currentRootfsPath: URL?
     private var layers: [CreatedLayer] = []
+    // Multi-stage: each FROM ... AS <name> snapshots its current rootfs URL
+    // here so later stages can `COPY --from=<name> src dst`.
+    private var stageRootfs: [String: URL] = [:]
+    private var currentStageName: String?
+
+    /// Rolling cache key for the build state at the current step. Updated
+    /// after every RUN / COPY by hashing (previousKey || instruction).
+    /// Layer cache hits skip the expensive RUN; misses execute and store
+    /// the new state under this key.
+    private var stepCacheKey: String = "init"
 
     struct CreatedLayer {
         let digest: String
@@ -357,7 +501,24 @@ actor DockerfileBuilder {
         var baseImage: String = ""
         var workdir: String = "/"
         var user: String = ""
-        var env: [String: String] = config.buildArgs
+        var healthcheck: Healthcheck? = nil
+        // Match Docker's default container PATH so `RUN addgroup`, `apk`,
+        // etc. resolve under /usr/sbin without each Dockerfile having to
+        // re-declare it.
+        let defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        // ENV instructions only — these end up in the final image's runtime
+        // env. Reset per stage.
+        var env: [String: String] = ["PATH": defaultPath]
+        // Build-only variables (ARG + --build-arg). Persist across stages
+        // (matches Docker), used for variable substitution, NOT persisted
+        // into the final image.
+        var args: [String: String] = config.buildArgs
+        // resolveArg consults both ; ENV wins over ARG when they collide.
+        func substEnv() -> [String: String] {
+            var merged = args
+            for (k, v) in env { merged[k] = v }
+            return merged
+        }
         var labels: [String: String] = [:]
         var cmd: [String] = []
         var entrypoint: [String] = []
@@ -379,37 +540,92 @@ actor DockerfileBuilder {
 
             switch instruction.keyword.uppercased() {
             case "FROM":
-                baseImage = resolveArg(instruction.args.split(separator: " ").first.map(String.init) ?? instruction.args, env: env)
+                // Persist the OUTGOING stage rootfs (if any) under its alias
+                // so later `COPY --from=<alias>` can reach it.
+                if let outgoingRootfs = currentRootfsPath,
+                   let outgoingName = currentStageName {
+                    stageRootfs[outgoingName] = outgoingRootfs
+                }
+
+                // Parse `image[:tag] [AS alias]`.
+                let argsParts = instruction.args.split(separator: " ").map(String.init)
+                baseImage = resolveArg(argsParts.first ?? instruction.args, env: substEnv())
+                var newStageName: String? = nil
+                if let asIdx = argsParts.firstIndex(where: { $0.uppercased() == "AS" }),
+                   asIdx + 1 < argsParts.count {
+                    newStageName = argsParts[asIdx + 1]
+                }
                 log(.stdout, " ---> Pulling base image: \(baseImage)\n")
                 if !(await imageManager.exists(baseImage)) {
                     _ = try await imageManager.pull(reference: baseImage, progressHandler: { msg in
                         self.log(.stdout, msg + "\n")
                     })
                 }
-                // Copy base rootfs into our working directory
+                // Each stage gets its own rootfs directory so the previous
+                // stage's tree survives for later `--from=` lookups.
+                let stageDirName = "rootfs-\(stageRootfs.count + 1)"
+                let layerDir = buildDir.appendingPathComponent(stageDirName)
+                if FileManager.default.fileExists(atPath: layerDir.path) {
+                    try FileManager.default.removeItem(at: layerDir)
+                }
                 if let baseRootfs = try? await imageManager.rootfsPath(for: baseImage) {
-                    let layerDir = buildDir.appendingPathComponent("rootfs")
-                    if FileManager.default.fileExists(atPath: layerDir.path) {
-                        try FileManager.default.removeItem(at: layerDir)
-                    }
                     try FileManager.default.copyItem(at: baseRootfs, to: layerDir)
-                    currentRootfsPath = layerDir
                 } else {
                     // FROM scratch — empty rootfs
-                    let layerDir = buildDir.appendingPathComponent("rootfs")
                     try FileManager.default.createDirectory(at: layerDir, withIntermediateDirectories: true)
-                    currentRootfsPath = layerDir
                 }
-                // Inherit base image layers
+                currentRootfsPath = layerDir
+                currentStageName = newStageName
+                // Reset per-stage layer accumulation : the final image is the
+                // LAST stage, intermediate stages must not contribute layers.
+                layers = []
+                healthcheck = nil
+                // Per-stage metadata reset (labels/env/cmd/entrypoint/workdir/user/exposed/volumes/stopSignal).
+                // Without this, a builder-stage's LABEL/ENV/CMD/EXPOSE leak
+                // into the final runtime image and corrupt its metadata.
+                // `args` is intentionally NOT reset : build args (declared
+                // before the first FROM or on the CLI) persist across stages
+                // — that's Docker's documented behavior so a global
+                // `ARG BUILD_VERSION` can be reused in any stage.
+                labels = [:]
+                cmd = []
+                entrypoint = []
+                exposedPorts = []
+                volumes = []
+                stopSignal = nil
+                user = ""
+                workdir = "/"
+                env = ["PATH": defaultPath]
+                // Inherit base image layers + runtime config. Without
+                // this a Dockerfile that only declares HEALTHCHECK / LABEL
+                // would lose the parent image's CMD/ENTRYPOINT/ENV and
+                // boot into "empty command in /cocker-spec".
                 if let baseInfo = try? await imageManager.find(baseImage) {
                     layers = baseInfo.layers.map { CreatedLayer(digest: $0, size: 0) }
-                    // Inherit config from base image
-                    // (we will override as we process more instructions)
+                    if let baseCmd = baseInfo.cmd { cmd = baseCmd }
+                    if let baseEntry = baseInfo.entrypoint { entrypoint = baseEntry }
+                    if let baseEnv = baseInfo.env {
+                        for entry in baseEnv {
+                            let parts = entry.split(separator: "=", maxSplits: 1).map(String.init)
+                            if parts.count == 2 { env[parts[0]] = parts[1] }
+                        }
+                    }
+                    if let baseWd = baseInfo.workdir { workdir = baseWd }
+                    if let baseUser = baseInfo.user { user = baseUser }
+                    labels = baseInfo.labels
+                    healthcheck = baseInfo.healthcheck
+                    // exposedPorts arrive as ["80/tcp"] — convert back.
+                    exposedPorts = baseInfo.exposedPorts.compactMap { spec in
+                        let parts = spec.split(separator: "/", maxSplits: 1)
+                        guard let port = UInt16(parts[0]) else { return nil }
+                        let proto: TransportProto = (parts.count == 2 && parts[1].lowercased() == "udp") ? .udp : .tcp
+                        return PortMapping(hostPort: port, containerPort: port, proto: proto)
+                    }
                 }
                 log(.stdout, " ---> \(shortID())\n")
 
             case "RUN":
-                let command = resolveArg(instruction.args, env: env)
+                let command = resolveArg(instruction.args, env: substEnv())
                 log(.stdout, " ---> Running: \(command)\n")
                 guard let rootfs = currentRootfsPath else {
                     log(.stderr, "Error: RUN before FROM — skipping\n")
@@ -417,16 +633,39 @@ actor DockerfileBuilder {
                     continue
                 }
 
+                // Build-cache check : if a previous build with the same
+                // parent state + same RUN argument string produced a
+                // layer, reuse it and skip the VM round-trip. The cache
+                // key is rolled forward by hashing (previousKey || step)
+                // so a divergence at any step invalidates everything
+                // downstream — matches docker's behaviour.
+                let stepHash = self.advanceCacheKey("RUN " + command)
+                if config.noCache == false,
+                   let cached = try await BuildCache.lookup(key: stepHash) {
+                    log(.stdout, " ---> Using cache (layer \(String(cached.digest.prefix(19))))\n")
+                    try await BuildCache.apply(layer: cached, to: rootfs)
+                    layers.append(CreatedLayer(digest: cached.digest, size: cached.size))
+                    log(.stdout, " ---> \(shortID())\n")
+                    continue
+                }
+
                 if let vm = vmRuntime {
                     // Mode "vraie VM" : on lance une VM éphémère, on capture les
                     // changements filesystem, on crée un layer OCI.
+                    // The platform field (e.g. "linux/amd64") tells the VM
+                    // to mount the qemu-user-static share + register
+                    // binfmt_misc so x86_64 RUN steps work on Apple Silicon.
                     let before = try snapshotFiles(at: rootfs)
+                    let buildArch = config.platform.flatMap { plat in
+                        plat.split(separator: "/").last.map(String.init)
+                    }
                     let exitCode = try await vm.runEphemeral(
                         rootfsPath: rootfs,
                         command: ["/bin/sh", "-c", command],
-                        env: env,
+                        env: substEnv(),
                         workdir: workdir,
-                        timeout: 600
+                        timeout: 600,
+                        targetArch: buildArch
                     )
                     if exitCode != 0 {
                         throw CockerError.buildFailed("RUN '\(command)' exited with code \(exitCode)")
@@ -443,6 +682,12 @@ actor DockerfileBuilder {
                             blobsDir: blobsDir
                         )
                         layers.append(layer)
+                        // Persist the produced layer under the rolling
+                        // cache key so the next build of the same
+                        // sequence skips the VM exec entirely.
+                        try? await BuildCache.store(key: stepHash,
+                                                     layer: layer,
+                                                     blobsDir: blobsDir)
                         log(.stdout, " ---> Created layer \(String(layer.digest.prefix(19))) (\(changed.count) changed, \(deleted.count) deleted)\n")
                     }
                 } else {
@@ -459,12 +704,33 @@ actor DockerfileBuilder {
                 let before = try snapshotFiles(at: rootfs)
                 let rawArgs = instruction.args
 
-                // Strip --from=xxx flag if present
+                // Parse leading flags (--from=, --chown=, --chmod=). Keep
+                // --from because we need to resolve sources from a previous
+                // stage instead of the build context.
                 var effectiveArgs = rawArgs
-                if rawArgs.hasPrefix("--") {
-                    let spaceIdx = rawArgs.firstIndex(of: " ") ?? rawArgs.endIndex
-                    effectiveArgs = String(rawArgs[rawArgs.index(after: spaceIdx)...])
+                var fromStage: String? = nil
+                while effectiveArgs.hasPrefix("--") {
+                    let spaceIdx = effectiveArgs.firstIndex(of: " ") ?? effectiveArgs.endIndex
+                    let flag = String(effectiveArgs[..<spaceIdx])
+                    if flag.hasPrefix("--from=") {
+                        fromStage = String(flag.dropFirst("--from=".count))
+                    }
+                    // Discard the flag (chown / chmod are silently ignored for now).
+                    if spaceIdx == effectiveArgs.endIndex { effectiveArgs = ""; break }
+                    effectiveArgs = String(effectiveArgs[effectiveArgs.index(after: spaceIdx)...])
+                        .trimmingCharacters(in: .whitespaces)
                 }
+                // Where to read sources from : a prior stage's rootfs, or the
+                // build context directory on the host.
+                let sourceRoot: URL = {
+                    if let stage = fromStage, let stageDir = stageRootfs[stage] {
+                        return stageDir
+                    }
+                    if let stage = fromStage {
+                        log(.stderr, "Warning: --from=\(stage) refers to unknown stage; falling back to build context\n")
+                    }
+                    return URL(fileURLWithPath: config.contextPath)
+                }()
 
                 let parts = splitArgs(effectiveArgs)
                 guard parts.count >= 2 else {
@@ -474,15 +740,30 @@ actor DockerfileBuilder {
                 let srcs = Array(parts.dropLast())
 
                 for src in srcs {
-                    let srcURL = URL(fileURLWithPath: config.contextPath).appendingPathComponent(src)
-                    // Resolve dst — if dst ends with / it's a dir target
-                    let dstPath: String
-                    if dst.hasSuffix("/") {
-                        dstPath = dst + srcURL.lastPathComponent
-                    } else {
-                        dstPath = dst
-                    }
+                    // Strip leading "/" so the path is appended UNDER the
+                    // source root rather than rebased to host /.
+                    let srcRel = src.hasPrefix("/") ? String(src.dropFirst()) : src
+                    let srcURL = sourceRoot.appendingPathComponent(srcRel)
                     let absWorkdir = rootfs.appendingPathComponent(workdir.hasPrefix("/") ? String(workdir.dropFirst()) : workdir)
+
+                    // Resolve dst to an absolute URL inside the rootfs.
+                    // Dockerfile dst rules:
+                    //   1. trailing `/` → directory target, append src basename
+                    //   2. `.` / `..` / empty → directory target relative to WORKDIR
+                    //   3. otherwise → file path (replace if exists)
+                    let dstIsDir = dst.hasSuffix("/")
+                        || dst == "." || dst == ".."
+                        || (!dst.hasPrefix("/") && {
+                            // Existing in-rootfs dir → treat as directory.
+                            let probe = absWorkdir.appendingPathComponent(dst)
+                            var isDir: ObjCBool = false
+                            return FileManager.default.fileExists(atPath: probe.path, isDirectory: &isDir) && isDir.boolValue
+                        }())
+                    let dstPath: String = dstIsDir
+                        ? (dst.hasSuffix("/") ? dst + srcURL.lastPathComponent
+                                              : "\(dst)/\(srcURL.lastPathComponent)")
+                        : dst
+
                     let dstURL: URL
                     if dstPath.hasPrefix("/") {
                         dstURL = rootfs.appendingPathComponent(String(dstPath.dropFirst()))
@@ -492,10 +773,25 @@ actor DockerfileBuilder {
 
                     try FileManager.default.createDirectory(at: dstURL.deletingLastPathComponent(), withIntermediateDirectories: true)
                     if FileManager.default.fileExists(atPath: srcURL.path) {
-                        if FileManager.default.fileExists(atPath: dstURL.path) {
+                        // Only remove the destination if it is an existing
+                        // regular file we're about to overwrite — never a
+                        // directory (would nuke unrelated files).
+                        var dstIsExistingDir: ObjCBool = false
+                        let exists = FileManager.default.fileExists(atPath: dstURL.path,
+                                                                    isDirectory: &dstIsExistingDir)
+                        if exists && !dstIsExistingDir.boolValue {
                             try FileManager.default.removeItem(at: dstURL)
                         }
-                        try FileManager.default.copyItem(at: srcURL, to: dstURL)
+                        if exists && dstIsExistingDir.boolValue {
+                            // Merge into existing dir : copy contents in.
+                            let merged = dstURL.appendingPathComponent(srcURL.lastPathComponent)
+                            if FileManager.default.fileExists(atPath: merged.path) {
+                                try FileManager.default.removeItem(at: merged)
+                            }
+                            try FileManager.default.copyItem(at: srcURL, to: merged)
+                        } else {
+                            try FileManager.default.copyItem(at: srcURL, to: dstURL)
+                        }
                         log(.stdout, " ---> COPY \(src) -> \(dstPath)\n")
                     } else {
                         log(.stderr, "Warning: source \(src) not found in build context\n")
@@ -513,7 +809,7 @@ actor DockerfileBuilder {
                 log(.stdout, " ---> \(shortID())\n")
 
             case "WORKDIR":
-                workdir = resolveArg(instruction.args, env: env)
+                workdir = resolveArg(instruction.args, env: substEnv())
                 // Create the directory in rootfs
                 if let rootfs = currentRootfsPath {
                     let dirPath = rootfs.appendingPathComponent(workdir.hasPrefix("/") ? String(workdir.dropFirst()) : workdir)
@@ -523,32 +819,34 @@ actor DockerfileBuilder {
                 log(.stdout, " ---> \(shortID())\n")
 
             case "USER":
-                user = resolveArg(instruction.args, env: env)
+                user = resolveArg(instruction.args, env: substEnv())
                 log(.stdout, " ---> \(shortID())\n")
 
             case "ENV":
-                // Support KEY=VALUE and KEY VALUE formats
                 let raw = instruction.args
                 if let eqIdx = raw.firstIndex(of: "=") {
                     let key = String(raw[..<eqIdx]).trimmingCharacters(in: .whitespaces)
-                    let val = resolveArg(String(raw[raw.index(after: eqIdx)...]).trimmingCharacters(in: .whitespaces), env: env)
+                    let val = resolveArg(String(raw[raw.index(after: eqIdx)...]).trimmingCharacters(in: .whitespaces), env: substEnv())
                     env[key] = val
                 } else {
                     let kv = raw.split(separator: " ", maxSplits: 1)
-                    if kv.count == 2 { env[String(kv[0])] = resolveArg(String(kv[1]), env: env) }
+                    if kv.count == 2 { env[String(kv[0])] = resolveArg(String(kv[1]), env: substEnv()) }
                 }
                 log(.stdout, " ---> \(shortID())\n")
 
             case "ARG":
                 let parts = instruction.args.split(separator: "=", maxSplits: 1)
-                if parts.count == 2 {
+                if parts.count >= 1 {
                     let key = String(parts[0])
-                    if env[key] == nil { env[key] = String(parts[1]) }
+                    // CLI --build-arg wins over the Dockerfile default.
+                    if args[key] == nil {
+                        args[key] = parts.count == 2 ? String(parts[1]) : ""
+                    }
                 }
 
             case "LABEL":
-                let raw = instruction.args
-                // Support multiple KEY=VALUE pairs
+                // Variables (${X} / $X) must be expanded — Dockerfile spec.
+                let raw = resolveArg(instruction.args, env: substEnv())
                 let pairs = raw.components(separatedBy: " ").filter { !$0.isEmpty }
                 for pair in pairs {
                     let kv = pair.split(separator: "=", maxSplits: 1)
@@ -557,8 +855,12 @@ actor DockerfileBuilder {
                 log(.stdout, " ---> \(shortID())\n")
 
             case "EXPOSE":
-                if let port = UInt16(instruction.args.split(separator: "/").first ?? "") {
-                    exposedPorts.append(PortMapping(hostPort: port, containerPort: port))
+                // EXPOSE accepts space-separated ports, each optionally with /tcp or /udp.
+                for token in instruction.args.split(separator: " ").map(String.init) {
+                    let segs = token.split(separator: "/", maxSplits: 1).map(String.init)
+                    guard let port = UInt16(segs[0]) else { continue }
+                    let proto: TransportProto = (segs.count == 2 && segs[1].lowercased() == "udp") ? .udp : .tcp
+                    exposedPorts.append(PortMapping(hostPort: port, containerPort: port, proto: proto))
                 }
 
             case "CMD":
@@ -575,7 +877,77 @@ actor DockerfileBuilder {
             case "STOPSIGNAL":
                 stopSignal = instruction.args.trimmingCharacters(in: .whitespaces)
 
-            case "HEALTHCHECK", "ONBUILD", "SHELL":
+            case "HEALTHCHECK":
+                // Dockerfile syntax:
+                //   HEALTHCHECK NONE
+                //   HEALTHCHECK [--interval=30s --timeout=30s --start-period=0s --retries=3] CMD <cmd...>
+                //   HEALTHCHECK [...] CMD-SHELL <shell snippet>
+                // We support the common shapes and the time-suffix duration
+                // format ("30s", "1m", "500ms").
+                let raw = resolveArg(instruction.args, env: substEnv())
+                if raw.trimmingCharacters(in: .whitespaces).uppercased() == "NONE" {
+                    healthcheck = Healthcheck(test: ["NONE"])
+                } else {
+                    var interval: TimeInterval = 30
+                    var timeout: TimeInterval = 30
+                    var startPeriod: TimeInterval = 0
+                    var retries = 3
+                    var rest = raw
+                    // Strip leading --flag=value pairs.
+                    while rest.hasPrefix("--") {
+                        let spaceIdx = rest.firstIndex(of: " ") ?? rest.endIndex
+                        let flag = String(rest[..<spaceIdx])
+                        if flag.hasPrefix("--interval=") {
+                            interval = parseDuration(String(flag.dropFirst("--interval=".count))) ?? interval
+                        } else if flag.hasPrefix("--timeout=") {
+                            timeout = parseDuration(String(flag.dropFirst("--timeout=".count))) ?? timeout
+                        } else if flag.hasPrefix("--start-period=") {
+                            startPeriod = parseDuration(String(flag.dropFirst("--start-period=".count))) ?? startPeriod
+                        } else if flag.hasPrefix("--retries=") {
+                            retries = Int(flag.dropFirst("--retries=".count)) ?? retries
+                        }
+                        if spaceIdx == rest.endIndex { rest = ""; break }
+                        rest = String(rest[rest.index(after: spaceIdx)...])
+                            .trimmingCharacters(in: .whitespaces)
+                    }
+                    // What's left is `CMD ...` or `CMD-SHELL ...`.
+                    var test: [String] = []
+                    if rest.uppercased().hasPrefix("CMD-SHELL") {
+                        var body = String(rest.dropFirst("CMD-SHELL".count)).trimmingCharacters(in: .whitespaces)
+                        // Strip surrounding quotes that Dockerfile authors
+                        // routinely add — `CMD-SHELL "..."`. Without this
+                        // /bin/sh -c receives the literal quoted blob and
+                        // tries to run it as a single filename (exit 127).
+                        if (body.hasPrefix("\"") && body.hasSuffix("\""))
+                            || (body.hasPrefix("'") && body.hasSuffix("'")) {
+                            body = String(body.dropFirst().dropLast())
+                        }
+                        test = ["CMD-SHELL", body]
+                    } else if rest.uppercased().hasPrefix("CMD") {
+                        let body = String(rest.dropFirst("CMD".count)).trimmingCharacters(in: .whitespaces)
+                        // Docker semantics : `HEALTHCHECK CMD <body>` is
+                        // shell form unless `<body>` is a JSON array. We
+                        // were splitting non-JSON bodies on whitespace and
+                        // passing them straight to execvp, which broke
+                        // `HEALTHCHECK CMD foo && bar` (treated as
+                        // `["foo", "&&", "bar"]` instead of running through
+                        // /bin/sh -c).
+                        if let arr = parseJsonArray(body) {
+                            test = ["CMD"] + arr
+                        } else if !body.isEmpty {
+                            test = ["CMD-SHELL", body]
+                        }
+                    }
+                    if !test.isEmpty {
+                        healthcheck = Healthcheck(test: test, interval: interval,
+                                                  timeout: timeout, startPeriod: startPeriod,
+                                                  retries: retries)
+                    }
+                }
+                log(.stdout, " ---> HEALTHCHECK \(healthcheck?.test.joined(separator: " ") ?? "(skipped)")\n")
+                log(.stdout, " ---> \(shortID())\n")
+
+            case "ONBUILD", "SHELL":
                 break  // acknowledged but not implemented
 
             default:
@@ -651,8 +1023,11 @@ actor DockerfileBuilder {
             entrypoint: entrypoint.isEmpty ? nil : entrypoint,
             env: envArray,
             workdir: workdir == "/" ? nil : workdir,
+            user: user.isEmpty ? nil : user,
             labels: labels,
-            exposedPorts: exposedPorts.map { "\($0.containerPort)/\($0.proto.rawValue)" }
+            exposedPorts: exposedPorts.map { "\($0.containerPort)/\($0.proto.rawValue)" },
+            healthcheck: healthcheck,
+            stopSignal: stopSignal
         )
 
         try await imageManager.storeBuiltImage(imageInfo)
@@ -877,6 +1252,122 @@ actor DockerfileBuilder {
         let trimmed = s.trimmingCharacters(in: .whitespaces)
         guard trimmed.hasPrefix("[") else { return nil }
         return try? JSONDecoder().decode([String].self, from: Data(trimmed.utf8))
+    }
+
+    /// Parse Dockerfile duration strings like "30s", "1m", "500ms", "2h"
+    /// into seconds. Returns nil on garbage input. Matches Docker's
+    /// time.ParseDuration semantics for the cases the HEALTHCHECK flag
+    /// language actually exposes.
+    private func parseDuration(_ s: String) -> TimeInterval? {
+        let trimmed = s.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        let suffixes: [(String, Double)] = [
+            ("ms", 0.001),
+            ("us", 0.000_001),
+            ("ns", 0.000_000_001),
+            ("s", 1),
+            ("m", 60),
+            ("h", 3600),
+        ]
+        for (suffix, factor) in suffixes {
+            if trimmed.hasSuffix(suffix) {
+                let numStr = String(trimmed.dropLast(suffix.count))
+                if let n = Double(numStr) { return n * factor }
+            }
+        }
+        // No suffix → assume seconds.
+        return Double(trimmed)
+    }
+
+    /// Roll the cache key forward by appending the current instruction's
+    /// textual form. Same input sequence → same SHA. Returns the new key
+    /// so the caller can use it as a one-shot.
+    func advanceCacheKey(_ step: String) -> String {
+        var hasher = SHA256()
+        hasher.update(data: Data(stepCacheKey.utf8))
+        hasher.update(data: Data(step.utf8))
+        let next = hasher.finalize().hexString
+        stepCacheKey = next
+        return next
+    }
+}
+
+/// On-disk build layer cache. Keyed by the rolling SHA from the
+/// DockerfileBuilder ; value is a layer descriptor pointing into the
+/// regular blob store. Layers are NOT duplicated — the cache only
+/// records "this build step produced layer X with size Y".
+///
+/// Layout :
+///   `~/.cocker/build-cache/<key>.json`  → CachedLayerEntry
+///
+/// On hit, BuildCache.apply extracts the cached layer's tar diff onto
+/// the current rootfs (so subsequent steps see the same state the
+/// previous build produced).
+enum BuildCache {
+    struct CachedLayerEntry: Codable {
+        let digest: String
+        let size: Int
+    }
+
+    /// Cache root, lazily created on first store(). Resolved relative
+    /// to `$HOME/.cocker` ; tests can override via `COCKER_ROOT`.
+    private static var cacheDir: URL {
+        let root = ProcessInfo.processInfo.environment["COCKER_ROOT"]
+                ?? "\(NSHomeDirectory())/.cocker"
+        return URL(fileURLWithPath: root).appendingPathComponent("build-cache")
+    }
+
+    static func lookup(key: String) async throws -> CachedLayerEntry? {
+        let url = cacheDir.appendingPathComponent("\(key).json")
+        guard let data = try? Data(contentsOf: url),
+              let entry = try? JSONDecoder().decode(CachedLayerEntry.self, from: data)
+        else { return nil }
+        // Sanity check : the blob still exists in the store. The blob
+        // GC sweep might have collected it between builds.
+        let blobsDir = URL(fileURLWithPath: (ProcessInfo.processInfo.environment["COCKER_ROOT"]
+                ?? "\(NSHomeDirectory())/.cocker"))
+            .appendingPathComponent("images/blobs/sha256")
+        let blobName = String(entry.digest.dropFirst("sha256:".count))
+        let blobPath = blobsDir.appendingPathComponent(blobName)
+        guard FileManager.default.fileExists(atPath: blobPath.path) else {
+            // Stale cache pointer ; wipe it so future lookups don't waste IO.
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        return entry
+    }
+
+    static func store(key: String,
+                       layer: DockerfileBuilder.CreatedLayer,
+                       blobsDir: URL) async throws {
+        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        let entry = CachedLayerEntry(digest: layer.digest, size: layer.size)
+        let data = try JSONEncoder().encode(entry)
+        try data.write(to: cacheDir.appendingPathComponent("\(key).json"), options: .atomic)
+    }
+
+    /// Materialise a cached layer onto an existing rootfs. The layer blob
+    /// is a gzipped tar diff produced by `createLayer` ; we extract it
+    /// in-place so the next Dockerfile step sees the same filesystem the
+    /// cached build produced at this point.
+    static func apply(layer: CachedLayerEntry, to rootfs: URL) async throws {
+        let blobsDir = URL(fileURLWithPath: (ProcessInfo.processInfo.environment["COCKER_ROOT"]
+                ?? "\(NSHomeDirectory())/.cocker"))
+            .appendingPathComponent("images/blobs/sha256")
+        let blobName = String(layer.digest.dropFirst("sha256:".count))
+        let blobPath = blobsDir.appendingPathComponent(blobName)
+        guard FileManager.default.fileExists(atPath: blobPath.path) else {
+            throw CockerError.buildFailed("cached layer blob missing: \(layer.digest)")
+        }
+        // tar zxf <blob> -C <rootfs>
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        proc.arguments = ["-xzf", blobPath.path, "-C", rootfs.path]
+        try proc.run()
+        proc.waitUntilExit()
+        if proc.terminationStatus != 0 {
+            throw CockerError.buildFailed("cached layer extract failed (exit \(proc.terminationStatus))")
+        }
     }
 }
 
