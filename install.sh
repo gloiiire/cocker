@@ -68,7 +68,7 @@ info "Building cocker-init (Linux ARM64 static)..."
 (cd cocker-init &&
  zig cc -target aarch64-linux-musl -static -O2 -Wall -Wl,-s -o cocker-init \
      init.c cmdline.c net.c dns_proxy.c spec.c qemu.c \
-     exec_listener.c caps.c health_poll.c &&
+     exec_listener.c caps.c health_poll.c etc_overlay.c &&
  cp cocker-init initrd-staging/init &&
  chmod +x initrd-staging/init &&
  (cd initrd-staging && find . | cpio -o -H newc 2>/dev/null) | gzip -9 > initrd.img)

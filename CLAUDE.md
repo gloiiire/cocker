@@ -29,7 +29,7 @@ swift test --filter ImageReferenceTests/parseDigest
 # zig linker. Stripped binary is ~70 KB ; unstripped is ~1.6 MB).
 cd cocker-init && zig cc -target aarch64-linux-musl -static -O2 -Wall -Wl,-s \
     -o cocker-init init.c cmdline.c net.c dns_proxy.c spec.c qemu.c \
-    exec_listener.c caps.c health_poll.c
+    exec_listener.c caps.c health_poll.c etc_overlay.c
 
 # Repack the initrd that cockerd boots VMs with (after editing init.c)
 cd cocker-init && cp cocker-init initrd-staging/init && \
