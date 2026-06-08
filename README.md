@@ -96,6 +96,29 @@ cd cocker
 
 `install.sh` does the whole dance: checks prereqs, builds `cocker` + `cockerd` + `cocker-init` (the Linux PID 1 used inside each VM), signs `cockerd` with your Apple Development cert, populates `~/.cocker/kernel/`, and registers a LaunchAgent that keeps the daemon running.
 
+#### Side-by-side dev install
+
+When you're hacking on cocker itself, you usually want a parallel install you can break without losing your prod daemon. Pass `SUFFIX=-dev` :
+
+```bash
+SUFFIX=-dev ./install.sh
+```
+
+This installs a complete second cocker stack with `-dev` appended to everything :
+
+| | prod (default) | dev (`SUFFIX=-dev`) |
+|---|---|---|
+| CLI binary | `cocker` | `cocker-dev` |
+| daemon binary | `cockerd` | `cockerd-dev` |
+| MCP server | `cocker-mcp` | `cocker-mcp-dev` |
+| data dir | `~/.cocker/` | `~/.cocker-dev/` |
+| IPC socket | `~/.cocker/cocker.sock` | `~/.cocker-dev/cocker.sock` |
+| launchd label | `com.cocker.cockerd` | `com.cocker.cockerd-dev` |
+
+Both daemons can run at the same time (different sockets, different state). Run `cocker ps` and `cocker-dev ps` from the same shell — you'll see two independent worlds.
+
+The lease-pool helper LaunchDaemon (system-wide, root-owned) is shared between the two installs ; only the first run prompts for sudo.
+
 ## Verify
 
 ```bash
