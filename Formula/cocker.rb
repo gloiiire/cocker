@@ -1,7 +1,7 @@
 class Cocker < Formula
   desc "Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework"
   homepage "https://github.com/gloiiire/cocker"
-  version "0.5.1"
+  version "0.5.2"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
   # Placeholder — replace with `shasum -a 256` of the actual release tarball.
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
@@ -47,19 +47,34 @@ class Cocker < Formula
     bin.install ".build/release/cockerd"
     bin.install ".build/release/cocker-portfwd"
 
-    # 4. Generate + install man pages (best-effort).
-    # The plugin tries to install its own sandbox via sandbox-exec, which
-    # gets denied by Homebrew's outer sandbox (`sandbox_apply: Operation
-    # not permitted`). Homebrew's `system` raises BuildError on non-zero
-    # exit, so an `if system …` doesn't help ; we rescue explicitly.
-    begin
-      system "swift", "package", "--allow-writing-to-package-directory",
-             "generate-manual", "--multi-page"
-      man1.install Dir[".build/plugins/GenerateManual/outputs/CockerCLI/*.1"]
-    rescue => e
-      opoo "man page generation failed (#{e.class}: #{e.message.split("\n").first}) — " \
-           "proceeding without ; run `swift package generate-manual --multi-page` " \
-           "from a source checkout to produce them manually."
+    # 4. Install man pages.
+    #
+    # Two sources are tried, in order :
+    #   a) `docs/man/*.1` shipped in the tarball — these are regenerated
+    #      at every release on a developer machine (where the sandbox
+    #      allows `swift package generate-manual`) and committed to git
+    #      so end-users never pay the generation cost.
+    #   b) Fallback : invoke `swift package generate-manual --multi-page`
+    #      from inside the Homebrew build. This used to be the only
+    #      path but the swift-argument-parser plugin tries to install
+    #      its OWN sandbox via sandbox-exec, which the outer Homebrew
+    #      sandbox denies with `sandbox_apply: Operation not permitted`.
+    #      We keep the fallback for source-only checkouts (where the
+    #      docs/ tree might be missing) ; for ordinary releases (a)
+    #      already covers everything.
+    prebuilt_man = Dir["docs/man/*.1"]
+    if prebuilt_man.any?
+      man1.install prebuilt_man
+    else
+      begin
+        system "swift", "package", "--allow-writing-to-package-directory",
+               "generate-manual", "--multi-page"
+        man1.install Dir[".build/plugins/GenerateManual/outputs/CockerCLI/*.1"]
+      rescue => e
+        opoo "man page generation failed (#{e.class}: #{e.message.split("\n").first}) — " \
+             "proceeding without ; run `swift package generate-manual --multi-page` " \
+             "from a source checkout to produce them manually."
+      end
     end
 
     # 5. Stage entitlements + initrd for post_install
