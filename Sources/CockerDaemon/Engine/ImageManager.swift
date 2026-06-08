@@ -720,17 +720,25 @@ actor DockerfileBuilder {
                     effectiveArgs = String(effectiveArgs[effectiveArgs.index(after: spaceIdx)...])
                         .trimmingCharacters(in: .whitespaces)
                 }
-                // Where to read sources from : a prior stage's rootfs, or the
-                // build context directory on the host.
-                let sourceRoot: URL = {
-                    if let stage = fromStage, let stageDir = stageRootfs[stage] {
-                        return stageDir
+                // Where to read sources from. Three cases :
+                //   1. --from=<stage>  → a prior `FROM ... AS <stage>` rootfs
+                //   2. --from=<image>  → an external OCI image (pull if needed,
+                //                        extract rootfs, read from there) —
+                //                        e.g. `COPY --from=ghcr.io/astral-sh/uv:latest`
+                //   3. no --from       → the build context directory on the host
+                let sourceRoot: URL
+                if let stage = fromStage, let stageDir = stageRootfs[stage] {
+                    sourceRoot = stageDir
+                } else if let stage = fromStage {
+                    do {
+                        sourceRoot = try await resolveExternalImageForCopy(stage)
+                    } catch {
+                        log(.stderr, "Warning: --from=\(stage) is neither a known stage nor a pullable image reference (\(error)); falling back to build context\n")
+                        sourceRoot = URL(fileURLWithPath: config.contextPath)
                     }
-                    if let stage = fromStage {
-                        log(.stderr, "Warning: --from=\(stage) refers to unknown stage; falling back to build context\n")
-                    }
-                    return URL(fileURLWithPath: config.contextPath)
-                }()
+                } else {
+                    sourceRoot = URL(fileURLWithPath: config.contextPath)
+                }
 
                 let parts = splitArgs(effectiveArgs)
                 guard parts.count >= 2 else {
@@ -1046,6 +1054,48 @@ actor DockerfileBuilder {
         log(.status, "Successfully tagged \(config.tag)")
 
         return imageInfo
+    }
+
+    // MARK: - COPY --from=<image> support
+
+    /// Resolves a `--from=<value>` flag to an extracted-rootfs directory when
+    /// `<value>` is an external image reference rather than a known build stage.
+    /// Pulls the image on cache miss, then returns the rootfs path from the
+    /// image store so the COPY loop can read files out of it like a stage.
+    ///
+    /// Throws if `<value>` doesn't even look like an image reference (caller
+    /// catches and falls back to "build context") OR if pull/extract fails.
+    private func resolveExternalImageForCopy(_ reference: String) async throws -> URL {
+        // Reject obvious non-references early : paths and stage-name patterns.
+        // We do this before hitting the registry so a typo'd stage name
+        // doesn't trigger a 30 s registry lookup.
+        if reference.isEmpty
+            || reference.hasPrefix(".")
+            || reference.hasPrefix("/")
+            || reference.contains(" ") {
+            throw CockerError.imageNotFound("'\(reference)' is not a valid image reference")
+        }
+        // Accept if it looks like a registry reference (has `:` for tag/digest,
+        // `/` for registry/org path, or matches a plain image name we might be
+        // able to resolve from Docker Hub like `alpine`).
+        let looksLikeRef = reference.contains(":")
+            || reference.contains("/")
+            || reference.range(of: "^[a-z0-9][a-z0-9._-]*$", options: .regularExpression) != nil
+        guard looksLikeRef else {
+            throw CockerError.imageNotFound("'\(reference)' is not a valid image reference")
+        }
+
+        // Pull always, even on cache hit. exists() / find() can't reliably
+        // resolve fully-qualified references like `ghcr.io/astral-sh/uv:latest`
+        // because the local index keys are `<repository>:<tag>` (registry
+        // stripped). pull() handles re-pull-as-noop internally if the image
+        // is already there. We keep the ImageInfo it returns to look up the
+        // rootfs directory directly, sidestepping the find() ambiguity.
+        log(.stdout, " ---> Resolving --from image: \(reference)\n")
+        let imageInfo = try await imageManager.pull(reference: reference, progressHandler: { msg in
+            self.log(.stdout, msg + "\n")
+        })
+        return await imageManager.rootfsDirectory(for: imageInfo)
     }
 
     // MARK: - RUN command execution
