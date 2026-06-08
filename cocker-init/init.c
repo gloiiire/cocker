@@ -196,6 +196,12 @@ int main(int argc, char **argv) {
     switch_to_virtiofs();
     mount_volumes(cmdline);
 
+    /* Workaround Apple virtiofsd bug that breaks shadow-utils (groupadd,
+     * useradd) — must happen BEFORE pin_resolv_conf so the runtime pin
+     * lands on the tmpfs overlay and doesn't accidentally persist into
+     * the rootfs at exit. See etc_overlay.c for the full story. */
+    etc_overlay_setup();
+
     /* Networking. */
     net_bring_up_loopback();
     net_setup_eth0_dhcp();
@@ -366,6 +372,13 @@ int main(int argc, char **argv) {
      * via `cocker logs`. */
     fflush(stderr);
     fflush(stdout);
+
+    /* Reverse the /etc tmpfs overlay so this container's RUN-step
+     * modifications (added users, package configs, …) land in the
+     * virtiofs rootfs before the VM powers off. resolv.conf et al. are
+     * preserved at their image-time content. Must precede sync(). */
+    etc_overlay_sync_back();
+
     sync();
 
     reboot(RB_POWER_OFF);
