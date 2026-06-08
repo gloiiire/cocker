@@ -67,7 +67,10 @@ func main() async {
 
     if setupMode {
         await runSetup(rootURL: rootURL)
-        return
+        // Without exit() the surrounding RunLoop.main.run() keeps the
+        // process alive — old behaviour was to hang on Ctrl-C after setup
+        // finished, which read like a crash.
+        exit(0)
     }
 
     // Check Virtualization.framework availability (requires Apple Silicon + macOS 14+)
@@ -78,6 +81,29 @@ func main() async {
           - Apple Silicon Mac (M1 or later)
           - macOS 14.0 or later
           - cockerd must be code-signed with com.apple.security.virtualization entitlement
+        \n
+        """, stderr)
+        exit(1)
+    }
+
+    // Fail fast if the binary is missing the virtualization entitlement.
+    // Without it, every VZVirtualMachine init throws a cryptic
+    // "Invalid virtual machine configuration" error on first container
+    // start — way after launch, when the user can't tell what's wrong.
+    if !hasVirtualizationEntitlement() {
+        let exe = CommandLine.arguments.first ?? "cockerd"
+        fputs("""
+        Error: cockerd is missing the com.apple.security.virtualization entitlement.
+        Without it Virtualization.framework refuses to boot any VM.
+
+        Fix (dev build, ad-hoc signature):
+          codesign --force --sign - \\
+            --entitlements entitlements/cockerd.entitlements \\
+            \(exe)
+
+        Or rerun the full installer (recommended) :
+          ./install.sh
+
         \n
         """, stderr)
         exit(1)
@@ -395,6 +421,141 @@ func printUsage() {
                              colored: isatty(fileno(stdout)) == 1))
 }
 
+// MARK: - Entitlement self-check
+
+/// Shells out to `codesign -d --entitlements -` against our own binary and
+/// looks for the virtualization entitlement key. Tolerant of every failure
+/// path : if codesign isn't there or the binary path can't be resolved, we
+/// assume the entitlement is present and let VZ surface the real error
+/// later — better than blocking a working install over a probe glitch.
+func hasVirtualizationEntitlement() -> Bool {
+    let exe = CommandLine.arguments.first ?? ""
+    guard !exe.isEmpty, FileManager.default.fileExists(atPath: exe) else { return true }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    proc.arguments = ["-d", "--entitlements", ":-", exe]
+    let out = Pipe()
+    proc.standardOutput = out
+    proc.standardError = Pipe()
+    do { try proc.run() } catch { return true }
+    proc.waitUntilExit()
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    let str = String(data: data, encoding: .utf8) ?? ""
+    return str.contains("com.apple.security.virtualization")
+}
+
+// MARK: - Setup
+
+/// Where Apple-provided `container` runtimes can sit. Order matters — we
+/// take the first match. The list covers : Homebrew (cellar-shared dirs),
+/// the official `.pkg` installer's libexec/share paths, and the per-user
+/// directory the `container` CLI writes to on first run.
+private let kernelSearchRoots: [String] = {
+    let home = NSHomeDirectory()
+    return [
+        "/opt/homebrew/share/container",
+        "/usr/local/share/container",
+        "/usr/local/libexec/container",
+        "/opt/homebrew/libexec/container",
+        "\(home)/.container",
+        "\(home)/Library/Application Support/com.apple.container",
+        "\(home)/Library/Application Support/com.apple.container.runtime",
+    ]
+}()
+
+/// Adds paths relative to `container` in PATH (e.g. .pkg installs to
+/// /usr/local/bin/container and the kernel sits in ../share or ../libexec).
+private func kernelRootsFromContainerBinary() -> [String] {
+    guard let bin = which("container") else { return [] }
+    let dir = (bin as NSString).deletingLastPathComponent
+    let prefix = (dir as NSString).deletingLastPathComponent
+    return [
+        "\(prefix)/share/container",
+        "\(prefix)/libexec/container",
+    ]
+}
+
+private func which(_ tool: String) -> String? {
+    let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+    for dir in path.split(separator: ":") {
+        let candidate = "\(dir)/\(tool)"
+        if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+    }
+    return nil
+}
+
+private struct DiscoveredKernel {
+    let root: String
+    let vmlinuz: String
+    let initrd: String?
+}
+
+/// Two layouts we recognize :
+///   1. Homebrew / older releases : <root>/kernel/vmlinuz (+ initrd.img)
+///   2. Apple `container` .pkg     : <root>/kernels/vmlinux-<ver>-<build>
+///      (initrd lives per-container, so nothing to symlink — cocker uses
+///      its own initrd.img from cocker-init either way.)
+private func discoverAppleKernel() -> DiscoveredKernel? {
+    var roots = kernelSearchRoots
+    roots.append(contentsOf: kernelRootsFromContainerBinary())
+    let fm = FileManager.default
+
+    for root in roots {
+        // Layout 1 — classic Homebrew path.
+        let classic = root + "/kernel/vmlinuz"
+        if fm.fileExists(atPath: classic) {
+            let initrd = root + "/kernel/initrd.img"
+            return DiscoveredKernel(
+                root: root,
+                vmlinuz: classic,
+                initrd: fm.fileExists(atPath: initrd) ? initrd : nil
+            )
+        }
+
+        // Layout 2 — Apple `container` .pkg. Pick the lexicographically
+        // newest vmlinux-* (release strings sort naturally enough for our
+        // single-Mac use case).
+        let kernelsDir = root + "/kernels"
+        if let entries = try? fm.contentsOfDirectory(atPath: kernelsDir) {
+            let candidates = entries.filter { $0.hasPrefix("vmlinux") }.sorted()
+            if let pick = candidates.last {
+                return DiscoveredKernel(
+                    root: root,
+                    vmlinuz: kernelsDir + "/" + pick,
+                    initrd: nil
+                )
+            }
+        }
+    }
+    return nil
+}
+
+/// Symlinks (or copies, if symlink fails) the discovered kernel into
+/// `kernelDir`. Returns true on success. Errors are printed in-place so
+/// the caller can keep its happy-path branching simple.
+private func linkKernel(_ k: DiscoveredKernel, into kernelDir: URL) -> Bool {
+    let dstKernel = kernelDir.appendingPathComponent("vmlinuz")
+    let dstInitrd = kernelDir.appendingPathComponent("initrd.img")
+    try? FileManager.default.removeItem(at: dstKernel)
+    try? FileManager.default.removeItem(at: dstInitrd)
+    do {
+        try FileManager.default.createSymbolicLink(
+            at: dstKernel,
+            withDestinationURL: URL(fileURLWithPath: k.vmlinuz)
+        )
+        if let initrd = k.initrd {
+            try FileManager.default.createSymbolicLink(
+                at: dstInitrd,
+                withDestinationURL: URL(fileURLWithPath: initrd)
+            )
+        }
+        return true
+    } catch {
+        print("Warning: could not symlink kernel files: \(error)")
+        return false
+    }
+}
+
 func runSetup(rootURL: URL) async {
     print("Cocker Setup")
     print("============")
@@ -402,121 +563,73 @@ func runSetup(rootURL: URL) async {
     print("")
 
     let kernelDir = rootURL.appendingPathComponent("kernel")
+    try? FileManager.default.createDirectory(at: kernelDir, withIntermediateDirectories: true)
 
-    // Check for Apple container kernel (installed via brew)
-    let brewPaths = [
-        "/opt/homebrew/share/container",
-        "/usr/local/share/container",
-        "\(NSHomeDirectory())/.container",
-    ]
-
-    var found = false
-    for basePath in brewPaths {
-        let vmlinuz = basePath + "/kernel/vmlinuz"
-        let initrd = basePath + "/kernel/initrd.img"
-
-        if FileManager.default.fileExists(atPath: vmlinuz) {
-            print("Found Apple container kernel at: \(basePath)")
-            print("Linking kernel files...")
-
-            let dstKernel = kernelDir.appendingPathComponent("vmlinuz")
-            let dstInitrd = kernelDir.appendingPathComponent("initrd.img")
-
-            try? FileManager.default.removeItem(at: dstKernel)
-            try? FileManager.default.removeItem(at: dstInitrd)
-
-            do {
-                try FileManager.default.createSymbolicLink(
-                    at: dstKernel,
-                    withDestinationURL: URL(fileURLWithPath: vmlinuz)
-                )
-                if FileManager.default.fileExists(atPath: initrd) {
-                    try FileManager.default.createSymbolicLink(
-                        at: dstInitrd,
-                        withDestinationURL: URL(fileURLWithPath: initrd)
-                    )
-                }
-                print("✓ Kernel linked successfully")
+    if let discovered = discoverAppleKernel() {
+        print("Found Apple container kernel at: \(discovered.vmlinuz)")
+        print("Linking kernel files...")
+        if linkKernel(discovered, into: kernelDir) {
+            print("✓ Kernel linked successfully")
+            let cockerInitrd = kernelDir.appendingPathComponent("initrd.img").path
+            if !FileManager.default.fileExists(atPath: cockerInitrd) {
                 print("")
-                print("Setup complete! You can now start cockerd and use cocker.")
-                found = true
-                break
-            } catch {
-                print("Warning: Could not link kernel files: \(error)")
+                print("⚠ initrd.img is still missing at \(cockerInitrd)")
+                print("  Apple's `container` doesn't ship a Linux initrd next to its kernel")
+                print("  (it builds per-container init filesystems instead). Cocker needs")
+                print("  its own initrd. Either run `./install.sh` from the cocker checkout")
+                print("  (it copies cocker-init/initrd.img into place), or copy it manually:")
+                print("    cp cocker-init/initrd.img \(cockerInitrd)")
             }
+            print("")
+            print("Setup complete! Run `cocker daemon start` (or restart it if already running).")
         }
+        return
     }
 
-    if !found {
-        print("No Apple container kernel found.")
+    print("No Apple container kernel found. Tried these locations:")
+    for root in kernelSearchRoots {
+        print("  - \(root)/kernel/vmlinuz           (Homebrew layout)")
+        print("  - \(root)/kernels/vmlinux-*        (.pkg layout)")
+    }
+    print("")
+    if which("container") != nil {
+        print("`container` is in your PATH but its kernel wasn't where we expected.")
+        print("Run `container system status` to see where it stores its data, then")
+        print("either symlink that vmlinuz into \(kernelDir.path)/vmlinuz manually,")
+        print("or paste the absolute path to vmlinuz below.")
+    } else {
+        print("Install Apple's container runtime first:")
+        print("  → Download the .pkg from https://github.com/apple/container/releases")
+        print("    (the Homebrew tap apple/container/container is not published —")
+        print("     ignore any older docs that mention it).")
         print("")
-
-        // Offer auto-install via Homebrew
-        print("Voulez-vous installer le runtime via Homebrew? [Y/n] ", terminator: "")
-        fflush(stdout)
-        let answer = readLine()?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
-
-        if answer == "" || answer == "y" || answer == "yes" {
-            print("Installation de apple/container via Homebrew...")
-            let brew = Process()
-            let brewPaths = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
-            guard let brewPath = brewPaths.first(where: { FileManager.default.fileExists(atPath: $0) }) else {
-                print("Homebrew non trouvé. Installe-le depuis https://brew.sh puis relance: cockerd setup")
-                return
-            }
-            brew.executableURL = URL(fileURLWithPath: brewPath)
-            brew.arguments = ["install", "apple/container/container"]
-            brew.standardOutput = FileHandle.standardOutput
-            brew.standardError = FileHandle.standardError
-            do {
-                try brew.run()
-                brew.waitUntilExit()
-            } catch {
-                print("Erreur lors de l'installation: \(error)")
-                return
-            }
-
-            if brew.terminationStatus == 0 {
-                print("Installation réussie! Liaison du kernel...")
-                // Re-check for kernel after install
-                for basePath in brewPaths.map({ URL(fileURLWithPath: $0).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("share/container").path }) {
-                    let vmlinuz = basePath + "/kernel/vmlinuz"
-                    let initrd = basePath + "/kernel/initrd.img"
-                    if FileManager.default.fileExists(atPath: vmlinuz) {
-                        let dstKernel = kernelDir.appendingPathComponent("vmlinuz")
-                        let dstInitrd = kernelDir.appendingPathComponent("initrd.img")
-                        try? FileManager.default.removeItem(at: dstKernel)
-                        try? FileManager.default.removeItem(at: dstInitrd)
-                        try? FileManager.default.createSymbolicLink(at: dstKernel, withDestinationURL: URL(fileURLWithPath: vmlinuz))
-                        if FileManager.default.fileExists(atPath: initrd) {
-                            try? FileManager.default.createSymbolicLink(at: dstInitrd, withDestinationURL: URL(fileURLWithPath: initrd))
-                        }
-                        print("Kernel lié avec succès.")
-                        print("Setup terminé! Lancez cockerd pour démarrer le daemon.")
-                        return
-                    }
-                }
-                print("Kernel introuvable après installation. Relancez: cockerd setup")
-            } else {
-                print("Installation échouée (code: \(brew.terminationStatus)).")
-                print("Essayez manuellement: brew install apple/container/container")
-            }
-        } else {
-            print("To install the Apple container runtime:")
-            print("  brew install apple/container/container")
-            print("  cockerd setup")
-            print("")
-            print("Or manually provide a Linux kernel:")
-            print("  1. Download Alpine Linux aarch64 netboot:")
-            print("     https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/")
-            print("  2. Place vmlinuz at: \(kernelDir.path)/vmlinuz")
-            print("  3. Place initramfs-lts at: \(kernelDir.path)/initrd.img")
-            print("")
-            print("The kernel needs to support:")
-            print("  - virtio_fs (FUSE over virtio)")
-            print("  - virtio_net")
-            print("  - virtio_vsock")
+        print("Then re-run: cockerd setup")
+    }
+    print("")
+    print("Or provide a kernel manually right now —")
+    print("paste the absolute path to a Linux aarch64 vmlinuz (or leave empty to skip): ", terminator: "")
+    fflush(stdout)
+    let entered = readLine()?.trimmingCharacters(in: .whitespaces) ?? ""
+    guard !entered.isEmpty else {
+        print("")
+        print("Skipped. cockerd cannot boot VMs until a kernel is in place at")
+        print("  \(kernelDir.path)/vmlinuz")
+        return
+    }
+    guard FileManager.default.fileExists(atPath: entered) else {
+        print("✗ \(entered) does not exist.")
+        return
+    }
+    let initrdSibling = (entered as NSString).deletingLastPathComponent + "/initrd.img"
+    let initrd = FileManager.default.fileExists(atPath: initrdSibling) ? initrdSibling : nil
+    let manual = DiscoveredKernel(root: (entered as NSString).deletingLastPathComponent, vmlinuz: entered, initrd: initrd)
+    if linkKernel(manual, into: kernelDir) {
+        print("✓ Kernel linked from \(entered)")
+        if initrd == nil {
+            print("Note: no initrd.img next to it — cocker will ship its own.")
         }
+        print("")
+        print("Setup complete! Run `cocker daemon start` (or restart it if already running).")
     }
 }
 
