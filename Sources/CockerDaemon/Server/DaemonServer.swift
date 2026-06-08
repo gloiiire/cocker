@@ -857,15 +857,21 @@ final class DaemonServer {
         send("  2. Place vmlinuz at: \(kernelDir.path)/vmlinuz")
         send("  3. Place initrd.img at: \(kernelDir.path)/initrd.img")
         send("")
-        send("Alternatively, use Apple's containerization project:")
-        send("  brew install apple/container/container")
-        send("  cockerd will automatically use the Apple-provided kernel")
+        send("Alternatively, install Apple's `container` runtime:")
+        send("  → https://github.com/apple/container/releases (.pkg)")
+        send("  cockerd will auto-detect the Apple-provided kernel on next setup.")
         send("")
 
-        // Check if apple/container kernel is available
+        // Check if apple/container kernel is available. The .pkg installer
+        // and Homebrew both drop the kernel under share/ or libexec/.
+        let home = NSHomeDirectory()
         let appleKernelPaths = [
             "/opt/homebrew/share/container/kernel",
             "/usr/local/share/container/kernel",
+            "/usr/local/libexec/container/kernel",
+            "/opt/homebrew/libexec/container/kernel",
+            "\(home)/.container/kernel",
+            "\(home)/Library/Application Support/com.apple.container/kernel",
         ]
 
         for path in appleKernelPaths {
