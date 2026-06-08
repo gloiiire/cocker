@@ -33,6 +33,7 @@ jobs:
           cp .build/release/cocker dist/cocker-${{ github.ref_name }}-arm64-macos
           cp .build/release/cockerd dist/cockerd-${{ github.ref_name }}-arm64-macos
           cp .build/release/cocker-portfwd dist/cocker-portfwd-${{ github.ref_name }}-arm64-macos
+          cp .build/release/cocker-mcp dist/cocker-mcp-${{ github.ref_name }}-arm64-macos
           ls -la dist/
 
       - name: Cross-compile cocker-init for Linux ARM64
