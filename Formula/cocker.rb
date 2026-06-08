@@ -34,7 +34,7 @@ class Cocker < Formula
              "-o", "cocker-init",
              "init.c", "cmdline.c", "net.c", "dns_proxy.c",
              "spec.c", "qemu.c", "exec_listener.c", "caps.c",
-             "health_poll.c"
+             "health_poll.c", "etc_overlay.c"
       cp "cocker-init", "initrd-staging/init"
       chmod 0755, "initrd-staging/init"
       cd "initrd-staging" do
