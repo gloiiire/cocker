@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.2 — Homebrew formula man-page fix
+
+Patch release. The 0.5.1 formula tried to regenerate the man pages at
+install time via `swift package generate-manual --multi-page`, but
+that command spawns its own `sandbox-exec` invocation which gets
+denied by Homebrew's outer sandbox (`sandbox_apply: Operation not
+permitted`) — so users saw a warning and ended up without man pages.
+
+0.5.2 installs the pre-built man pages shipped under `docs/man/*.1`
+in the source tarball instead. They were already being regenerated +
+committed at every release on a developer machine where the sandbox
+nesting works ; we just weren't using them on install. The fallback
+to `swift package generate-manual` is kept for source-only checkouts
+that might miss the `docs/` tree.
+
+For users on 0.5.1 : `brew upgrade gloiiire/cocker/cocker` brings you
+to 0.5.2 with man pages working. `man cocker`, `man cocker-daemon-tls-init`,
+etc. now respond properly.
+
 ## 0.5.1 — Release pipeline patch (no code changes vs 0.5.0)
 
 Patch release. No behaviour change for users compared to 0.5.0 ; the only
