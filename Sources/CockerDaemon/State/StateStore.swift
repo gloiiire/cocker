@@ -200,7 +200,16 @@ actor StateStore {
 
     func volume(id: String) -> VolumeInfo? {
         if let v = state.volumes[id] { return v }
-        return state.volumes.values.first { $0.name == id || $0.id.hasPrefix(id) }
+        // Prefix match falls back to the Docker convention : a 12-char
+        // short ID is the minimum that's safe to disambiguate. Without
+        // this minimum, a 1-char lookup like "c" would match any volume
+        // whose UUID happens to start with "c" (~6 % per existing
+        // volume) and short-named volumes would silently collide. The
+        // VolumeManagerPruneTests suite hit this intermittently with
+        // names "a"/"b"/"c" — 12 % failure rate in CI.
+        return state.volumes.values.first {
+            $0.name == id || (id.count >= 12 && $0.id.hasPrefix(id))
+        }
     }
 
     func allVolumes() -> [VolumeInfo] {
