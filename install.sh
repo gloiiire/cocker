@@ -87,6 +87,7 @@ mkdir -p "$BIN_DIR" "$MAN_DIR"
 install -m 755 .build/release/cocker "$BIN_DIR/cocker"
 install -m 755 .build/release/cockerd "$BIN_DIR/cockerd"
 install -m 755 .build/release/cocker-portfwd "$BIN_DIR/cocker-portfwd"
+install -m 755 .build/release/cocker-mcp "$BIN_DIR/cocker-mcp"
 install -m 644 "$MAN_SRC"/*.1 "$MAN_DIR/"
 ok "Binaires + man pages installés ($MAN_DIR)"
 
@@ -204,3 +205,6 @@ echo "    cocker ps"
 echo
 echo "Pour stopper le daemon : launchctl bootout gui/$(id -u) $PLIST"
 echo "Pour redémarrer        : launchctl kickstart -k gui/$(id -u)/com.cocker.cockerd"
+echo
+echo "MCP (Claude Desktop) — ajoute à ~/Library/Application Support/Claude/claude_desktop_config.json :"
+echo '    { "mcpServers": { "cocker": { "command": "'"$BIN_DIR/cocker-mcp"'" } } }'

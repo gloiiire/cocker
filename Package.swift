@@ -11,6 +11,9 @@ let package = Package(
         // l'entitlement virtualization → pas de sandbox sur les bridges
         // privés vmnet (sinon EHOSTUNREACH depuis cockerd).
         .executable(name: "cocker-portfwd", targets: ["CockerPortFwd"]),
+        // MCP server (Model Context Protocol). Stdio JSON-RPC bridge that
+        // exposes cockerd to LLM clients (Claude Desktop, etc.).
+        .executable(name: "cocker-mcp", targets: ["CockerMCP"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
@@ -54,6 +57,11 @@ let package = Package(
         .executableTarget(
             name: "CockerPortFwd",
             path: "Sources/CockerPortFwd"
+        ),
+        .executableTarget(
+            name: "CockerMCP",
+            dependencies: ["CockerCore"],
+            path: "Sources/CockerMCP"
         ),
         .testTarget(
             name: "CockerTests",
