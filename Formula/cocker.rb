@@ -42,10 +42,12 @@ class Cocker < Formula
 
     # 3. Install binaries (cocker-portfwd = subprocess séparé pour le port
     #    forwarding, signé ad-hoc sans entitlement virtualization → évite
-    #    le sandbox macOS qui bloque connect() vers les IPs vmnet privées)
+    #    le sandbox macOS qui bloque connect() vers les IPs vmnet privées ;
+    #    cocker-mcp = stdio MCP server pour Claude Desktop / agents)
     bin.install ".build/release/cocker"
     bin.install ".build/release/cockerd"
     bin.install ".build/release/cocker-portfwd"
+    bin.install ".build/release/cocker-mcp"
 
     # 4. Install man pages.
     #
