@@ -1,5 +1,5 @@
 import Foundation
-import Virtualization
+@preconcurrency import Virtualization
 import CockerCore
 
 // Apple Virtualization.framework runtime
@@ -16,9 +16,29 @@ final class VMRuntime: NSObject {
         let stderrPipe: Pipe
         var logBuffer: [StreamEvent] = []
         let logBufferLock = NSLock()
+        /// Where the virtiofs root is mounted from on the host. Carried
+        /// here so `stop()` can read `/cocker-exit-code` from the
+        /// container's rootfs after the VM is gone — the console-pipe
+        /// path drops the "exited with code N" line if the kernel
+        /// powers off before stdio drains.
+        let rootfsPath: URL?
     }
 
     private var runningVMs: [String: RunningVM] = [:]
+    /// MAC the VZ framework auto-assigned to each VM's eth0 NIC. ContainerEngine
+    /// drains this map after `start()` returns so it can persist the value
+    /// and use it for /var/db/dhcpd_leases lookup if /cocker-ip polling times
+    /// out. Cleared on container stop / remove.
+    fileprivate var pendingNATMACs: [String: String] = [:]
+
+    /// Pop and return the auto-assigned eth0 MAC for `containerID` after a
+    /// successful start. Returns nil if createVM never recorded one (e.g.
+    /// network mode .none).
+    func takeNATMAC(forContainer containerID: String) -> String? {
+        guard let m = pendingNATMACs.removeValue(forKey: containerID),
+              !m.isEmpty else { return nil }
+        return m
+    }
     private let kernelPath: URL
     private let initrdPath: URL
     private let rootDir: URL
@@ -134,6 +154,19 @@ final class VMRuntime: NSObject {
             fsDevices.append(volFS)
         }
 
+        // Cross-arch builds : if the build container is labelled with
+        // `com.cocker.qemu-arch`, share `~/.cocker/qemu` so the in-VM
+        // qemu_register_binfmt path in cocker-init can find the binary
+        // it advertises on the kernel cmdline. cocker-init mounts the
+        // "qemu" virtiofs tag at /opt/cocker/qemu (see init.c).
+        if container.labels["com.cocker.qemu-arch"] != nil,
+           let qemuDir = Self.qemuHostDir() {
+            let qemuShare = VZSingleDirectoryShare(directory: VZSharedDirectory(url: qemuDir, readOnly: true))
+            let qemuFS = VZVirtioFileSystemDeviceConfiguration(tag: "qemu")
+            qemuFS.share = qemuShare
+            fsDevices.append(qemuFS)
+        }
+
         config.directorySharingDevices = fsDevices
 
         // eth0 — outbound NAT to the internet (Apple-managed vmnet)
@@ -150,6 +183,17 @@ final class VMRuntime: NSObject {
                 netDevice.attachment = VZNATNetworkDeviceAttachment()
             }
         }
+        // Let VZ pick the MAC for eth0. Surface it back to cockerd through
+        // a side channel so it can match the corresponding lease in
+        // /var/db/dhcpd_leases. Pinning our own MAC didn't work — vmnet's
+        // bootpd silently refused to hand out leases for our 02:cc:* prefix.
+        let natMACString: String = {
+            guard container.networkMode != .none else { return "" }
+            let s = netDevice.macAddress.string
+            fputs("[vm] eth0 MAC=\(s)\n", stderr); fflush(stderr)
+            return s
+        }()
+        pendingNATMACs[container.id] = natMACString
 
         var netDevices: [VZVirtioNetworkDeviceConfiguration] = []
         if container.networkMode != .none {
@@ -196,13 +240,36 @@ final class VMRuntime: NSObject {
     // MARK: - Kernel command line
 
     private func buildKernelCommandLine(for container: Container, rootfsPath: URL) -> String {
-        KernelCommandLine.build(KernelCommandLineParams(
+        // For cross-arch builds, label "com.cocker.qemu-arch" is stamped
+        // on the synthetic build container so we know which qemu binary
+        // to plumb. Production runs leave it empty.
+        let qemuArch = container.labels["com.cocker.qemu-arch"]
+        let qemuPath = qemuArch.map { _ in "/opt/cocker/qemu/qemu-\(qemuArch!)-static" }
+        return KernelCommandLine.build(KernelCommandLineParams(
             container: container,
             dnsIP: DNSServer.hostIP(),
             dnsPort: DNSServer.defaultPort,
             dnsVsockPort: 5353,
-            cockerSwitchGateway: NetworkManager.cockerSwitchGateway
+            cockerSwitchGateway: NetworkManager.cockerSwitchGateway,
+            qemuArch: qemuArch,
+            qemuPath: qemuPath
         ))
+    }
+
+    /// Resolve the host directory holding qemu-user-static binaries the
+    /// daemon will mount into cross-arch VMs at `/opt/cocker/qemu/`.
+    /// Returns nil when the user hasn't dropped any binaries in there.
+    /// Binaries must be Linux aarch64 ELF (they run inside the build VM,
+    /// not on macOS), one per target arch :
+    ///   ~/.cocker/qemu/qemu-x86_64-static
+    ///   ~/.cocker/qemu/qemu-riscv64-static
+    static func qemuHostDir() -> URL? {
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".cocker/qemu")
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir),
+              isDir.boolValue else { return nil }
+        return dir
     }
 
     // MARK: - Start/Stop
@@ -217,7 +284,8 @@ final class VMRuntime: NSObject {
         command: [String],
         env: [String: String],
         workdir: String?,
-        timeout: TimeInterval = 600
+        timeout: TimeInterval = 600,
+        targetArch: String? = nil
     ) async throws -> Int32 {
         fputs("[vm-build] runEphemeral cmd=\(command.joined(separator: " ")) rootfs=\(rootfsPath.path)\n", stderr)
         fflush(stderr)
@@ -225,6 +293,22 @@ final class VMRuntime: NSObject {
 
         // Build un Container synthétique pour réutiliser la même config
         let ephID = "build-" + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased()
+        // Stamp the qemu arch label when cross-arch is requested so
+        // createVM mounts the qemu directory + buildKernelCommandLine
+        // emits the binfmt registration params. Host arch builds get
+        // a nil label and the cmdline params are omitted.
+        var labels: [String: String] = ["com.cocker.build": "true"]
+        if let arch = targetArch?.lowercased(), arch != "arm64", arch != "aarch64" {
+            // Normalise Docker-style "amd64" → kernel-style "x86_64".
+            let kernelArch: String
+            switch arch {
+            case "amd64": kernelArch = "x86_64"
+            case "arm/v7", "armhf": kernelArch = "arm"
+            case "riscv64": kernelArch = "riscv64"
+            default: kernelArch = arch
+            }
+            labels["com.cocker.qemu-arch"] = kernelArch
+        }
         var container = Container(
             id: ephID,
             name: ephID,
@@ -233,7 +317,7 @@ final class VMRuntime: NSObject {
             ports: [],
             volumes: [],
             env: env,
-            labels: ["com.cocker.build": "true"],
+            labels: labels,
             networkMode: .nat,
             cpuCount: 2,
             memoryMB: 1024,
@@ -269,6 +353,14 @@ final class VMRuntime: NSObject {
         }
         fputs("[vm-build] VM booted\n", stderr); fflush(stderr)
 
+        // Same DNS vsock wiring as `start()` — without this, DNS in the
+        // build VM fails and `RUN apk add …` / `RUN apt-get …` break.
+        if let listener = dnsVsockListener,
+           let socketDev = vm.socketDevices.first as? VZVirtioSocketDevice {
+            socketDev.setSocketListener(listener, forPort: 5353)
+            fputs("[vm-build] DNS vsock listener attached on port 5353\n", stderr); fflush(stderr)
+        }
+
         // Attendre que la VM s'arrête d'elle-même (cocker-init reboot après le
         // child exit) — poll vm.state avec timeout.
         let deadline = Date().addingTimeInterval(timeout)
@@ -290,9 +382,24 @@ final class VMRuntime: NSObject {
         let output = outputBuffer.text()
         let exitCode = parseExitCode(from: output) ?? 0
         fputs("[vm-build] VM stopped, exitCode=\(exitCode)\n", stderr); fflush(stderr)
+        if exitCode != 0 {
+            // Surface the failed step's output instead of swallowing it.
+            // Otherwise the user only sees "exit code 1" with no clue.
+            fputs("[vm-build] --- captured output (last 4 KB) ---\n", stderr)
+            let tail = output.suffix(4096)
+            fputs(String(tail), stderr)
+            fputs("\n[vm-build] --- end output ---\n", stderr); fflush(stderr)
+        }
 
         // Cleanup spec/resolv files for next iteration
         try? FileManager.default.removeItem(at: rootfsPath.appendingPathComponent("cocker-spec"))
+        // Also wipe /cocker-ip — build VMs go through DHCP and persist their
+        // IP into the image rootfs. Containers launched from that image
+        // would then race against their own cocker-init writing the
+        // correct value, surfacing as portfwd pointing at the build VM's
+        // dead IP. The defence in net.c truncates this file before each
+        // boot, but cleaning here keeps built images well-formed.
+        try? FileManager.default.removeItem(at: rootfsPath.appendingPathComponent("cocker-ip"))
 
         return exitCode
     }
@@ -303,6 +410,18 @@ final class VMRuntime: NSObject {
         let after = log[range.upperBound...]
         let codeStr = after.prefix { $0.isNumber }
         return Int32(codeStr)
+    }
+
+    /// Best-effort exit code for a container that has stopped. Returns nil
+    /// if cocker-init's "exited with code N" marker wasn't seen in the
+    /// console buffer — caller falls back to 0. Used by watchContainer to
+    /// decide whether to honour on-failure restart policy.
+    func exitCode(forContainer containerID: String) -> Int32? {
+        guard let running = runningVMs[containerID] else { return nil }
+        running.logBufferLock.lock()
+        defer { running.logBufferLock.unlock() }
+        let combined = running.logBuffer.map { $0.data }.joined()
+        return parseExitCode(from: combined)
     }
 
     func start(container: Container, rootfsPath: URL) async throws {
@@ -331,7 +450,8 @@ final class VMRuntime: NSObject {
             vm: vm,
             containerID: container.id,
             stdoutPipe: stdoutPipe,
-            stderrPipe: stderrPipe
+            stderrPipe: stderrPipe,
+            rootfsPath: rootfsPath
         )
         runningVMs[container.id] = runningVM
 
@@ -344,7 +464,15 @@ final class VMRuntime: NSObject {
                 case .success:
                     continuation.resume()
                 case .failure(let error):
-                    continuation.resume(throwing: CockerError.vmStartFailed(error.localizedDescription))
+                    let ns = error as NSError
+                    fputs("[vm] start FAILED domain=\(ns.domain) code=\(ns.code) desc=\(ns.localizedDescription)\n", stderr)
+                    fputs("[vm] userInfo=\(ns.userInfo)\n", stderr)
+                    if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+                        fputs("[vm] underlying: domain=\(underlying.domain) code=\(underlying.code) desc=\(underlying.localizedDescription)\n", stderr)
+                        fputs("[vm] underlying userInfo=\(underlying.userInfo)\n", stderr)
+                    }
+                    fflush(stderr)
+                    continuation.resume(throwing: CockerError.vmStartFailed("\(ns.localizedDescription) [code=\(ns.code)]"))
                 }
             }
         }
@@ -375,17 +503,45 @@ final class VMRuntime: NSObject {
         }
     }
 
-    func stop(containerID: String, timeout: TimeInterval = 10) async throws {
+    /// Returns the container's exit code (parsed from cocker-init's
+    /// console log) when the VM stopped gracefully — `nil` if we had to
+    /// force-stop and the init line never landed. ContainerEngine writes
+    /// this to `state.exitCode` instead of the hardcoded 0 the prior
+    /// path used, so `cocker inspect` and the Docker API's
+    /// `State.ExitCode` reflect what really happened (137 on SIGKILL,
+    /// `exit N` from a STOPSIGNAL trap, etc.).
+    @discardableResult
+    func stop(containerID: String, timeout: TimeInterval = 10,
+              stopSignal: String? = nil) async throws -> Int32? {
         guard let running = runningVMs[containerID] else {
             throw CockerError.containerNotRunning(containerID)
         }
 
-        // Try graceful shutdown first
-        if running.vm.canRequestStop {
+        // Phase 1 — In-VM signal relay via vsock. VZ's `requestStop()`
+        // sends an ACPI shutdown which the Linux kernel doesn't reliably
+        // turn into a SIGTERM at PID 1 (no systemd to broker it). For
+        // STOPSIGNAL semantics (nginx wants SIGQUIT, etc.) we hand the
+        // signal to the exec_listener over vsock — it reads /cocker-child.pid
+        // that init wrote and delivers the signal directly to the
+        // container's main process.
+        let signalName = stopSignal ?? "SIGTERM"
+        await sendStopSignal(vm: running.vm, containerID: containerID, signal: signalName)
+
+        // Phase 2 — Poll for the child to exit. The signal handler in the
+        // container does its graceful shutdown ; PID 1 reaps it and
+        // reboots the VM. VZ surfaces this as state == .stopped.
+        let deadline = Date().addingTimeInterval(timeout)
+        while running.vm.state != .stopped && Date() < deadline {
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        // Phase 3 — Fallback to ACPI shutdown if still running. Container
+        // ignored the signal (or had no handler installed) — request
+        // graceful via VZ, then force-stop after the timeout.
+        if running.vm.state == .running && running.vm.canRequestStop {
             try running.vm.requestStop()
-            // Give it timeout to stop
-            let deadline = Date().addingTimeInterval(timeout)
-            while running.vm.state != .stopped && Date() < deadline {
+            let acpiDeadline = Date().addingTimeInterval(timeout)
+            while running.vm.state != .stopped && Date() < acpiDeadline {
                 try await Task.sleep(nanoseconds: 100_000_000)
             }
         }
@@ -403,7 +559,47 @@ final class VMRuntime: NSObject {
             }
         }
 
+        // Exit code resolution. cocker-init writes its decimal exit
+        // code to `/cocker-exit-code` on the shared rootfs right before
+        // reboot — reading that file is the source of truth here. We
+        // fall back to parseExitCode on the console buffer for
+        // backwards compatibility with older cocker-init builds that
+        // don't write the file yet.
+        let rootfs = running.rootfsPath
+        var detectedExit: Int32? = nil
+        if let rootfs {
+            let ecPath = rootfs.appendingPathComponent("cocker-exit-code")
+            if let s = try? String(contentsOf: ecPath, encoding: .utf8),
+               let n = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                detectedExit = n
+            }
+        }
+        if detectedExit == nil {
+            detectedExit = parseExitCode(from: running.logBuffer.map { $0.data }.joined())
+        }
         runningVMs.removeValue(forKey: containerID)
+        await l2Switch.removePort(containerID: containerID)
+        return detectedExit
+    }
+
+    /// Reap the FDs / handlers held for a container whose VM stopped on
+    /// its own (no explicit `stop()` call). Without this, every short-
+    /// lived `cocker run --rm` cycle leaked ~8 FDs into cockerd (mainly
+    /// console + stderr pipes + /dev/null + vsock IPC channels).
+    func cleanup(containerID: String) async {
+        guard let running = runningVMs[containerID] else { return }
+        // Tear down the readability handler first so it stops capturing
+        // the file handle, then close both ends of each pipe explicitly.
+        // FileHandle.deinit closes the FD, but the handler closure can
+        // outlive deinit if the GCD queue is still draining it.
+        running.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        try? running.stdoutPipe.fileHandleForReading.close()
+        try? running.stdoutPipe.fileHandleForWriting.close()
+        running.stderrPipe.fileHandleForReading.readabilityHandler = nil
+        try? running.stderrPipe.fileHandleForReading.close()
+        try? running.stderrPipe.fileHandleForWriting.close()
+        runningVMs.removeValue(forKey: containerID)
+        pendingNATMACs.removeValue(forKey: containerID)
         await l2Switch.removePort(containerID: containerID)
     }
 
@@ -463,7 +659,12 @@ final class VMRuntime: NSObject {
             to: rootfsPath,
             command: container.command,
             env: container.env,
-            workdir: container.config_workdir
+            workdir: container.config_workdir,
+            user: container.config_user,
+            privileged: container.privileged,
+            capAdd: container.capAdd,
+            capDrop: container.capDrop,
+            stopSignal: container.stopSignal
         )
     }
 
@@ -480,12 +681,48 @@ final class VMRuntime: NSObject {
     // MARK: - Logs
 
     func logs(containerID: String, tail: Int) -> [StreamEvent] {
-        guard let running = runningVMs[containerID] else { return [] }
-        running.logBufferLock.lock()
-        defer { running.logBufferLock.unlock() }
-        let all = running.logBuffer
-        if tail <= 0 { return all }
-        return Array(all.suffix(tail))
+        // Fast path : container still running, serve from in-memory ring.
+        if let running = runningVMs[containerID] {
+            running.logBufferLock.lock()
+            defer { running.logBufferLock.unlock() }
+            let all = running.logBuffer
+            if tail <= 0 { return all }
+            return Array(all.suffix(tail))
+        }
+        // Cold path : container already exited (very common for short-
+        // lived `cocker run --rm` workloads — the watcher may have
+        // dropped runningVMs[id] between `engine.run` returning and the
+        // CLI's follow-attach. Without this fallback the user sees no
+        // output even though writeJSONLog has it on disk.
+        return Self.readJSONLog(containerID: containerID, tail: tail)
+    }
+
+    /// Replay the persisted json-file log at
+    /// `~/.cocker/containers/<id>/<id>-json.log`. Each line is a Docker-
+    /// shape JSON object ({log, stream, time}) ; we decode back to a
+    /// StreamEvent so the streaming layer doesn't need to know which
+    /// source served the bytes. Used as the cold-path fallback in
+    /// `logs(containerID:tail:)`.
+    private static func readJSONLog(containerID: String, tail: Int) -> [StreamEvent] {
+        let path = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".cocker/containers/\(containerID)/\(containerID)-json.log")
+        guard let raw = try? String(contentsOf: path, encoding: .utf8) else { return [] }
+        let lines = raw.split(separator: "\n", omittingEmptySubsequences: true)
+        let scope = (tail <= 0) ? Array(lines) : Array(lines.suffix(tail))
+        let iso = ISO8601DateFormatter()
+        var out: [StreamEvent] = []
+        out.reserveCapacity(scope.count)
+        for line in scope {
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let logStr = obj["log"] as? String
+            else { continue }
+            let streamRaw = (obj["stream"] as? String) ?? "stdout"
+            let stream: StreamEvent.Stream = (streamRaw == "stderr") ? .stderr : .stdout
+            let ts = (obj["time"] as? String).flatMap { iso.date(from: $0) } ?? Date()
+            out.append(StreamEvent(stream: stream, data: logStr, timestamp: ts))
+        }
+        return out
     }
 
     func appendLog(containerID: String, event: StreamEvent) {
@@ -498,11 +735,123 @@ final class VMRuntime: NSObject {
             running.logBuffer.removeFirst(running.logBuffer.count - 10000)
         }
         runningVMs[containerID] = running
+
+        // json-file driver : mirror the event to disk in Docker's exact
+        // shape so `docker logs <id>` against the json-file path works
+        // for anyone who shells in. Rotation at 10 MB keeps the file from
+        // unbounded growth ; rotated copies are .1.gz, .2.gz, …
+        Self.writeJSONLog(containerID: containerID, event: event)
+    }
+
+    /// Append one line to `~/.cocker/containers/<id>/<id>-json.log` in
+    /// Docker's canonical shape `{"log": "...", "stream": "stdout|stderr",
+    /// "time": "<RFC3339>"}`. Best-effort : a disk-full or perms failure
+    /// silently drops the entry rather than crashing the VM console reader.
+    private static func writeJSONLog(containerID: String, event: StreamEvent) {
+        let root = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent(".cocker/containers/\(containerID)")
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let path = root.appendingPathComponent("\(containerID)-json.log")
+        let streamName: String = {
+            switch event.stream {
+            case .stdout: return "stdout"
+            case .stderr: return "stderr"
+            default: return "stdout"
+            }
+        }()
+        let entry: [String: Any] = [
+            "log": event.data,
+            "stream": streamName,
+            "time": ISO8601DateFormatter().string(from: event.timestamp),
+        ]
+        guard let line = try? JSONSerialization.data(withJSONObject: entry),
+              let withNL = (String(data: line, encoding: .utf8).map { $0 + "\n" })?.data(using: .utf8)
+        else { return }
+
+        // Rotate at 10 MB. We keep up to 5 generations (Docker's default).
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
+           let size = attrs[.size] as? Int, size > 10 * 1024 * 1024 {
+            for i in stride(from: 4, through: 1, by: -1) {
+                let from = root.appendingPathComponent("\(containerID)-json.log.\(i)")
+                let to = root.appendingPathComponent("\(containerID)-json.log.\(i+1)")
+                _ = try? FileManager.default.removeItem(at: to)
+                _ = try? FileManager.default.moveItem(at: from, to: to)
+            }
+            let target = root.appendingPathComponent("\(containerID)-json.log.1")
+            _ = try? FileManager.default.removeItem(at: target)
+            _ = try? FileManager.default.moveItem(at: path, to: target)
+        }
+
+        if let fh = FileHandle(forWritingAtPath: path.path) {
+            defer { try? fh.close() }
+            try? fh.seekToEnd()
+            try? fh.write(contentsOf: withNL)
+        } else {
+            try? withNL.write(to: path)
+        }
+    }
+
+    /// Send a POSIX signal (`SIGQUIT`, `SIGTERM`, …) to the container's
+    /// main process by talking to the in-VM `exec_listener` over vsock
+    /// port 9000. The listener reads the PID init wrote at
+    /// `/cocker-child.pid` and calls `kill(pid, signum)`.
+    ///
+    /// Best-effort : a missing listener or closed connection is logged
+    /// and ignored ; the outer stop() loop falls back to VZ's ACPI
+    /// shutdown if the signal didn't trigger an exit within the timeout.
+    private func sendStopSignal(vm: VZVirtualMachine, containerID: String, signal: String) async {
+        guard let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else {
+            fputs("[stopsig] no vsock device for \(containerID)\n", stderr); fflush(stderr)
+            return
+        }
+        let connection: VZVirtioSocketConnection? = await withCheckedContinuation { cont in
+            socketDevice.connect(toPort: 9000) { result in
+                switch result {
+                case .success(let conn): cont.resume(returning: conn)
+                case .failure(let err):
+                    fputs("[stopsig] vsock connect failed for \(containerID): \(err)\n", stderr); fflush(stderr)
+                    cont.resume(returning: nil)
+                }
+            }
+        }
+        guard let connection else { return }
+        defer { _ = connection } // keep alive past the send
+
+        struct SignalReq: Codable { let signal: String }
+        let req = SignalReq(signal: signal)
+        guard let data = try? JSONEncoder().encode(req) else { return }
+        let fd = connection.fileDescriptor
+        _ = data.withUnsafeBytes { buf in
+            Darwin.write(fd, buf.baseAddress!, buf.count)
+        }
+        var nl: UInt8 = 0x0A
+        _ = Darwin.write(fd, &nl, 1)
+
+        // Best-effort read of the listener's one-line ack so the daemon
+        // log shows whether the kill actually landed. We give it 500 ms
+        // — anything slower means the listener is wedged and the ACPI
+        // fallback will handle it.
+        var ackBuf = [UInt8](repeating: 0, count: 64)
+        let deadline = Date().addingTimeInterval(0.5)
+        var got = 0
+        while Date() < deadline && got == 0 {
+            got = ackBuf.withUnsafeMutableBytes { buf in
+                Darwin.read(fd, buf.baseAddress!, buf.count)
+            }
+            if got <= 0 {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                got = 0
+            }
+        }
+        if got > 0 {
+            let ack = String(bytes: ackBuf[0..<got], encoding: .utf8) ?? ""
+            fputs("[stopsig] \(containerID) signal=\(signal) ack=\(ack.trimmingCharacters(in: .whitespacesAndNewlines))\n", stderr); fflush(stderr)
+        }
     }
 
     // MARK: - Exec via vsock
 
-    func exec(containerID: String, command: [String], env: [String: String]) async throws -> AsyncStream<StreamEvent> {
+    func exec(containerID: String, command: [String], env: [String: String], tty: Bool = false, stdin: Data? = nil) async throws -> AsyncStream<StreamEvent> {
         guard let running = runningVMs[containerID] else {
             throw CockerError.containerNotRunning(containerID)
         }
@@ -512,43 +861,229 @@ final class VMRuntime: NSObject {
             throw CockerError.vmCommunicationFailed("No vsock device")
         }
 
+        fputs("[exec] connecting vsock 9000 for container=\(containerID)\n", stderr); fflush(stderr)
         return AsyncStream { continuation in
             socketDevice.connect(toPort: 9000) { result in
                 switch result {
                 case .failure(let error):
-                    continuation.yield(StreamEvent(stream: .error, data: "exec failed: \(error)"))
+                    fputs("[exec] vsock connect failed: \(error)\n", stderr); fflush(stderr)
+                    continuation.yield(StreamEvent(stream: .error,
+                        data: "exec failed: \(error) — the in-VM listener may be unavailable (try `cocker restart \(containerID)`)"))
                     continuation.finish()
                 case .success(let connection):
-                    // Use the file descriptor directly for vsock communication
-                    struct ExecReq: Codable { let cmd: [String]; let env: [String: String] }
-                    let req = ExecReq(cmd: command, env: env)
-                    if let data = try? JSONEncoder().encode(req) {
-                        let fd = connection.fileDescriptor
-                        // Write request + newline
-                        data.withUnsafeBytes { buf in _ = Darwin.write(fd, buf.baseAddress!, buf.count) }
-                        var nl: UInt8 = 0x0A
-                        Darwin.write(fd, &nl, 1)
+                    fputs("[exec] vsock connected fd=\(connection.fileDescriptor)\n", stderr); fflush(stderr)
+                    struct ExecReq: Codable {
+                        let cmd: [String]
+                        let env: [String: String]
+                        let tty: Bool
+                    }
+                    let req = ExecReq(cmd: command, env: env, tty: tty)
+                    guard let data = try? JSONEncoder().encode(req) else {
+                        continuation.yield(StreamEvent(stream: .error, data: "Failed to encode exec request"))
+                        continuation.finish(); return
+                    }
+                    let fd = connection.fileDescriptor
+                    // Request : single JSON line, NL-terminated.
+                    let wrote = data.withUnsafeBytes { buf in
+                        Darwin.write(fd, buf.baseAddress!, buf.count)
+                    }
+                    var nl: UInt8 = 0x0A
+                    let wroteNL = Darwin.write(fd, &nl, 1)
+                    fputs("[exec] wrote req: bytes=\(wrote) nl=\(wroteNL)\n", stderr); fflush(stderr)
 
-                        // Read output line by line
-                        Task.detached {
-                            var buffer = Data()
-                            var chunk = [UInt8](repeating: 0, count: 4096)
-                            while true {
-                                let n = Darwin.read(fd, &chunk, chunk.count)
-                                if n <= 0 { continuation.finish(); break }
-                                buffer.append(contentsOf: chunk.prefix(n))
-                                while let nlIdx = buffer.firstIndex(of: 0x0A) {
-                                    let line = Data(buffer[..<nlIdx])
-                                    buffer = Data(buffer[buffer.index(after: nlIdx)...])
-                                    if let text = String(data: line, encoding: .utf8) {
-                                        continuation.yield(StreamEvent(stream: .stdout, data: text + "\n"))
-                                    }
+                    // After the JSON+NL terminator, anything we write on
+                    // the same vsock fd becomes the child's stdin (the
+                    // guest dup2's the client fd onto STDIN_FILENO in
+                    // the non-TTY branch of exec_listener.c). Stream
+                    // the blob in 64 KB chunks so a multi-MiB heredoc
+                    // doesn't stall the single write() on a small
+                    // socket buffer.
+                    if let stdin, !stdin.isEmpty {
+                        stdin.withUnsafeBytes { buf in
+                            guard let base = buf.baseAddress else { return }
+                            var off = 0
+                            let chunkSize = 64 * 1024
+                            while off < buf.count {
+                                let n = min(chunkSize, buf.count - off)
+                                let w = Darwin.write(fd, base.advanced(by: off), n)
+                                if w <= 0 { break }
+                                off += w
+                            }
+                        }
+                        // Half-close the write side : the in-VM child
+                        // sees EOF on stdin once we shutdown(SHUT_WR).
+                        // Without this, programs like `cat` block
+                        // forever waiting for more input on the still-
+                        // open socket. SHUT_WR keeps the read side up
+                        // so we still receive the child's stdout +
+                        // exit marker on the same fd.
+                        _ = Darwin.shutdown(fd, SHUT_WR)
+                    }
+
+                    // Capture `connection` strongly so ARC doesn't release it
+                    // (and tear down the vsock fd) the moment the callback
+                    // returns. Without this, the host side closes its end
+                    // before the guest can accept().
+                    let retained = connection
+                    Task.detached {
+                        _ = retained  // keep alive for the lifetime of the stream
+                        var buffer = Data()
+                        var chunk = [UInt8](repeating: 0, count: 4096)
+                        let exitMarker = Data("__COCKER_EXIT__".utf8)
+
+                        /// Flush whatever leading bytes precede the exit
+                        /// marker — without this, the last chunk of stdout
+                        /// (which may not end in '\n') gets eaten when the
+                        /// marker arrives on the same read.
+                        func flush(_ prefix: Data) {
+                            guard !prefix.isEmpty,
+                                  let text = String(data: prefix, encoding: .utf8)
+                            else { return }
+                            continuation.yield(StreamEvent(stream: .stdout, data: text))
+                        }
+
+                        while true {
+                            let n = Darwin.read(fd, &chunk, chunk.count)
+                            if n <= 0 { continuation.finish(); break }
+                            buffer.append(contentsOf: chunk.prefix(n))
+
+                            // The exit marker can land mid-buffer next to
+                            // unfinished output ; scan for it explicitly.
+                            if let r = buffer.range(of: exitMarker) {
+                                flush(buffer[..<r.lowerBound])
+                                let tail = buffer[r.upperBound...]
+                                // Parse exit code up to a newline (or EOF).
+                                let codeBytes: Data
+                                if let nl = tail.firstIndex(of: 0x0A) {
+                                    codeBytes = Data(tail[..<nl])
+                                } else {
+                                    codeBytes = Data(tail)
+                                }
+                                if let codeStr = String(data: codeBytes, encoding: .utf8) {
+                                    continuation.yield(StreamEvent(stream: .status,
+                                                                   data: "exit:\(codeStr)"))
+                                }
+                                continuation.finish()
+                                return
+                            }
+                            // Otherwise, drain complete lines.
+                            while let nlIdx = buffer.firstIndex(of: 0x0A) {
+                                let line = Data(buffer[..<nlIdx])
+                                buffer = Data(buffer[buffer.index(after: nlIdx)...])
+                                if let text = String(data: line, encoding: .utf8) {
+                                    continuation.yield(StreamEvent(stream: .stdout,
+                                                                   data: text + "\n"))
                                 }
                             }
                         }
-                    } else {
-                        continuation.yield(StreamEvent(stream: .error, data: "Failed to encode exec request"))
-                        continuation.finish()
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Single-shot resume guard. NSLock-backed so the timeout / connect
+/// callbacks can race from different queues without double-resuming the
+/// continuation.
+final class ResumeOnceBox: @unchecked Sendable {
+    private var claimed = false
+    private let lock = NSLock()
+    func tryClaim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
+    }
+}
+
+extension VMRuntime {
+    /// Synchronous one-shot exec for healthchecks. Connects to vsock 9000,
+    /// sends the request, reads until the exit marker or `timeout` seconds
+    /// elapse, and tears down the connection unconditionally. Returns the
+    /// child's exit code, or 1 on any transport/timeout failure.
+    ///
+    /// **Known limitation** : Apple's VZVirtioSocketDevice.connect()
+    /// callback fails to fire when called repeatedly from a background
+    /// async context (the manual-exec path works because the AsyncStream's
+    /// iteration happens to keep the right queue alive). The probe will
+    /// reliably hit its `timeout` and the container's healthStatus flips
+    /// to `.unhealthy`. We keep the loop wired so future Apple updates
+    /// (or a workaround using a dedicated process-per-probe) drop in
+    /// cleanly without touching ContainerEngine.
+    func execProbe(containerID: String,
+                   argv: [String],
+                   timeout: TimeInterval) async -> Int32 {
+        guard let socketDevice = runningVMs[containerID]?.vm.socketDevices.first as? VZVirtioSocketDevice else {
+            fputs("[probe] no VM/socket for \(containerID)\n", stderr); fflush(stderr)
+            return 1
+        }
+        fputs("[probe] connecting vsock 9000 for \(containerID)\n", stderr); fflush(stderr)
+
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
+            let resumeBox = ResumeOnceBox()
+            func resumeOnce(_ code: Int32) {
+                if resumeBox.tryClaim() { continuation.resume(returning: code) }
+            }
+
+            // Hard deadline : if no callback fires within `timeout` we
+            // count it as failed and drop the probe on the floor.
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                resumeOnce(1)
+            }
+
+            socketDevice.connect(toPort: 9000) { result in
+                switch result {
+                case .failure(let err):
+                    fputs("[probe] connect failed: \(err)\n", stderr); fflush(stderr)
+                    resumeOnce(1)
+                case .success(let connection):
+                    let fd = connection.fileDescriptor
+                    fputs("[probe] connected fd=\(fd)\n", stderr); fflush(stderr)
+                    struct Req: Codable { let cmd: [String]; let env: [String: String] }
+                    guard let data = try? JSONEncoder().encode(Req(cmd: argv, env: [:])) else {
+                        resumeOnce(1); return
+                    }
+                    let retained = connection  // keep ARC happy during the read
+
+                    DispatchQueue.global().async {
+                        _ = retained
+                        defer {
+                            // Best-effort fd cleanup. The connection retains
+                            // its end ; closing the dup'd fd via shutdown is
+                            // safe because we own the read side.
+                            shutdown(fd, SHUT_RDWR)
+                        }
+                        // Write request + NL.
+                        let wrote = data.withUnsafeBytes {
+                            Darwin.write(fd, $0.baseAddress!, $0.count)
+                        }
+                        var nl: UInt8 = 0x0A
+                        _ = Darwin.write(fd, &nl, 1)
+                        if wrote <= 0 { resumeOnce(1); return }
+
+                        var buffer = Data()
+                        var chunk = [UInt8](repeating: 0, count: 4096)
+                        let marker = Data("__COCKER_EXIT__".utf8)
+                        let readDeadline = Date().addingTimeInterval(timeout)
+                        while Date() < readDeadline {
+                            let n = Darwin.read(fd, &chunk, chunk.count)
+                            if n <= 0 { break }
+                            buffer.append(contentsOf: chunk.prefix(n))
+                            if let r = buffer.range(of: marker) {
+                                let tail = buffer[r.upperBound...]
+                                let codeBytes: Data
+                                if let nlIdx = tail.firstIndex(of: 0x0A) {
+                                    codeBytes = Data(tail[..<nlIdx])
+                                } else {
+                                    codeBytes = Data(tail)
+                                }
+                                let codeStr = String(data: codeBytes, encoding: .utf8) ?? ""
+                                resumeOnce(Int32(codeStr) ?? 1)
+                                return
+                            }
+                        }
+                        resumeOnce(1)
                     }
                 }
             }

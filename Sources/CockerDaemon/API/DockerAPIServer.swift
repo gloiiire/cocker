@@ -14,6 +14,14 @@ final class DockerAPIServer {
     private var serverFD: Int32 = -1
     private var isRunning = false
 
+    /// Compatibility shim — the canonical formatter now lives in CockerCore
+    /// so `cocker inspect` and the Docker API agree byte-for-byte on the
+    /// same timestamp. Kept here so existing tests against
+    /// `DockerAPIServer.rfc3339Nano` still resolve.
+    nonisolated static func rfc3339Nano(_ date: Date) -> String {
+        CockerCore.rfc3339Nano(date)
+    }
+
     // In-flight exec sessions: execID -> container ID + command
     private var execSessions: [String: ExecSession] = [:]
 
@@ -60,7 +68,11 @@ final class DockerAPIServer {
             throw CockerError.internalError("docker.sock: listen() failed")
         }
 
-        chmod(socketPath, 0o666)
+        // Same secrecy contract as the native IPC socket : 0600 means
+        // only the cockerd owner can drive the daemon. Anyone with this
+        // socket can run privileged containers, bind-mount the host, and
+        // exec into them as root — treat it like an SSH key.
+        chmod(socketPath, 0o600)
         self.serverFD = fd
         self.isRunning = true
         CockerLog.shared.info("docker-api", "listening on \(socketPath)")
@@ -95,6 +107,46 @@ final class DockerAPIServer {
             await routeRequest(request, fd: fd)
             if !keepAlive { break }
         }
+    }
+
+    /// TLS-TCP bridge entry point. Network.framework's NWConnection
+    /// doesn't expose a raw socket FD, so `DockerAPITLSListener`
+    /// builds two pipes : one for the request body (readFD) and one
+    /// for the response (writeFD). This method drives the same
+    /// `routeRequest` path as the Unix socket loop, just with the
+    /// read and write halves split. One request per call ; TLS
+    /// pipelining is rare in Docker clients.
+    /// In-memory request → response path used by `DockerAPITLSListener`
+    /// to keep TLS traffic out of the fd-pipe bridge (which proved
+    /// fragile because Foundation `Pipe` deinits close fds, the kernel
+    /// reuses fd numbers, and bytes leaked across pipes). This drains
+    /// the response into a `socketpair(AF_UNIX, SOCK_STREAM)` so the
+    /// existing `(req, fd)` handlers can write headers + body normally
+    /// — we just read the other end of the socketpair afterward.
+    func routeAndSerialize(_ req: HTTPRequest) async -> Data {
+        var fds: [Int32] = [-1, -1]
+        let rc = fds.withUnsafeMutableBufferPointer { buf in
+            socketpair(AF_UNIX, SOCK_STREAM, 0, buf.baseAddress)
+        }
+        guard rc == 0 else {
+            // Fall back to a minimal 500 if we can't even allocate a
+            // socketpair. Unlikely outside of fd-exhaustion.
+            let r = HTTPResponse.error("internal: socketpair failed", status: 500)
+            return r.serialize()
+        }
+        let writerFD = fds[0]
+        let readerFD = fds[1]
+        await routeRequest(req, fd: writerFD)
+        close(writerFD)
+        var collected = Data()
+        var buf = [UInt8](repeating: 0, count: 16 * 1024)
+        while true {
+            let n = Darwin.read(readerFD, &buf, buf.count)
+            if n <= 0 { break }
+            collected.append(contentsOf: buf.prefix(Int(n)))
+        }
+        close(readerFD)
+        return collected
     }
 
     // MARK: - Router
@@ -271,6 +323,36 @@ final class DockerAPIServer {
             response = HTTPResponse(status: 200, headers: ["Content-Type": "application/json"],
                                     body: Data(#"{"ImagesDeleted":[],"SpaceReclaimed":0}"#.utf8))
 
+        // ── Image history ────────────────────────────────────────
+        // Returns one history entry per layer for `docker history <img>` /
+        // `docker image history`. Cocker doesn't track per-instruction
+        // history yet ; we synthesise one entry per layer digest so the
+        // common consumer (a UI listing layer sizes) gets a reasonable
+        // shape instead of a 501.
+        case ("GET", "images") where segments.count == 3 && segments[2] == "history":
+            response = await handleImageHistory(name: segments[1])
+
+        // ── Container filesystem diff (no-op) ────────────────────
+        // `docker container diff <id>` lists files added/changed/deleted
+        // since the image's rootfs. Cocker runs each container as a real
+        // VM with a clonefile rootfs and doesn't keep a baseline diff ;
+        // we return an empty list rather than a 501 so tooling like
+        // Portainer doesn't error out at inspect time.
+        case ("GET", "containers") where segments.count == 3 && segments[2] == "changes":
+            response = .json([DockerEmpty]())
+
+        // ── Ping / version handshake ─────────────────────────────
+        // `docker version` issues GET /_ping (and tolerates the HEAD
+        // variant) before its real handshake. Bare 200 OK with the
+        // text body "OK" matches dockerd's response byte-for-byte.
+        case ("GET", "_ping"), ("HEAD", "_ping"):
+            response = HTTPResponse(status: 200,
+                headers: ["Content-Type": "text/plain",
+                          "Api-Version": "1.41",
+                          "Docker-Experimental": "false",
+                          "Cocker-Version": CockerVersion.version],
+                body: Data("OK".utf8))
+
         default:
             print("[docker-api] Unhandled: \(method) \(path)")
             response = .error("Not implemented: \(method) \(path)", status: 501)
@@ -365,15 +447,37 @@ final class DockerAPIServer {
     private func handleEvents(req: HTTPRequest, fd: Int32) async {
         let writer = HTTPStreamWriter(fd: fd)
         writer.writeHeaders(contentType: "application/json")
+        // Docker passes filter dicts URL-encoded as JSON via `?filters=`.
+        // We parse the three most-used keys (event/type/container) and
+        // drop everything else — matches `docker events --filter` usage
+        // in the wild without dragging in the full filter language.
+        let filterSpec = Self.parseEventsFilter(req.query["filters"])
         let stream = await engine.eventStream()
         for await event in stream {
+            // Engine event wire format is "<type>\t<action>\t<id>" — split
+            // it back into the proper Docker fields so `docker events` /
+            // any filter consumer sees the canonical shape (Action,
+            // Actor.ID, Type) rather than a single status blob.
+            let parts = event.data.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            let type = parts.count > 0 ? String(parts[0]) : "container"
+            let action = parts.count > 1 ? String(parts[1]) : event.data
+            let id = parts.count > 2 ? String(parts[2]) : ""
+            // Docker's filter `--filter event=health_status` matches against
+            // Action's prefix before the colon (`health_status: healthy`
+            // matches `event=health_status`). Keep the full string in Action
+            // for downstream consumers ; only the filter compares the prefix.
+            let actionKey = action.split(separator: ":", maxSplits: 1).first.map(String.init) ?? action
+            if !filterSpec.events.isEmpty && !filterSpec.events.contains(actionKey) { continue }
+            if !filterSpec.types.isEmpty && !filterSpec.types.contains(type) { continue }
+            if !filterSpec.containerIDs.isEmpty
+                && !filterSpec.containerIDs.contains(where: { id.hasPrefix($0) }) { continue }
             let dockerEvent = DockerEvent(
-                status: event.data,
-                id: "",
+                status: action,
+                id: id,
                 from: "",
-                eventType: "container",
-                Action: event.data,
-                Actor: .init(ID: "", Attributes: [:]),
+                eventType: type,
+                Action: action,
+                Actor: .init(ID: id, Attributes: [:]),
                 scope: "local",
                 time: Int64(Date().timeIntervalSince1970),
                 timeNano: Int64(Date().timeIntervalSince1970 * 1_000_000_000)
@@ -383,6 +487,32 @@ final class DockerAPIServer {
             }
         }
         writer.finish()
+    }
+
+    struct EventsFilterSpec {
+        var events: Set<String>
+        var types: Set<String>
+        var containerIDs: Set<String>
+    }
+
+    /// Parse Docker's `?filters=<url-encoded-json>` URL parameter into a
+    /// minimal `EventsFilterSpec`. Docker's wire format is a JSON object
+    /// whose values are arrays of strings :
+    ///   `{"event":["start","health_status"],"container":["abc123"]}`.
+    /// Missing / malformed payload → empty filter (matches all).
+    nonisolated static func parseEventsFilter(_ raw: String?) -> EventsFilterSpec {
+        guard let raw, !raw.isEmpty,
+              let data = raw.removingPercentEncoding?.data(using: .utf8)
+                       ?? raw.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: [String]]
+        else {
+            return EventsFilterSpec(events: [], types: [], containerIDs: [])
+        }
+        return EventsFilterSpec(
+            events: Set(obj["event"] ?? []),
+            types: Set(obj["type"] ?? []),
+            containerIDs: Set(obj["container"] ?? [])
+        )
     }
 
     // MARK: - Container handlers
@@ -777,6 +907,37 @@ final class DockerAPIServer {
         return .json(DockerImageSummary(from: img))
     }
 
+    /// `GET /images/<name>/history` — one entry per layer digest. Cocker
+    /// doesn't track per-instruction history yet ; we fabricate the bare
+    /// minimum shape (`Id`, `Size`, `Created`, `CreatedBy: <empty>`) so
+    /// the common consumer pattern (UIs listing layer sizes / counts)
+    /// works against the Docker socket the same way it does against
+    /// dockerd. Returns `[{}]` placeholder array if the image has no
+    /// layers recorded, matching Docker's "empty image" response.
+    private func handleImageHistory(name: String) async -> HTTPResponse {
+        guard let img = try? await engine.images.find(name) else { return .notFound(name) }
+        struct HistoryEntry: Encodable {
+            let Id: String
+            let Created: Int64
+            let CreatedBy: String
+            let Size: Int64
+            let Comment: String
+            let Tags: [String]?
+        }
+        let created = Int64(img.createdAt.timeIntervalSince1970)
+        let entries: [HistoryEntry] = img.layers.enumerated().map { (idx, digest) in
+            HistoryEntry(
+                Id: digest,
+                Created: created,
+                CreatedBy: "(layer \(idx + 1)/\(img.layers.count))",
+                Size: 0,
+                Comment: "",
+                Tags: idx == img.layers.count - 1 ? ["\(img.repository):\(img.tag)"] : nil
+            )
+        }
+        return .json(entries)
+    }
+
     private func handleImageRemove(name: String, req: HTTPRequest) async -> HTTPResponse {
         struct DeleteResponse: Encodable { let Untagged: String?; let Deleted: String? }
         do {
@@ -975,11 +1136,32 @@ final class DockerAPIServer {
                 Pid: c.status == .running ? 1 : 0,
                 ExitCode: Int(c.exitCode ?? 0), Error: "",
                 StartedAt: c.startedAt.map { iso.string(from: $0) } ?? "0001-01-01T00:00:00Z",
-                FinishedAt: c.finishedAt.map { iso.string(from: $0) } ?? "0001-01-01T00:00:00Z"
+                FinishedAt: c.finishedAt.map { iso.string(from: $0) } ?? "0001-01-01T00:00:00Z",
+                Health: (c.healthcheck != nil && !(c.healthcheck?.isDisabled ?? true))
+                    ? DockerHealth(
+                        Status: c.healthStatus.rawValue,
+                        FailingStreak: c.healthFailingStreak,
+                        // Docker writes RFC 3339 with nanoseconds
+                        // (`2026-06-07T21:27:55.123456789Z`) — Go template
+                        // parsers reading `.State.Health.Log[].Start` as
+                        // `time.Time` choke on second-resolution. Format
+                        // with nanos here even when the underlying Date
+                        // only carries microseconds ; round-trips through
+                        // both the Docker CLI and Go's encoding/json.
+                        Log: c.healthLog.map {
+                            DockerHealthLogEntry(
+                                Start: Self.rfc3339Nano($0.start),
+                                End: Self.rfc3339Nano($0.end),
+                                ExitCode: Int($0.exitCode),
+                                Output: $0.output
+                            )
+                        }
+                    )
+                    : nil
             ),
             Image: c.image,
             Name: "/\(c.name)",
-            RestartCount: 0,
+            RestartCount: c.restartCount,
             HostConfig: DockerHostConfig(
                 Binds: c.volumes.filter { $0.source.hasPrefix("/") }.map { "\($0.source):\($0.destination)" },
                 NetworkMode: c.networkMode.rawValue,

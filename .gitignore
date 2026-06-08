@@ -1,4 +1,5 @@
 .build/
+.build.nosync/
 *.o
 *.d
 .swiftpm/
@@ -8,3 +9,11 @@ DerivedData/
 .DS_Store
 *.tar
 *.gz
+
+# iCloud Drive placeholder files (the daemon dir uses them for downloads).
+.fl*
+
+# Root-level initrd.img is a stray leftover from manual repacking
+# experiments — the real one lives at cocker-init/initrd.img and is
+# the only copy any code reads.
+/initrd.img

@@ -131,14 +131,20 @@ struct BuildCommand: AsyncParsableCommand {
     var context: String = "."
 
     mutating func run() async throws {
-        var config = BuildConfig(contextPath: context, tag: tag.isEmpty ? "cocker-image:\(Int(Date().timeIntervalSince1970))" : tag)
+        // The daemon runs in its own cwd, so relative build paths sent over
+        // IPC resolve against the daemon's directory, not the user's. Always
+        // anchor against the CLI's cwd before sending.
+        let cwd = FileManager.default.currentDirectoryPath
+        let absContext = context.hasPrefix("/") ? context : cwd + "/" + context
+
+        var config = BuildConfig(contextPath: absContext, tag: tag.isEmpty ? "cocker-image:\(Int(Date().timeIntervalSince1970))" : tag)
         config.dockerfile = file
         config.buildArgs = try parseKV(buildArgs)
         config.noCache = noCache
         config.target = target
         config.platform = platform
 
-        print("Building \(ANSI.colored(config.tag, ANSI.cyan)) from \(context)/\(file)...")
+        print("Building \(ANSI.colored(config.tag, ANSI.cyan)) from \(absContext)/\(file)...")
 
         let client = IPCClient()
         let payload = BuildRequest(config: config)

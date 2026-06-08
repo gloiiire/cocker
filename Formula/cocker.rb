@@ -1,9 +1,10 @@
 class Cocker < Formula
   desc "Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework"
   homepage "https://github.com/gloiiire/cocker"
-  version "0.2.1"
+  version "0.5.0"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
-  sha256 "ace56c3d6a0b73432a19c43c95fb5de9c32f18946782280a04b2c612651d6231"
+  # Placeholder — replace with `shasum -a 256` of the actual release tarball.
+  sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
   license "MIT"
   head "https://github.com/gloiiire/cocker.git", branch: "main"
 
@@ -18,15 +19,20 @@ class Cocker < Formula
 
     # 2. Build cocker-init (static Linux ARM64 binary) via zig, package into initrd.img
     cd "cocker-init" do
-      # The init binary was split into 6 translation units in v0.2.x —
-      # init.c is now a thin orchestrator over cmdline / net / dns_proxy /
-      # spec / qemu. zig handles them in one shot.
+      # Translation units : init / cmdline / net / dns_proxy / spec / qemu
+      # (orig) + exec_listener.c (Sprint 2 — vsock exec relay)
+      #        + caps.c (Sprint 3 — Linux capabilities via prctl)
+      #        + health_poll.c (v0.4.0 — virtiofs healthcheck worker).
+      # -Wl,-s strips at link time : macOS `strip` cannot process Linux
+      # ELF (silent warning, binary stays 1.6 MB). Linker-side strip
+      # gets us a 70 KB statically-linked binary.
       system "zig", "cc",
              "-target", "aarch64-linux-musl",
-             "-static", "-O2", "-Wall",
+             "-static", "-O2", "-Wall", "-Wl,-s",
              "-o", "cocker-init",
-             "init.c", "cmdline.c", "net.c", "dns_proxy.c", "spec.c", "qemu.c"
-      system "strip", "cocker-init"
+             "init.c", "cmdline.c", "net.c", "dns_proxy.c",
+             "spec.c", "qemu.c", "exec_listener.c", "caps.c",
+             "health_poll.c"
       cp "cocker-init", "initrd-staging/init"
       chmod 0755, "initrd-staging/init"
       cd "initrd-staging" do
@@ -115,6 +121,49 @@ class Cocker < Formula
 
     cp share/"cocker/initrd.img", kernel_dir/"initrd.img"
     ohai "Installed initrd: #{kernel_dir}/initrd.img"
+
+    # --- 3. Lease-pool helper LaunchDaemon (one-time root install) ---
+    # macOS vmnet's bootpd saturates around 256 DHCP leases ; without
+    # this helper the user gets sudo-prompted every time they need to
+    # clear the file. Skipping silently if we can't get root.
+    helper_plist = Pathname.new("/Library/LaunchDaemons/com.cocker.leases-helper.plist")
+    if helper_plist.exist?
+      ohai "Lease helper already installed at #{helper_plist}"
+    else
+      tmp_plist = Pathname.new(Dir.tmpdir)/"com.cocker.leases-helper.plist"
+      tmp_plist.write <<~PLIST
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>Label</key>
+          <string>com.cocker.leases-helper</string>
+          <key>ProgramArguments</key>
+          <array>
+            <string>/bin/sh</string>
+            <string>-c</string>
+            <string>while true; do if [ -f /var/run/cocker-clear-leases ]; then echo > /var/db/dhcpd_leases; rm -f /var/run/cocker-clear-leases; fi; sleep 1; done</string>
+          </array>
+          <key>RunAtLoad</key>
+          <true/>
+          <key>KeepAlive</key>
+          <true/>
+          <key>StandardErrorPath</key>
+          <string>/var/log/cocker-leases-helper.log</string>
+        </dict>
+        </plist>
+      PLIST
+      ohai "Installing lease helper LaunchDaemon (sudo prompt) ..."
+      begin
+        system "sudo", "install", "-m", "644", "-o", "root", "-g", "wheel",
+               tmp_plist.to_s, helper_plist.to_s
+        system "sudo", "launchctl", "bootstrap", "system", helper_plist.to_s
+        ohai "Lease helper installed."
+      rescue
+        opoo "Could not install lease helper — `cocker daemon clear-leases` will prompt for sudo each time."
+      end
+      tmp_plist.unlink if tmp_plist.exist?
+    end
   end
 
   service do

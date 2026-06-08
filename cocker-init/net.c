@@ -39,6 +39,31 @@ void net_bring_up_loopback(void) {
     close(s);
 }
 
+/* Spawn a DHCP client and return its exit code, or -1 on fork failure.
+ * Splits the spawn out of run_dhcp_client so the caller can retry. */
+static int spawn_dhcp_attempt(const char *client) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (strstr(client, "udhcpc")) {
+            /* -t 10 : up to 10 DISCOVER packets at 1 s intervals before
+             *         giving up. The default 3 races against vmnet's
+             *         bootpd, especially on cold-cache VM cold boots.
+             * -n    : exit (don't daemonize) on lease failure
+             * -q    : exit (don't daemonize) on lease success
+             * -f    : foreground (no syslog detach) so wait() works.   */
+            execl(client, "udhcpc", "-i", "eth0",
+                  "-t", "10", "-n", "-q", "-f", (char *)NULL);
+        } else {
+            execl(client, "dhclient", "-1", "eth0", (char *)NULL);
+        }
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
 static void run_dhcp_client(void) {
     /* Several distros, several paths — busybox in Alpine, dhclient elsewhere. */
     const char *clients[] = {
@@ -46,25 +71,23 @@ static void run_dhcp_client(void) {
         "/sbin/dhclient", "/usr/sbin/dhclient",
         NULL,
     };
+    const char *client = NULL;
     for (int i = 0; clients[i]; i++) {
-        if (access(clients[i], X_OK) != 0) continue;
-        pid_t pid = fork();
-        if (pid < 0) return;
-        if (pid == 0) {
-            if (strstr(clients[i], "udhcpc")) {
-                execl(clients[i], "udhcpc", "-i", "eth0",
-                      "-t", "3", "-n", "-q", "-f", (char *)NULL);
-            } else {
-                execl(clients[i], "dhclient", "-1", "eth0", (char *)NULL);
-            }
-            _exit(127);
-        }
-        info("started DHCP client %s (pid %d)", clients[i], pid);
-        int status;
-        waitpid(pid, &status, 0);
-        return;
+        if (access(clients[i], X_OK) == 0) { client = clients[i]; break; }
     }
-    info("no DHCP client found (udhcpc/dhclient)");
+    if (!client) { info("no DHCP client found (udhcpc/dhclient)"); return; }
+
+    /* Two attempts back-to-back. If the first udhcpc exits non-zero, vmnet's
+     * bootpd may not have been ready yet (cold cache) — a 1 s sleep usually
+     * smooths it out. cockerd has a host-side fallback via
+     * /var/db/dhcpd_leases for the case where this still fails. */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        info("started DHCP client %s (attempt %d)", client, attempt + 1);
+        int rc = spawn_dhcp_attempt(client);
+        if (rc == 0) return;
+        info("DHCP attempt %d failed (rc=%d)", attempt + 1, rc);
+        sleep(1);
+    }
 }
 
 static void report_eth0_ip(void) {
@@ -98,6 +121,15 @@ static void report_eth0_ip(void) {
 }
 
 void net_setup_eth0_dhcp(void) {
+    /* The rootfs we boot from is a clonefile of the image's rootfs, so a
+     * stale /cocker-ip from a previous build VM or container persists into
+     * fresh containers. cockerd polls that file every 100 ms ; if it reads
+     * the stale value before we get around to overwriting it after DHCP,
+     * port-forwarding gets wired to the wrong IP. Truncate up front so
+     * cockerd sees an empty file (and keeps polling) until DHCP succeeds. */
+    int trunc_fd = open("/cocker-ip", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (trunc_fd >= 0) close(trunc_fd);
+
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     if (s >= 0) {
         if (ifup(s, "eth0") != 0) info("ifup eth0: %s", strerror(errno));

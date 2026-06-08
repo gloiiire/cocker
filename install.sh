@@ -61,9 +61,14 @@ MAN_SRC=".build/plugins/GenerateManual/outputs/CockerCLI"
 ok "$(ls "$MAN_SRC"/*.1 | wc -l | tr -d ' ') man pages generated"
 
 info "Building cocker-init (Linux ARM64 static)..."
+# All translation units : init.c is the main PID 1 entry, the rest are
+# split-by-responsibility modules. -Wl,-s strips at link time (macOS
+# `strip` silently fails on Linux ELF — bloat from 70 KB → 1.6 MB if
+# you skip it).
 (cd cocker-init &&
- zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init init.c cmdline.c net.c dns_proxy.c spec.c qemu.c &&
- strip cocker-init &&
+ zig cc -target aarch64-linux-musl -static -O2 -Wall -Wl,-s -o cocker-init \
+     init.c cmdline.c net.c dns_proxy.c spec.c qemu.c \
+     exec_listener.c caps.c health_poll.c &&
  cp cocker-init initrd-staging/init &&
  chmod +x initrd-staging/init &&
  (cd initrd-staging && find . | cpio -o -H newc 2>/dev/null) | gzip -9 > initrd.img)
@@ -150,6 +155,45 @@ if ! manpath 2>/dev/null | tr ':' '\n' | grep -qx "$MAN_ROOT"; then
   echo "        export MANPATH=\"$MAN_ROOT:\$(manpath 2>/dev/null)\""
 else
   ok "$MAN_ROOT dans MANPATH — essaye : man cocker"
+fi
+
+# 11. Lease pool auto-clean helper (one-time root install)
+HELPER_PLIST="/Library/LaunchDaemons/com.cocker.leases-helper.plist"
+if [ -f "$HELPER_PLIST" ]; then
+  ok "Lease helper LaunchDaemon déjà installé"
+else
+  info "Installation du lease pool helper (sudo prompt unique)…"
+  TMP_PLIST="$(mktemp)"
+  cat > "$TMP_PLIST" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cocker.leases-helper</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>while true; do if [ -f /var/run/cocker-clear-leases ]; then echo > /var/db/dhcpd_leases; rm -f /var/run/cocker-clear-leases; fi; sleep 1; done</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>/var/log/cocker-leases-helper.log</string>
+</dict>
+</plist>
+PLIST
+  if sudo install -m 644 -o root -g wheel "$TMP_PLIST" "$HELPER_PLIST" \
+     && (sudo launchctl bootstrap system "$HELPER_PLIST" 2>/dev/null \
+         || sudo launchctl load "$HELPER_PLIST"); then
+    ok "Lease helper installé — plus de prompt sudo pour vider la pool"
+  else
+    warn "Lease helper non installé — utilise \`cocker daemon clear-leases\` si vmnet sature"
+  fi
+  rm -f "$TMP_PLIST"
 fi
 
 echo
