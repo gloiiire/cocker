@@ -443,7 +443,7 @@ public struct UpdateRequest: Codable, Sendable {
 public enum CockerVersion {
     // Bumped manually with each tag. TODO : drive from a Version.generated.swift
     // produced by the release workflow so this can't drift again.
-    public static let version = "0.5.0"
+    public static let version = "0.5.1"
     public static let apiVersion = "1.0"
     public static let buildTime = "2026-06-08"
     public static let minAPIVersion = "1.0"
