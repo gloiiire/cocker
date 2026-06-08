@@ -436,10 +436,34 @@ private struct DaemonPaths {
 }
 
 private func defaultPaths() -> DaemonPaths {
-    let root = URL(fileURLWithPath: NSHomeDirectory())
-        .appendingPathComponent(".cocker")
+    // Derive root from env so SUFFIX=-dev installs (wrapper sets
+    // COCKER_HOST=unix://~/.cocker-dev/cocker.sock) don't accidentally
+    // operate on the prod data dir. Order of precedence : explicit
+    // COCKER_ROOT > COCKER_HOST socket dirname > ~/.cocker fallback.
+    // `daemon start` propagates the resolved root to cockerd as
+    // --root/--socket args ; without this the subcommand spawned a
+    // prod-rooted daemon even when the wrapper set COCKER_HOST.
+    let root: URL
+    if let envRoot = ProcessInfo.processInfo.environment["COCKER_ROOT"], !envRoot.isEmpty {
+        root = URL(fileURLWithPath: envRoot)
+    } else if let host = ProcessInfo.processInfo.environment["COCKER_HOST"],
+              host.hasPrefix("unix://") {
+        let sock = String(host.dropFirst("unix://".count))
+        root = URL(fileURLWithPath: sock).deletingLastPathComponent()
+    } else {
+        root = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".cocker")
+    }
     try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     return DaemonPaths(root: root)
+}
+
+/// True when `paths.root` isn't the conventional ~/.cocker default.
+/// Used by `daemon start` to decide whether to pass --root/--socket to
+/// the cockerd it spawns (no-args = ~/.cocker for backwards compat).
+private func isNonDefaultRoot(_ root: URL) -> Bool {
+    let defaultRoot = URL(fileURLWithPath: NSHomeDirectory())
+        .appendingPathComponent(".cocker")
+    return root.standardizedFileURL.path != defaultRoot.standardizedFileURL.path
 }
 
 /// Read the PID from the PID file ; nil if the file doesn't exist or is
@@ -549,6 +573,17 @@ struct DaemonStartCommand: AsyncParsableCommand {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cockerd)
+        // For SUFFIX=-dev installs the wrapper sets COCKER_HOST and our
+        // defaultPaths() derives a non-default root from it. Pass that
+        // through as explicit --root/--socket flags so the spawned daemon
+        // uses the alternate data dir instead of falling back to the
+        // ~/.cocker hard-coded default.
+        if isNonDefaultRoot(paths.root) {
+            proc.arguments = [
+                "--root",   paths.root.path,
+                "--socket", paths.ipcSock.path,
+            ]
+        }
         proc.standardOutput = log
         proc.standardError = log
         proc.standardInput = FileHandle(forReadingAtPath: "/dev/null")
