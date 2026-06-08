@@ -235,7 +235,7 @@ jobs:
     # actually work" signal for releases.
     name: e2e smoke (best-effort)
     runs-on: macos-15
-    needs: [swift-tests, release-build, cocker-init-build]
+    needs: [swift-tests, swift-build-release, cocker-init-build]
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
