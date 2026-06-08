@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.5.1 — Release pipeline patch (no code changes vs 0.5.0)
+
+Patch release. No behaviour change for users compared to 0.5.0 ; the only
+diff is a one-line CI fix in `.github/workflows/release.yml`.
+
+### What this fixes
+- The `release.yml` workflow that runs on `v*` tag pushes had a stale
+  `zig cc` invocation that did not list `exec_listener.c`, `caps.c`, and
+  `health_poll.c`. These three .c files joined `cocker-init/` during
+  Sprints 11 + 13 but the workflow's source list wasn't updated. On
+  the v0.5.0 tag push, the cross-compile step failed with three
+  `undefined symbol` errors (`exec_listener_spawn`, `caps_apply`,
+  `health_poll_spawn`) and the GitHub Release shipped without its
+  signed binaries.
+- v0.5.0's `brew install` path was unaffected (the Homebrew tap pinned
+  the source tarball, build-from-source worked fine). Only the GitHub
+  Release page assets were missing.
+
+### Why bump the version
+
+We could have just left `release.yml` fixed on `main` and waited for
+the next "real" release to validate the pipeline. Tagging a release
+that's only a CI fix isn't ideal in SemVer-purist terms. We did it
+anyway for two practical reasons :
+- The pipeline fix is **never exercised** until a tag is pushed. Better
+  to discover any remaining bugs now, with a low-stakes patch, than at
+  the next feature release.
+- v0.5.0's GitHub Release page lacks signed binaries forever (we can't
+  rebuild them without invalidating the Homebrew tap's pinned sha256).
+  v0.5.1 ships those binaries.
+
 ## 0.5.0 — Remote-prod TLS docker.sock + ECDSA identities (Sprint 13)
 
 ### Remote prod : `DOCKER_HOST=tcp://…:2376`
