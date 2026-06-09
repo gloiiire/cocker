@@ -350,7 +350,8 @@ actor ComposeEngine {
                 service: service,
                 serviceName: serviceName,
                 projectName: projectName,
-                compose: compose
+                compose: compose,
+                composePath: request.composePath
             )
 
             let id = try await containerEngine.run(config: runConfig)
@@ -460,7 +461,7 @@ actor ComposeEngine {
             throw CockerError.invalidComposeFile("Service '\(serviceName)' not found")
         }
 
-        let runConfig = try buildRunConfig(service: service, serviceName: serviceName, projectName: projectName, compose: compose)
+        let runConfig = try buildRunConfig(service: service, serviceName: serviceName, projectName: projectName, compose: compose, composePath: request.composePath)
         let id = try await containerEngine.run(config: runConfig)
         progressHandler(StreamEvent(stream: .status, data: "Started container \(String(id.prefix(12)))\n"))
     }
@@ -519,11 +520,136 @@ actor ComposeEngine {
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
             throw CockerError.invalidComposeFile("Cannot read file: \(path)")
         }
+        // Docker Compose variable substitution: ${VAR}, ${VAR:-default},
+        // ${VAR-default}, $VAR, $$. Without this, a compose file that uses
+        // ${POSTGRES_USER:-cidgroupe} would pass the literal string (with
+        // `$`, `{`, etc.) as an env var value into the container — which
+        // breaks anything that validates input chars (e.g. postgres
+        // "invalid character in extension owner").
+        let composeDir = URL(fileURLWithPath: path).deletingLastPathComponent().path
+        let subEnv = Self.composeSubstitutionEnv(composeDir: composeDir)
+        let expanded = Self.expandVariables(in: content, env: subEnv)
         do {
-            return try YAMLDecoder().decode(ComposeFile.self, from: content)
+            return try YAMLDecoder().decode(ComposeFile.self, from: expanded)
         } catch {
             throw CockerError.invalidComposeFile("YAML parse error: \(error)")
         }
+    }
+
+    /// Build the env map used for `${VAR}` substitution in the compose file.
+    /// Per the Compose spec, values come from the project `.env` file in the
+    /// compose dir (if present), then host environment wins on conflict.
+    static func composeSubstitutionEnv(composeDir: String) -> [String: String] {
+        var env: [String: String] = [:]
+        let dotEnv = composeDir + "/.env"
+        if FileManager.default.fileExists(atPath: dotEnv) {
+            for (k, v) in parseEnvFile(at: dotEnv) { env[k] = v }
+        }
+        // Host env overrides .env (Compose precedence)
+        for (k, v) in ProcessInfo.processInfo.environment { env[k] = v }
+        return env
+    }
+
+    /// Parse a KEY=VALUE env file (Docker `--env-file` / Compose `env_file`).
+    /// Strips matching surrounding quotes ; ignores blank lines and `#` comments.
+    static func parseEnvFile(at path: String) -> [String: String] {
+        var result: [String: String] = [:]
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            return result
+        }
+        for rawLine in content.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let key = line[..<eq].trimmingCharacters(in: .whitespaces)
+            var value = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            if value.count >= 2, let first = value.first, let last = value.last,
+               (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+                value = String(value.dropFirst().dropLast())
+            }
+            result[key] = value
+        }
+        return result
+    }
+
+    /// Expand `${VAR}`, `${VAR:-default}`, `${VAR-default}`, `${VAR:?msg}`,
+    /// `${VAR?msg}`, `$VAR` ; `$$` escapes to a literal `$`. Anything that
+    /// doesn't parse as a variable reference is passed through untouched.
+    static func expandVariables(in input: String, env: [String: String]) -> String {
+        var out = ""
+        var i = input.startIndex
+        while i < input.endIndex {
+            let c = input[i]
+            if c != "$" {
+                out.append(c)
+                i = input.index(after: i)
+                continue
+            }
+            let next = input.index(after: i)
+            guard next < input.endIndex else {
+                out.append(c)
+                i = next
+                continue
+            }
+            let nc = input[next]
+            if nc == "$" {
+                out.append("$")
+                i = input.index(after: next)
+                continue
+            }
+            if nc == "{" {
+                if let close = input[next...].firstIndex(of: "}") {
+                    let body = String(input[input.index(after: next)..<close])
+                    out += resolveComposeVar(body, env: env)
+                    i = input.index(after: close)
+                    continue
+                }
+                out.append(c)
+                i = next
+                continue
+            }
+            if nc.isLetter || nc == "_" {
+                var end = next
+                while end < input.endIndex {
+                    let ch = input[end]
+                    if ch.isLetter || ch.isNumber || ch == "_" {
+                        end = input.index(after: end)
+                    } else { break }
+                }
+                let name = String(input[next..<end])
+                out += env[name] ?? ""
+                i = end
+                continue
+            }
+            out.append(c)
+            i = next
+        }
+        return out
+    }
+
+    private static func resolveComposeVar(_ body: String, env: [String: String]) -> String {
+        // Order matters: 2-char ops first so `:-` isn't matched as bare `-`.
+        for op in [":-", ":?", "-", "?"] {
+            if let range = body.range(of: op) {
+                let name = String(body[..<range.lowerBound])
+                let rest = String(body[range.upperBound...])
+                let value = env[name]
+                switch op {
+                case ":-":
+                    if let v = value, !v.isEmpty { return v }
+                    return rest
+                case "-":
+                    return value ?? rest
+                case ":?":
+                    if let v = value, !v.isEmpty { return v }
+                    return ""
+                case "?":
+                    return value ?? ""
+                default: break
+                }
+            }
+        }
+        return env[body] ?? ""
     }
 
     private func inferProjectName(from path: String) -> String {
@@ -534,7 +660,8 @@ actor ComposeEngine {
         service: ComposeFile.ComposeService,
         serviceName: String,
         projectName: String,
-        compose: ComposeFile
+        compose: ComposeFile,
+        composePath: String
     ) throws -> RunConfig {
         let image = service.image ?? "\(projectName)_\(serviceName)"
         var config = RunConfig(image: image)
@@ -547,8 +674,20 @@ actor ComposeEngine {
             config.command = cmd.array
         }
 
+        // env_file is the lowest-priority layer ; `environment:` overrides it.
+        // Paths are relative to the compose file's directory.
+        if let envFile = service.env_file {
+            let baseDir = URL(fileURLWithPath: composePath).deletingLastPathComponent()
+            for p in envFile.array {
+                let fullPath = p.hasPrefix("/") ? p : baseDir.appendingPathComponent(p).path
+                for (k, v) in Self.parseEnvFile(at: fullPath) {
+                    config.env[k] = v
+                }
+            }
+        }
+
         if let env = service.environment {
-            config.env = env.dict
+            for (k, v) in env.dict { config.env[k] = v }
         }
 
         // Ports

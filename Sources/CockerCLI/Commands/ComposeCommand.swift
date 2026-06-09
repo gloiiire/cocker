@@ -80,7 +80,7 @@ struct ComposeDownCommand: AsyncParsableCommand {
     @Option(name: [.short, .customLong("project-name")], help: "Project name")
     var projectName: String?
 
-    @Flag(name: .customLong("volumes"), help: "Remove named volumes")
+    @Flag(name: [.customShort("v"), .customLong("volumes")], help: "Remove named volumes")
     var removeVolumes = false
 
     @Flag(name: .customLong("remove-orphans"), help: "Remove orphaned containers")

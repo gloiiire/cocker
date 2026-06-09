@@ -754,6 +754,20 @@ actor DockerfileBuilder {
                     let srcURL = sourceRoot.appendingPathComponent(srcRel)
                     let absWorkdir = rootfs.appendingPathComponent(workdir.hasPrefix("/") ? String(workdir.dropFirst()) : workdir)
 
+                    // `COPY . dst/` is supposed to copy the build context's
+                    // CONTENTS into dst, not the context dir itself nested
+                    // under dst. Swift's URL.lastPathComponent for paths
+                    // ending in "." returns "." literally, which used to
+                    // make the path arithmetic below produce `dst/./` and
+                    // either NOOP-loop or crash FileManager with "The file
+                    // 'foo' doesn't exist." Detecting this upfront and
+                    // recursing into the context for each entry is the
+                    // standard Docker semantics here.
+                    let isWholeContextCopy = (src == "." || src == "./")
+                    let srcBasename: String? = isWholeContextCopy
+                        ? nil
+                        : srcURL.lastPathComponent
+
                     // Resolve dst to an absolute URL inside the rootfs.
                     // Dockerfile dst rules:
                     //   1. trailing `/` → directory target, append src basename
@@ -767,10 +781,17 @@ actor DockerfileBuilder {
                             var isDir: ObjCBool = false
                             return FileManager.default.fileExists(atPath: probe.path, isDirectory: &isDir) && isDir.boolValue
                         }())
-                    let dstPath: String = dstIsDir
-                        ? (dst.hasSuffix("/") ? dst + srcURL.lastPathComponent
-                                              : "\(dst)/\(srcURL.lastPathComponent)")
-                        : dst
+                    // When src is a whole context copy (`.` / `./`), the
+                    // destination IS the directory we merge into — no
+                    // basename to append.
+                    let dstPath: String
+                    if let basename = srcBasename, dstIsDir {
+                        dstPath = dst.hasSuffix("/")
+                            ? dst + basename
+                            : "\(dst)/\(basename)"
+                    } else {
+                        dstPath = dst
+                    }
 
                     let dstURL: URL
                     if dstPath.hasPrefix("/") {
@@ -780,7 +801,21 @@ actor DockerfileBuilder {
                     }
 
                     try FileManager.default.createDirectory(at: dstURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    if FileManager.default.fileExists(atPath: srcURL.path) {
+
+                    if isWholeContextCopy {
+                        // Iterate context entries and copy each one INTO dst.
+                        // Mirrors `cp -r src/. dst/` (note the trailing dot).
+                        try FileManager.default.createDirectory(at: dstURL, withIntermediateDirectories: true)
+                        let entries = (try? FileManager.default.contentsOfDirectory(at: srcURL, includingPropertiesForKeys: nil, options: [])) ?? []
+                        for entry in entries {
+                            let entryDst = dstURL.appendingPathComponent(entry.lastPathComponent)
+                            if FileManager.default.fileExists(atPath: entryDst.path) {
+                                try? FileManager.default.removeItem(at: entryDst)
+                            }
+                            try FileManager.default.copyItem(at: entry, to: entryDst)
+                        }
+                        log(.stdout, " ---> COPY \(src) -> \(dstPath) (\(entries.count) entries)\n")
+                    } else if FileManager.default.fileExists(atPath: srcURL.path) {
                         // Only remove the destination if it is an existing
                         // regular file we're about to overwrite — never a
                         // directory (would nuke unrelated files).
