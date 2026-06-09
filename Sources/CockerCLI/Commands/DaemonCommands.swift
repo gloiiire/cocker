@@ -466,6 +466,48 @@ private func isNonDefaultRoot(_ root: URL) -> Bool {
     return root.standardizedFileURL.path != defaultRoot.standardizedFileURL.path
 }
 
+/// Derive the launchd plist path for a given data dir. Mirrors what
+/// install.sh writes : `~/.cocker` → `com.cocker.cockerd.plist`,
+/// `~/.cocker-dev` → `com.cocker.cockerd-dev.plist`. The suffix is the
+/// part of the data dir's basename after `.cocker` (empty for prod).
+private func launchdPlistPath(for root: URL) -> URL {
+    let base = root.lastPathComponent          // .cocker, .cocker-dev, …
+    let suffix: String
+    if base == ".cocker" {
+        suffix = ""
+    } else if base.hasPrefix(".cocker") {
+        suffix = String(base.dropFirst(".cocker".count))
+    } else {
+        suffix = ""
+    }
+    return URL(fileURLWithPath: NSHomeDirectory())
+        .appendingPathComponent("Library/LaunchAgents/com.cocker.cockerd\(suffix).plist")
+}
+
+/// Run /bin/launchctl with the given args. Surfaces stderr on failure
+/// so the user gets the actual reason (already loaded, no such job, …)
+/// rather than a generic "command exited non-zero".
+@discardableResult
+private func runLaunchctl(_ args: [String]) throws -> Int32 {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    proc.arguments = args
+    let errPipe = Pipe()
+    proc.standardError = errPipe
+    try proc.run()
+    proc.waitUntilExit()
+    if proc.terminationStatus != 0 {
+        let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderr = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        throw ValidationError(
+            "launchctl \(args.joined(separator: " ")) exited " +
+            "\(proc.terminationStatus): \(stderr.isEmpty ? "(no stderr)" : stderr)"
+        )
+    }
+    return proc.terminationStatus
+}
+
 /// Read the PID from the PID file ; nil if the file doesn't exist or is
 /// malformed. Does NOT verify the process is alive — call `isAlive(_:)` after.
 private func readPID(_ url: URL) -> pid_t? {
@@ -539,8 +581,33 @@ struct DaemonStartCommand: AsyncParsableCommand {
           help: "Run cockerd in the foreground (Ctrl-C to stop) — same as just `cockerd`")
     var foreground = false
 
+    @Flag(name: [.short, .customLong("service")],
+          help: "Bootstrap the launchd job instead of spawning a one-off process (use after install.sh).")
+    var service = false
+
     mutating func run() async throws {
         let paths = defaultPaths()
+
+        // --service / -s : delegate to launchd. install.sh shipped a plist
+        // at ~/Library/LaunchAgents/com.cocker.cockerd${suffix}.plist that
+        // has RunAtLoad=true and KeepAlive=true ; `launchctl bootstrap`
+        // loads it AND starts the daemon. Different code path entirely
+        // from the PID-file-based spawn below.
+        if service {
+            let plist = launchdPlistPath(for: paths.root)
+            guard FileManager.default.fileExists(atPath: plist.path) else {
+                throw ValidationError(
+                    "No launchd plist at \(plist.path). " +
+                    "Did you install via ./install.sh ? Without it there's no service to manage."
+                )
+            }
+            try runLaunchctl(["bootstrap", "gui/\(getuid())", plist.path])
+            print("✓ launchd job \(plist.lastPathComponent) bootstrapped")
+            print("  KeepAlive=true → daemon auto-restarts on crash")
+            print("  → cocker daemon status     to inspect")
+            print("  → cocker daemon stop -s    to stop (no respawn)")
+            return
+        }
 
         if let pid = readPID(paths.pidFile), isAlive(pid) {
             print("cockerd is already running (pid \(pid))")
@@ -630,8 +697,32 @@ struct DaemonStopCommand: AsyncParsableCommand {
             help: "Seconds to wait for graceful shutdown before SIGKILL")
     var timeout: Int = 10
 
+    @Flag(name: [.short, .customLong("service")],
+          help: "Bootout the launchd job so KeepAlive doesn't respawn it (counterpart to `daemon start -s`).")
+    var service = false
+
     mutating func run() async throws {
         let paths = defaultPaths()
+
+        // --service / -s : bootout the launchd job. SIGTERM would normally
+        // get instantly undone by KeepAlive=true ; bootout removes the
+        // job from launchd's bookkeeping so no respawn happens until the
+        // user bootstraps it again (`daemon start -s` or relog).
+        if service {
+            let plist = launchdPlistPath(for: paths.root)
+            guard FileManager.default.fileExists(atPath: plist.path) else {
+                throw ValidationError(
+                    "No launchd plist at \(plist.path). " +
+                    "There's no service to stop ; you probably want `cocker daemon stop` (no -s)."
+                )
+            }
+            try runLaunchctl(["bootout", "gui/\(getuid())", plist.path])
+            try? FileManager.default.removeItem(at: paths.pidFile)
+            print("✓ launchd job \(plist.lastPathComponent) booted out (no respawn)")
+            print("  → cocker daemon start -s   to bring it back up")
+            return
+        }
+
         guard let pid = readPID(paths.pidFile), isAlive(pid) else {
             print("cockerd is not running")
             try? FileManager.default.removeItem(at: paths.pidFile)
@@ -669,13 +760,19 @@ struct DaemonRestartCommand: AsyncParsableCommand {
             help: "Path to the cockerd binary (defaults to autodetect)")
     var binary: String?
 
+    @Flag(name: [.short, .customLong("service")],
+          help: "Bootout + bootstrap the launchd job instead of SIGTERM-then-spawn (use after install.sh).")
+    var service = false
+
     mutating func run() async throws {
         // ArgumentParser only initializes @Option/@Flag values during parse().
         // Direct `Type()` instantiation leaves them unset and crashes the run.
         var stop = try DaemonStopCommand.parse([])
+        stop.service = service
         try await stop.run()
         var start = try DaemonStartCommand.parse([])
         start.binary = binary
+        start.service = service
         try await start.run()
     }
 }
