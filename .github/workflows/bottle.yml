@@ -222,20 +222,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Switch to main FIRST, then sed. Previous version sed'd the
+          # tag's checkout then ran `git checkout - -- Formula/cocker.rb`
+          # which restored Formula from the tag (reverting our changes)
+          # — "No formula change" with placeholders still in main.
+          git fetch origin main --quiet
+          git checkout main
+          git pull origin main --ff-only --quiet
+
           sed -i "s|REPLACE_BOTTLE_SHA256_TAHOE|${{ steps.assemble.outputs.sha_tahoe }}|"   Formula/cocker.rb
           sed -i "s|REPLACE_BOTTLE_SHA256_SEQUOIA|${{ steps.assemble.outputs.sha_sequoia }}|" Formula/cocker.rb
           sed -i "s|REPLACE_BOTTLE_SHA256_SONOMA|${{ steps.assemble.outputs.sha_sonoma }}|"  Formula/cocker.rb
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Switch to main and rebase the sha256 patch on top — the
-          # tag was cut from main, but main may have moved while
-          # Release + this workflow ran.
-          git fetch origin main --quiet
-          git checkout main
-          git pull origin main --ff-only --quiet
-          git checkout - -- Formula/cocker.rb
           git add Formula/cocker.rb
           if git diff --staged --quiet; then
             echo "No formula change (sha256s already in place ?)"
