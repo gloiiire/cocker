@@ -32,6 +32,30 @@ jobs:
       TAP_REPO: homebrew-cocker
       GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
+      # Fail loud + early if the PAT is missing/expired. Without this,
+      # the failure was a generic HTTP 401 buried 5 steps in, and the
+      # tap stayed stuck on the previous version with no clear signal.
+      - name: Validate HOMEBREW_TAP_TOKEN
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN secret is not set."
+            echo "Generate a fine-grained PAT for gloiiire/homebrew-cocker"
+            echo "(Contents R/W + Pull requests R/W) then add it under"
+            echo "Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          HTTP=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${TAP_OWNER}/${TAP_REPO}")
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN failed auth check (HTTP $HTTP)."
+            echo "Token likely expired. Renew it at"
+            echo "https://github.com/settings/personal-access-tokens"
+            echo "then update the secret in this repo's Actions settings."
+            exit 1
+          fi
+          echo "Token auth OK."
+
       - name: Resolve tag + tarball SHA256
         id: meta
         run: |
