@@ -106,15 +106,23 @@ struct DNSQueryProcessorTests {
         }
     }
 
-    @Test func aaaaWithoutIPv6ReturnsEmpty() throws {
+    /// Before 0.5.13.16 we answered AAAA for a name-matching-container
+    /// with no IPv6 as "authoritative empty", which breaks happy-eyeballs
+    /// (RFC 8305) for tools like uv / pip / curl when the container's
+    /// hostname collides with a real public CDN (files.pythonhosted.org
+    /// hit this). The new contract : without an IPv6 we DO NOT short-
+    /// circuit ; the query falls through to upstream forwarding. When no
+    /// upstream forwarder is wired up (this test's case), `process`
+    /// returns `nil` so the caller can decide what to do.
+    @Test func aaaaWithoutIPv6FallsThroughToUpstream() throws {
         let q = buildQuery(name: "srv-a", qtype: 28)
         let r = DNSQueryProcessor.process(
             query: q,
             containers: [container(name: "srv-a", cockerIP: "10.42.0.2")]  // no ipv6
         )
         let result = try #require(r)
-        if case .empty = result.kind { /* ok */ }
-        else { Issue.record("expected empty, got \(result.kind)") }
+        if case .nxdomain = result.kind { /* ok — no upstream + no v6 = NXDOMAIN */ }
+        else { Issue.record("expected nxdomain, got \(result.kind)") }
     }
 
     // MARK: - Upstream forwarding

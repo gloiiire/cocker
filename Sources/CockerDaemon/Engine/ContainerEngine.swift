@@ -264,8 +264,13 @@ final class ContainerEngine {
             privileged: config.privileged,
             capAdd: config.capAdd,
             capDrop: config.capDrop,
-            stopSignal: imageInfo?.stopSignal
+            // Precedence : explicit `cocker run --stop-signal` wins over
+            // the image's STOPSIGNAL declaration. Empty string == default
+            // (don't carry it forward) so users can deliberately reset
+            // a baked-in image signal with `--stop-signal SIGTERM`.
+            stopSignal: config.stopSignal ?? imageInfo?.stopSignal
         )
+        container.shmSizeMB = config.shmSizeMB
         if let workdir = resolvedWorkdir { container.env["WORKDIR"] = workdir }
 
         fputs("[eng] container struct created\n", stderr); fflush(stderr)

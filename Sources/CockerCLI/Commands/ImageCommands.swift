@@ -137,7 +137,18 @@ struct BuildCommand: AsyncParsableCommand {
         let cwd = FileManager.default.currentDirectoryPath
         let absContext = context.hasPrefix("/") ? context : cwd + "/" + context
 
-        var config = BuildConfig(contextPath: absContext, tag: tag.isEmpty ? "cocker-image:\(Int(Date().timeIntervalSince1970))" : tag)
+        // Stage iCloud-resident build contexts to a local cache. cockerd
+        // can't read iCloud files reliably (`bird` coordinator deadlocks
+        // inside the daemon process) ; the CLI has full TCC access and
+        // can copy via rsync. Same staging mechanism `cocker compose up`
+        // uses ; benefits from the same incremental cache on repeat runs.
+        let dockerfileFullPath = absContext + "/" + file
+        let stage = try await ICloudStaging.stageIfNeeded(originalPath: dockerfileFullPath) { msg in
+            print(ANSI.colored(msg, ANSI.cyan))
+        }
+        let effectiveContext = (stage.path as NSString).deletingLastPathComponent
+
+        var config = BuildConfig(contextPath: effectiveContext, tag: tag.isEmpty ? "cocker-image:\(Int(Date().timeIntervalSince1970))" : tag)
         config.dockerfile = file
         config.buildArgs = try parseKV(buildArgs)
         config.noCache = noCache

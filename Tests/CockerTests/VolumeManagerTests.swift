@@ -24,8 +24,13 @@ struct VolumeManagerCreateTests {
         let vol = try await mgr.create(request: VolumeCreateRequest(name: "data"))
         #expect(vol.name == "data")
         #expect(vol.driver == "local")
-        #expect(vol.mountpoint.hasSuffix("/data/_data"))
-        // Mountpoint dir actually created on disk
+        // 0.5.13 switched named volumes from a `_data` virtiofs dir to a
+        // sparse `data.img` ext4 block device — fixes chown EPERM /
+        // lost+found / FUSE inode bugs that broke postgres, mysql, redis
+        // on Apple virtiofsd. VolumeManager.mountpoint now points at the
+        // image file itself ; VMRuntime attaches it as a virtio block
+        // device and the guest mounts it on the destination path.
+        #expect(vol.mountpoint.hasSuffix("/data/data.img"))
         #expect(FileManager.default.fileExists(atPath: vol.mountpoint))
         // Persisted in StateStore
         let stored = await store.volume(id: "data")
