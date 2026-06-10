@@ -115,8 +115,14 @@ struct KernelCommandLineTests {
             ]),
             dnsIP: "1.2.3.4", dnsPort: 5300, cockerSwitchGateway: "10.42.0.1"
         ))
-        #expect(cmdline.contains("cocker.vol0=vol0:/data"))
-        #expect(cmdline.contains("cocker.vol1=vol1:/var/log"))
+        // 0.5.13 added block-storage volumes : each cocker.volN entry now
+        // carries a type tag (`virtiofs:` for directory shares,
+        // `blk:/dev/vdX` for ext4 .img devices). When the caller hands us
+        // a VolumeMount with no resolved spec, we still emit the
+        // virtiofs-shaped fallback for backwards compat with older tests
+        // and CLI call sites.
+        #expect(cmdline.contains("cocker.vol0=virtiofs:vol0:/data"))
+        #expect(cmdline.contains("cocker.vol1=virtiofs:vol1:/var/log"))
     }
 
     @Test func emitsWorkdirAndUserFromEnv() {
