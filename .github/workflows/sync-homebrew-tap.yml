@@ -18,14 +18,26 @@ name: sync-homebrew-tap
 #   - Pull requests  : Read and write
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  # Trigger AFTER the Bottle workflow finishes — bottle.yml's last
+  # step commits the patched sha256s to main, and sync-tap needs to
+  # read main HEAD to propagate them to the tap. Triggering on
+  # `push: tags` raced with bottle.yml (both fired at the same time,
+  # sync-tap usually won and shipped a Formula full of
+  # REPLACE_BOTTLE_SHA256_* placeholders to the tap).
+  workflow_run:
+    workflows: ["Bottle"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to sync (e.g. v0.5.14.4)'
+        required: true
 
 permissions: {}
 
 jobs:
   bump-tap:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     env:
       TAP_OWNER: gloiiire
@@ -59,7 +71,15 @@ jobs:
       - name: Resolve tag + tarball SHA256
         id: meta
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          # workflow_run gives us the upstream's head_branch (the tag
+          # for tag-triggered runs); workflow_dispatch gives us the
+          # explicit input. GITHUB_REF_NAME would be 'main' here since
+          # workflow_run defaults to the default branch.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.workflow_run.head_branch }}"
+          fi
           VERSION="${TAG#v}"
           URL="https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
 
@@ -85,6 +105,10 @@ jobs:
       - name: Checkout source (for source-of-truth Formula)
         uses: actions/checkout@v4
         with:
+          # Explicitly main HEAD — workflow_run defaults to default
+          # branch, but bottle.yml just pushed sha256 patches to main,
+          # so we want the freshest copy, not the tag's snapshot.
+          ref: main
           path: source
 
       - name: Build patched formula
