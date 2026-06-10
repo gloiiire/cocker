@@ -24,3 +24,10 @@ DerivedData/
 *\ 2.swift
 *\ 2.c
 *\ 2.rb
+
+# Markdown — only README files travel in the repo. CHANGELOG, docs/,
+# CLAUDE.md, .roadmap.md, RELEASE.md, QUICKSTART.md and any iCloud
+# "*2.md" sync duplicates stay out of git.
+*.md
+!README.md
+!**/README.md
