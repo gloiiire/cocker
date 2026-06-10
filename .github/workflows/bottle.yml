@@ -80,6 +80,27 @@ jobs:
           brew --version
           brew tap-info homebrew/core || true
 
+      # The formula's `install` block runs `swift build -c release` inside
+      # brew's sandboxed source dir. brew creates that dir fresh per
+      # invocation, so we can't reuse the `actions/cache` on `.build` the
+      # CI workflow uses. What we CAN cache is brew's own download cache
+      # (~/Library/Caches/Homebrew) and the SwiftPM module cache that
+      # `swift build` keeps in ~/Library/Caches/org.swift.swiftpm — the
+      # latter contains the resolved-dep checkout plus the compiled
+      # module artifacts keyed by toolchain hash, so a hit means swift
+      # build only recompiles the cocker sources themselves (~30s
+      # instead of ~5min cold).
+      - name: Cache Homebrew + SwiftPM modules
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/Homebrew
+            ~/Library/Caches/org.swift.swiftpm
+          key: ${{ runner.os }}-bottle-${{ matrix.macos }}-${{ hashFiles('Package.resolved', 'Formula/cocker.rb') }}
+          restore-keys: |
+            ${{ runner.os }}-bottle-${{ matrix.macos }}-
+            ${{ runner.os }}-bottle-
+
       # `brew install --build-bottle` runs the formula's `install` block
       # in a sandbox that records the install prefix (Cellar/cocker/<ver>).
       # We point brew at the formula in this repo via `--formula

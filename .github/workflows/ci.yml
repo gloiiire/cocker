@@ -100,6 +100,11 @@ jobs:
             .build
             ~/Library/Caches/org.swift.swiftpm
           key: ${{ runner.os }}-spm-release-${{ hashFiles('Package.resolved') }}
+          # Partial-match fallback so a deps-only change still benefits
+          # from the previous toolchain's module cache (saves ~3 min).
+          restore-keys: |
+            ${{ runner.os }}-spm-release-
+            ${{ runner.os }}-spm-
       - name: swift build -c release
         # Vérifie que cocker + cockerd compilent en release.
         # Le code signing virtualization est fait à l'install via Homebrew.
