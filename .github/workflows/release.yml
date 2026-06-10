@@ -88,18 +88,60 @@ jobs:
           done
           ls -la
 
+      # The release object was already created by the human who pushed
+      # the tag (or by an earlier `gh release create`). Create a
+      # placeholder via REST if it isn't there yet, then upload assets
+      # via curl directly against uploads.github.com — `gh release
+      # upload` here returns 401 even with a valid GITHUB_TOKEN (a
+      # known gh-CLI / runner-token quirk that surfaces irregularly).
       - name: Attach assets to GitHub release
-        run: |
-          # The release object was already created by the human who pushed the
-          # tag (or by an earlier `gh release create`). If it doesn't exist
-          # yet, create a placeholder so we can attach assets.
-          gh release view "${{ github.ref_name }}" >/dev/null 2>&1 \
-            || gh release create "${{ github.ref_name }}" \
-                 --title "${{ github.ref_name }}" \
-                 --notes "Signed release artifacts attached by CI."
-          gh release upload "${{ github.ref_name }}" dist/* --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+          # Ensure the release exists. `tags/<TAG>` returns 404 if not.
+          if ! curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
+               "https://api.github.com/repos/$REPO/releases/tags/$TAG" >/dev/null 2>&1; then
+            curl -fsS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/releases" \
+              -d "{\"tag_name\":\"$TAG\",\"name\":\"$TAG\",\"body\":\"Signed release artifacts attached by CI.\"}" >/dev/null
+          fi
+          REL_JSON=$(curl -fsS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases/tags/$TAG")
+          UP_TMPL=$(echo "$REL_JSON" | jq -r '.upload_url')
+          UP_BASE="${UP_TMPL%\{*\}}"
+          REL_ID=$(echo "$REL_JSON" | jq -r '.id')
+
+          for f in dist/*; do
+            name=$(basename "$f")
+            # Clobber any existing asset with the same name (idempotent re-runs).
+            EXISTING=$(echo "$REL_JSON" | jq -r --arg n "$name" '.assets[] | select(.name == $n) | .id // empty')
+            if [ -n "$EXISTING" ]; then
+              curl -fsS -X DELETE \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                "https://api.github.com/repos/$REPO/releases/assets/$EXISTING" >/dev/null
+            fi
+            echo "uploading $name"
+            # Pick a content type from the filename ; release uploads
+            # tolerate octet-stream but signature verification on the
+            # consumer side prefers the right mime.
+            case "$name" in
+              *.tar.gz|*.tgz) ctype="application/gzip" ;;
+              *.img)          ctype="application/octet-stream" ;;
+              *.sig|*.crt)    ctype="text/plain" ;;
+              *)              ctype="application/octet-stream" ;;
+            esac
+            curl -fsS -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: $ctype" \
+              --data-binary @"$f" \
+              "${UP_BASE}?name=${name}" >/dev/null
+          done
 
       - name: Generate SLSA provenance attestation
         # GitHub-native attestations link the artifact to the workflow run that
