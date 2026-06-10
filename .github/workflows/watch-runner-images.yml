@@ -1,0 +1,100 @@
+name: Watch runner images
+
+# Poll the actions/runner-images repo for new macOS releases. When the
+# `macos-27` label (or any later macos-NN label we don't yet bottle for)
+# appears, open an issue in this repo so we know to extend the Bottle
+# workflow's matrix.
+#
+# No secrets needed : uses the default GITHUB_TOKEN with `issues: write`.
+# Runs weekly + on-demand. Idempotent : skips if an open issue with the
+# expected title already exists, so a re-run won't spam.
+
+on:
+  schedule:
+    # Mondays 09:00 UTC — pick a slot that's reliably outside any cocker
+    # release window, and weekly keeps the API hit-rate trivial.
+    - cron: '0 9 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Detect missing macOS bottle targets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Versions cocker already bottles for. Keep aligned with
+          # .github/workflows/bottle.yml matrix.
+          KNOWN="14 15 26"
+
+          # Pull the runner-images README — it lists supported images in
+          # a markdown table. Grep for any `macos-NN` label, sort, dedupe,
+          # discard the ones cocker already covers.
+          README=$(gh api repos/actions/runner-images/contents/README.md --jq '.content' | base64 -d)
+          AVAILABLE=$(printf "%s\n" "$README" | grep -oE 'macos-[0-9]+' | sort -u | sed 's/macos-//' || true)
+          if [ -z "$AVAILABLE" ]; then
+            echo "::warning::No macos-* labels found in runner-images README — parser may be stale."
+            exit 0
+          fi
+
+          MISSING=""
+          for v in $AVAILABLE; do
+            # macOS 13 and below are out of cocker's support window
+            # (`depends_on macos: :sonoma`), don't notify for those.
+            if [ "$v" -lt 14 ]; then continue; fi
+            if ! printf "%s\n" $KNOWN | grep -qx "$v"; then
+              MISSING="$MISSING $v"
+            fi
+          done
+
+          if [ -z "$MISSING" ]; then
+            echo "All published macOS runner images are already in the bottle matrix."
+            exit 0
+          fi
+
+          for v in $MISSING; do
+            TITLE="Runner macos-$v is now available — extend Bottle matrix"
+
+            # Idempotency : look for an open issue with the exact same
+            # title. gh issue list returns a JSON array ; grep is enough
+            # because titles are stable.
+            EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+            if [ -n "$EXISTING" ]; then
+              echo "Issue #$EXISTING already open for macos-$v, skipping."
+              continue
+            fi
+
+            BODY=$(cat <<EOF
+GitHub-hosted runner image \`macos-$v\` is now available
+(https://github.com/actions/runner-images/blob/main/images/macos/).
+
+Action items to ship a bottle for it :
+
+1. \`.github/workflows/bottle.yml\` — add a matrix entry :
+\`\`\`yaml
+- runner: macos-$v
+  macos: <codename>   # check Apple's release name
+\`\`\`
+2. \`Formula/cocker.rb\` — add a sha256 placeholder line in the
+\`bottle do\` block (between sequoia and tahoe to keep order roughly
+chronological) :
+\`\`\`ruby
+sha256 cellar: :any_skip_relocation, arm64_<codename>: "REPLACE_BOTTLE_SHA256_<CODENAME>"
+\`\`\`
+3. \`.github/workflows/bottle.yml\` → \`update-formula\` job — extract
+the \`arm64_<codename>\` sha256 and sed it in.
+
+Triggered by \`.github/workflows/watch-runner-images.yml\` cron run on
+$(date -u +%Y-%m-%d).
+EOF
+)
+            gh issue create --title "$TITLE" --body "$BODY"
+            echo "Opened issue for macos-$v."
+          done

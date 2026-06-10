@@ -4,9 +4,9 @@ name: Bottle
 # is a pre-compiled binary tarball that brew downloads instead of
 # running `swift build` on the user's machine — install drops from
 # ~3 min to ~5s. We build one per supported macOS arm64 release
-# (Sonoma 14, Sequoia 15), upload each as a release asset, then
-# rewrite the `bottle do` block in Formula/cocker.rb with the actual
-# sha256s and commit it back to main.
+# (Sonoma 14, Sequoia 15, Tahoe 26), upload each as a release asset,
+# then rewrite the `bottle do` block in Formula/cocker.rb with the
+# actual sha256s and commit it back to main.
 #
 # Triggered AFTER the Release workflow has uploaded its source-tarball
 # assets, because brew bottling needs the formula's `url` tarball to
@@ -34,9 +34,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # arm64_sequoia uses macos-15 runners ; arm64_sonoma uses
-          # macos-14. Keep this in sync with the formula's
+          # macOS runner mapping. Keep aligned with the formula's
           # `depends_on macos:` floor when bumping.
+          #
+          # Runner image labels :
+          #   macos-26 → Tahoe (Darwin 25.x, arm64_tahoe bottle tag)
+          #   macos-15 → Sequoia (Darwin 24.x, arm64_sequoia)
+          #   macos-14 → Sonoma  (Darwin 23.x, arm64_sonoma)
+          #
+          # macOS 27 (Apple WWDC 2026) — Developer Beta dropped
+          # 2026-06-08. GitHub-hosted `macos-27` runner image isn't
+          # published yet ; re-enable the matrix entry + formula
+          # placeholder when the label lands in
+          # https://github.com/actions/runner-images/blob/main/images/macos/
+          - runner: macos-26
+            macos: tahoe
           - runner: macos-15
             macos: sequoia
           - runner: macos-14
@@ -155,8 +167,10 @@ jobs:
         run: |
           # Extract sha256 from each macOS's bottle json (jq filter
           # walks the standard `brew bottle --json` shape).
+          TAH=$(jq -r 'first(.[]).bottle.tags.arm64_tahoe.sha256'   shas/sha-tahoe/bottle-tahoe.json)
           SEQ=$(jq -r 'first(.[]).bottle.tags.arm64_sequoia.sha256' shas/sha-sequoia/bottle-sequoia.json)
           SON=$(jq -r 'first(.[]).bottle.tags.arm64_sonoma.sha256'  shas/sha-sonoma/bottle-sonoma.json)
+          sed -i "s|REPLACE_BOTTLE_SHA256_TAHOE|$TAH|"   Formula/cocker.rb
           sed -i "s|REPLACE_BOTTLE_SHA256_SEQUOIA|$SEQ|" Formula/cocker.rb
           sed -i "s|REPLACE_BOTTLE_SHA256_SONOMA|$SON|"  Formula/cocker.rb
 

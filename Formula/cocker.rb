@@ -21,6 +21,7 @@ class Cocker < Formula
   # they don't hard-code their install prefix.
   bottle do
     root_url "https://github.com/gloiiire/cocker/releases/download/v#{version}"
+    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "REPLACE_BOTTLE_SHA256_TAHOE"
     sha256 cellar: :any_skip_relocation, arm64_sequoia: "REPLACE_BOTTLE_SHA256_SEQUOIA"
     sha256 cellar: :any_skip_relocation, arm64_sonoma:  "REPLACE_BOTTLE_SHA256_SONOMA"
   end
