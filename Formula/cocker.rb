@@ -19,8 +19,15 @@ class Cocker < Formula
   # committed back to this file. `cellar :any_skip_relocation` is
   # correct here because cocker's binaries are statically positioned —
   # they don't hard-code their install prefix.
+  # `bottle do` runs in a `BottleSpecification` scope that does NOT
+  # have the formula's `version` method in lexical scope — using
+  # `#{version}` here raises `undefined local variable 'version'` at
+  # `brew info / outdated` time and bricks the tap for the user. The
+  # URL has to be a literal. The `sync-homebrew-tap` workflow rewrites
+  # both `version "..."` AND this `vX.Y.Z` substring on every release
+  # tag so they stay in lock-step.
   bottle do
-    root_url "https://github.com/gloiiire/cocker/releases/download/v#{version}"
+    root_url "https://github.com/gloiiire/cocker/releases/download/v0.5.14.0"
     sha256 cellar: :any_skip_relocation, arm64_tahoe:   "REPLACE_BOTTLE_SHA256_TAHOE"
     sha256 cellar: :any_skip_relocation, arm64_sequoia: "REPLACE_BOTTLE_SHA256_SEQUOIA"
     sha256 cellar: :any_skip_relocation, arm64_sonoma:  "REPLACE_BOTTLE_SHA256_SONOMA"
