@@ -169,9 +169,15 @@ jobs:
           # filename → different sha256 of the FILE itself. We use
           # tar -C to enter the staging root so the tarball contains
           # `cocker/<ver>/...` paths exactly as brew expects.
+          # Filename uses the bare version (no `v` prefix) because
+          # brew computes the bottle filename from the formula's
+          # `version` string, NOT from any tag/url. Earlier this used
+          # ${TAG} → user got 404 because brew asked for
+          # `cocker-0.5.14.3.arm64_tahoe.bottle.tar.gz` but we'd
+          # uploaded `cocker-v0.5.14.3.arm64_tahoe.bottle.tar.gz`.
           mkdir -p out
           for os in tahoe sequoia sonoma; do
-            NAME="cocker-${TAG}.arm64_${os}.bottle.tar.gz"
+            NAME="cocker-${VER}.arm64_${os}.bottle.tar.gz"
             tar -C bottle-staging -czf "out/${NAME}" "cocker/${VER}"
             SHA=$(sha256sum "out/${NAME}" | awk '{print $1}')
             echo "sha_${os}=${SHA}" >> "$GITHUB_OUTPUT"
