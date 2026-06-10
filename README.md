@@ -133,7 +133,7 @@ cocker info
 ```bash
 cocker daemon start              # spawn in background, returns to shell
 cocker daemon status             # running? pid, uptime, log, socket
-cocker daemon logs -f            # follow the log
+cocker daemon logs -f            # follow the log (ANSI-colorized by level when stdout is a TTY ; pass --no-color to disable)
 cocker daemon stop               # graceful shutdown (SIGTERM)
 cocker daemon restart            # stop + start
 ```
@@ -357,6 +357,10 @@ cocker compose pull
 # Build services with build: config
 cocker compose build
 
+# Hot-reload : watch the project dir, rebuild & restart on file change
+cocker compose watch
+cocker compose watch --debounce-ms 500     # tune batching window
+
 # Restart / pause / unpause
 cocker compose restart
 cocker compose pause web
@@ -366,6 +370,25 @@ cocker compose unpause web
 cocker compose down
 ```
 
+`cocker compose up` (without `-d`) opens an attached session — press `d` to
+detach (containers keep running, matches Docker Compose v2 UX) or Ctrl-C
+for a traditional teardown. Stdin is auto-detected : piped input skips raw
+TTY mode so `cocker compose up | tee` works.
+
+`cocker compose watch` brings the project up via `compose up -d` first,
+then opens a recursive FSEventStream on the source directory and rebuilds
++ restarts on batched events (default 300 ms debounce ;
+`~/Library/Caches/cocker/`, `.DS_Store`, `.Spotlight-V100`, `.fseventsd`
+are auto-skipped).
+
+### Cockerfile
+
+When a `Cockerfile` exists in the build context, it's preferred over
+`Dockerfile`. This lets you keep a Docker-compatible Dockerfile and a
+cocker-specific Cockerfile side by side — e.g. to opt into
+cocker-only features without breaking your CI that still runs
+`docker build`.
+
 ### System
 
 ```bash
@@ -374,6 +397,106 @@ cocker system prune
 cocker system df
 cocker system events
 ```
+
+## iCloud Drive projects
+
+Cocker auto-detects projects that live under iCloud Drive
+(`~/Library/Mobile Documents/com~apple~CloudDocs/`, or any path carrying
+a `com.apple.fileprovider.*` xattr — which also covers the
+"Desktop & Documents Folders" sync) and works around the macOS `bird`
+daemon's behaviour transparently. No flags, no opt-in.
+
+### Why this is needed
+
+Apple's `bird` (the iCloud Drive coordinator) materializes dataless
+files on demand by intercepting filesystem syscalls. When `cockerd`
+(a long-running daemon) issues many concurrent `read()`s through that
+path, `bird` returns `EDEADLK` (Resource deadlock avoided) often enough
+to break `cp -R`, `ditto`, and even raw `read()` from inside the daemon.
+Past the first few files, every `COPY` or `compose build` will stall or
+fail with no useful diagnostic.
+
+### What cocker does automatically
+
+When `cocker compose up` / `cocker build` runs on an iCloud-resident
+project, the CLI :
+
+1. Stages the project to
+   `~/Library/Caches/cocker/staging/<basename>-<hash>/` via rsync
+   (avoids the `bird` deadlock that affects every other copy path).
+2. Auto-detects dataless files via
+   `URLResourceValues.ubiquitousItemDownloadingStatus` and pre-downloads
+   them via Apple's `startDownloadingUbiquitousItem` with progress
+   reporting before the rsync starts.
+3. Skips the pre-fetch step entirely when everything is already local.
+4. Applies `.dockerignore` + `.cockerignore` from the project tree, plus
+   hardcoded defaults (`.git`, `node_modules`, `.DS_Store`, `*.icloud`).
+5. Reuses the staging directory on subsequent runs : rsync only re-reads
+   files that changed in iCloud — incremental staging is "free" after
+   the first run.
+
+### `cocker icloud` — inspect & control
+
+```bash
+# Show materialization state (count of Materialized / Dataless /
+# Downloading + total + pending bytes). Run before a build to predict
+# whether staging will be fast or slow.
+cocker icloud status
+cocker icloud status ~/some/project
+cocker icloud status --json
+
+# Force-materialize all dataless files via brctl download, with a
+# before/after delta report.
+cocker icloud prefetch
+cocker icloud prefetch ~/some/project
+
+# Wipe ~/Library/Caches/cocker/staging/ (frees disk ; next build
+# re-stages from scratch).
+cocker icloud cache-clear
+```
+
+Sample output :
+
+```
+Scanning /Users/me/Projects/api…
+  Files:       1247
+  Total size:  84.3 MB
+  ─────────────────────────────
+  Downloaded:    1102 (88%)
+    of which current:  1102
+  Dataless:      143 (11%)
+  Downloading:   2 (0%)
+  Pending bytes: 8.7 MB
+
+→ A `cocker icloud prefetch /Users/me/Projects/api` (or `cocker compose up`)
+  will materialize the missing files first.
+```
+
+### Environment variables
+
+| Variable | Effect |
+|---|---|
+| `COCKER_FORCE_STAGE` | `1` forces staging even for non-iCloud paths (CI / testing) |
+| `COCKER_ICLOUD_TIMEOUT` | bird query timeout in seconds (default `30`) |
+
+## Shell completion
+
+```bash
+# bash : append to your ~/.bashrc or ship system-wide
+cocker completion bash > /usr/local/etc/bash_completion.d/cocker
+
+# zsh : drop into your $fpath
+cocker completion zsh > /usr/local/share/zsh/site-functions/_cocker
+
+# fish
+cocker completion fish > ~/.config/fish/completions/cocker.fish
+```
+
+Generated by ArgumentParser straight from the command graph — every new
+subcommand / flag is reflected the next time you re-source the script.
+Modern terminals (Warp, Zed, Kiro, VS Code terminal, iTerm autosuggest)
+parse these scripts to build their inline command pickers, so completion
+"just appears" once installed.
 
 ## Docker compatibility
 

@@ -145,6 +145,27 @@ cocker run -d --network mynet --name b nginx:alpine
 cocker run --rm --network mynet alpine -- wget -q -O- http://a/   # DNS works
 ```
 
+## iCloud Drive projects
+
+Projects living under iCloud Drive (`~/Library/Mobile Documents/com~apple~CloudDocs/`,
+or any "Desktop & Documents Folders" sync path) work transparently.
+`cocker build` and `cocker compose up` auto-detect iCloud paths, pre-fetch
+any dataless files, and rsync the tree to `~/Library/Caches/cocker/staging/`
+before handing it to the daemon — this sidesteps a `bird` (Apple's iCloud
+coordinator) deadlock that breaks every other copy path. Subsequent runs
+are incremental.
+
+Inspect / control state with :
+
+```bash
+cocker icloud status                  # how much is dataless ?
+cocker icloud prefetch                # warm the cache before a big build
+cocker icloud cache-clear             # nuke ~/Library/Caches/cocker/staging/
+```
+
+`.dockerignore` and `.cockerignore` are both honoured during staging
+(and during `COPY` inside builds).
+
 ## Troubleshooting
 
 **`cocker version` says "Cannot connect to cockerd"**

@@ -95,8 +95,69 @@ static void switch_to_virtiofs(void) {
     if (chdir("/") < 0) die("chdir /: %s", strerror(errno));
 }
 
-/* Mount the per-container volume virtiofs shares (vol0, vol1, …) at the
- * paths specified on the kernel cmdline via cocker.vol<N>=tag:/path. */
+/* Recursively mkdir all components of `path` (mkdir -p). */
+static void mkdirp(const char *path) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+    }
+    mkdir(tmp, 0755);
+}
+
+/* Detect whether the device already holds an ext4 (or ext2/3) filesystem.
+ * The ext family stores its superblock at offset 1024 with magic 0xEF53
+ * at offset 56 of the superblock (= absolute offset 1080). Any other
+ * pattern means "format me". */
+static int has_ext_fs(const char *device) {
+    int fd = open(device, O_RDONLY);
+    if (fd < 0) return 0;
+    if (lseek(fd, 1080, SEEK_SET) < 0) { close(fd); return 0; }
+    unsigned char buf[2] = {0};
+    ssize_t n = read(fd, buf, 2);
+    close(fd);
+    return (n == 2 && buf[0] == 0x53 && buf[1] == 0xEF);
+}
+
+/* fork + execvp + wait. Returns the child's exit status, or -1 on
+ * fork/exec failure. Used for one-shot helpers like mkfs.ext4 that
+ * we don't keep around. Sets PATH explicitly in the child because
+ * cocker-init (PID 1) inherits no environment from the kernel and
+ * execvp's default search would otherwise miss /sbin (where Alpine
+ * and Debian ship mkfs.ext4, useradd, etc.). */
+static int run_cmd(char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 1);
+        execvp(argv[0], argv);
+        // execvp returned → couldn't find the binary. Tell the caller
+        // explicitly so the failure log includes which command was tried.
+        fprintf(stderr, "[cocker-init] execvp(%s) failed: %s\n",
+                argv[0], strerror(errno));
+        _exit(127);
+    }
+    int status;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    if (!WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+/* Per-container volume mounts driven by the kernel cmdline.
+ *
+ * Spec format : `cocker.vol<N>=<type>:<source>:<target>`
+ *   - type = "virtiofs"  → mount source as virtiofs tag (legacy, bind
+ *                          mounts, also fallback for volumes created
+ *                          before block storage).
+ *   - type = "blk"       → mount source (a device path like /dev/vda)
+ *                          as ext4. If the device has no filesystem
+ *                          yet, mkfs.ext4 it from the image's PATH
+ *                          first. Block storage is the default for
+ *                          new named volumes since 0.5.13 — fixes
+ *                          chown / chmod EPERM under Apple virtiofs.
+ *
+ * Legacy format `<tag>:<target>` (one less colon) is recognized too so
+ * older daemons that still emit the old shape keep working. */
 static void mount_volumes(const char *cmdline) {
     for (int i = 0; i < 32; i++) {
         char key[16];
@@ -104,24 +165,74 @@ static void mount_volumes(const char *cmdline) {
         char *spec = cmdline_get(cmdline, key);
         if (!spec) break;
 
-        char *colon = strchr(spec, ':');
-        if (!colon) { free(spec); continue; }
-        *colon = '\0';
-        const char *tag = spec;
-        const char *path = colon + 1;
+        /* Try new format <type>:<source>:<target> first, fall back to
+         * legacy <tag>:<target> if the spec only has one colon. */
+        char *c1 = strchr(spec, ':');
+        if (!c1) { free(spec); continue; }
+        *c1 = '\0';
+        char *after_c1 = c1 + 1;
+        char *c2 = strchr(after_c1, ':');
 
-        /* mkdir -p */
-        char tmp[512];
-        snprintf(tmp, sizeof(tmp), "%s", path);
-        for (char *p = tmp + 1; *p; p++) {
-            if (*p == '/') { *p = '\0'; mkdir(tmp, 0755); *p = '/'; }
+        const char *type;
+        const char *source;
+        const char *target;
+        if (c2) {
+            *c2 = '\0';
+            type = spec;
+            source = after_c1;
+            target = c2 + 1;
+        } else {
+            // Legacy : assume virtiofs.
+            type = "virtiofs";
+            source = spec;
+            target = after_c1;
         }
-        mkdir(tmp, 0755);
 
-        if (mount(tag, path, "virtiofs", 0, NULL) < 0)
-            info("mount %s -> %s failed: %s", tag, path, strerror(errno));
-        else
-            info("mounted volume %s at %s", tag, path);
+        mkdirp(target);
+
+        if (strcmp(type, "virtiofs") == 0) {
+            if (mount(source, target, "virtiofs", 0, NULL) < 0)
+                info("mount virtiofs %s -> %s failed: %s", source, target, strerror(errno));
+            else
+                info("mounted volume %s at %s (virtiofs)", source, target);
+        } else if (strcmp(type, "blk") == 0) {
+            if (!has_ext_fs(source)) {
+                info("volume %s has no filesystem, formatting ext4 …", source);
+                char *mkfs_argv[] = {
+                    (char *)"mkfs.ext4", (char *)"-F", (char *)"-q",
+                    (char *)source, NULL
+                };
+                int rc = run_cmd(mkfs_argv);
+                if (rc != 0) {
+                    info("mkfs.ext4 %s failed (rc=%d) — image likely lacks e2fsprogs ; "
+                         "install it in your Dockerfile (apt-get install e2fsprogs / "
+                         "apk add e2fsprogs) so cocker-init can format named volumes on "
+                         "first attach", source, rc);
+                    free(spec);
+                    continue;
+                }
+            }
+            if (mount(source, target, "ext4", 0, NULL) < 0) {
+                info("mount ext4 %s -> %s failed: %s", source, target, strerror(errno));
+            } else {
+                info("mounted volume %s at %s (ext4 block)", source, target);
+                /* Remove the lost+found directory that mke2fs creates.
+                 * Postgres' initdb refuses to use a non-empty data dir
+                 * ("It contains a lost+found directory, perhaps due to
+                 * it being a mount point"), and many other apps make
+                 * similar assumptions. Best-effort : rmdir fails with
+                 * ENOTEMPTY if fsck has populated it, in which case the
+                 * user has bigger problems anyway. */
+                char lostfound[1024];
+                snprintf(lostfound, sizeof(lostfound), "%s/lost+found", target);
+                if (rmdir(lostfound) == 0) {
+                    info("  cleared lost+found in %s (postgres-friendly)", target);
+                }
+            }
+        } else {
+            info("unknown volume type %s for vol%d (spec=%s:%s:%s) — skipped",
+                 type, i, type, source, target);
+        }
         free(spec);
     }
 }
@@ -174,6 +285,18 @@ int main(int argc, char **argv) {
     if (mount("devtmpfs", "/dev",  "devtmpfs", 0, NULL) < 0)
         info("mount /dev: %s (continuing)", strerror(errno));
 
+    /* devtmpfs gives us device nodes (null, zero, console, tty…) but
+     * NOT the /dev/fd → /proc/self/fd indirection that POSIX programs
+     * rely on. initdb (postgres), shell process substitution (`<(cmd)`),
+     * and a pile of build tools open `/dev/fd/N` to slurp from a passed
+     * file descriptor — without these symlinks they fail with ENOENT.
+     * Distro initramfses usually create these via udev or rc-script ;
+     * cocker-init's minimal /dev mount has to do it by hand. */
+    symlink("/proc/self/fd",    "/dev/fd");
+    symlink("/proc/self/fd/0",  "/dev/stdin");
+    symlink("/proc/self/fd/1",  "/dev/stdout");
+    symlink("/proc/self/fd/2",  "/dev/stderr");
+
     char cmdline[4096];
     if (read_cmdline(cmdline, sizeof(cmdline)) < 0)
         die("read /proc/cmdline: %s", strerror(errno));
@@ -195,6 +318,40 @@ int main(int argc, char **argv) {
 
     switch_to_virtiofs();
     mount_volumes(cmdline);
+
+    /* `--shm-size` : Linux gives /dev/shm only 64 MB by default which
+     * postgres / redis / chromium / pytorch routinely overrun. When the
+     * user passes --shm-size=N to `cocker run`, we re-mount /dev/shm
+     * tmpfs with `size=Nm`. Done after switch_to_virtiofs so the mount
+     * lands on the post-switch /dev (otherwise it gets shadowed). The
+     * remount uses MS_REMOUNT semantics when /dev/shm already exists,
+     * or a fresh tmpfs mount when it doesn't (busybox-based images
+     * sometimes ship without /dev/shm at all). */
+    {
+        char *shm_mb_s = cmdline_get(cmdline, "shm_mb");
+        if (shm_mb_s) {
+            unsigned long mb = strtoul(shm_mb_s, NULL, 10);
+            if (mb > 0) {
+                char opts[64];
+                snprintf(opts, sizeof(opts), "size=%lum", mb);
+                mkdir("/dev/shm", 01777);
+                if (mount("tmpfs", "/dev/shm", "tmpfs",
+                          MS_NOSUID | MS_NODEV, opts) < 0) {
+                    /* Fallback to remount when /dev/shm was already
+                     * mounted by devtmpfs. */
+                    if (mount("tmpfs", "/dev/shm", "tmpfs",
+                              MS_REMOUNT | MS_NOSUID | MS_NODEV, opts) < 0) {
+                        info("/dev/shm size=%lum: %s", mb, strerror(errno));
+                    } else {
+                        info("/dev/shm remounted size=%lum", mb);
+                    }
+                } else {
+                    info("/dev/shm mounted size=%lum", mb);
+                }
+            }
+            free(shm_mb_s);
+        }
+    }
 
     /* Workaround Apple virtiofsd bug that breaks shadow-utils (groupadd,
      * useradd) — must happen BEFORE pin_resolv_conf so the runtime pin

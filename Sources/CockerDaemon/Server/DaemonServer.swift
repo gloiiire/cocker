@@ -378,13 +378,48 @@ final class DaemonServer {
                 let req = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
                 let pName = req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent
                 let filter = ["label": "com.cocker.project=\(pName)"]
-                let containers = await engine.list(all: true, filter: filter)
+                var containers = await engine.list(all: true, filter: filter)
+                // Optional `services` filter narrows down inside the project
+                // (e.g. `cocker compose logs backend frontend`).
+                if !req.services.isEmpty {
+                    let pin = Set(req.services)
+                    containers = containers.filter { c in
+                        if let svc = c.labels["com.cocker.service"], pin.contains(svc) { return true }
+                        return pin.contains(c.name) || pin.contains(where: { c.name.hasSuffix("_\($0)_1") })
+                    }
+                }
                 try await sendStreamingOperation(requestId: request.id, to: fd) { send in
+                    // Always emit the tail backlog first so the user sees
+                    // context even when nothing new is being printed.
                     for container in containers {
-                        let logs = await self.engine.vmRuntime.logs(containerID: container.id, tail: 50)
-                        for event in logs {
+                        let backlog = await self.engine.vmRuntime.logs(containerID: container.id, tail: req.tail)
+                        for event in backlog {
                             send(StreamEvent(stream: event.stream, data: "[\(container.name)] \(event.data)"))
                         }
+                    }
+                    if !req.follow { return }
+                    // Follow mode : open a per-container streaming task
+                    // and multiplex their output. Each `engine.logs` already
+                    // yields lines as they appear ; we just relay with a
+                    // `[container.name]` prefix. The group lives until all
+                    // containers exit or the client disconnects.
+                    await withTaskGroup(of: Void.self) { group in
+                        for container in containers {
+                            let name = container.name
+                            let id = container.id
+                            group.addTask {
+                                let logsReq = LogsRequest(id: id, follow: true, tail: 0)
+                                do {
+                                    let stream = try await self.engine.logs(id: id, request: logsReq)
+                                    for try await event in stream {
+                                        send(StreamEvent(stream: event.stream, data: "[\(name)] \(event.data)"))
+                                    }
+                                } catch {
+                                    send(StreamEvent(stream: .stderr, data: "[\(name)] log stream error: \(error)\n"))
+                                }
+                            }
+                        }
+                        await group.waitForAll()
                     }
                 }
 

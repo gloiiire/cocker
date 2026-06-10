@@ -61,21 +61,26 @@ public enum DNSQueryProcessor {
             )
         }
 
-        // AAAA → if we have an IPv6 for the container, answer ; else empty.
-        if question.isAAAA {
-            if let ipv6 = DNSNameResolver.resolveAAAA(name: question.name, in: containers) {
-                return DNSQueryResult(
-                    response: buildAAAAResponse(header: header, question: question, ipv6: ipv6),
-                    kind: .authoritativeAAAA(name: question.name, ipv6: ipv6)
-                )
-            }
+        // AAAA → if the name belongs to a container, answer authoritatively
+        // (with the v6 record if it has one, empty if it doesn't). For
+        // anything else, fall through to upstream forwarding.
+        //
+        // The previous version returned an authoritative empty for ALL
+        // AAAA queries that didn't match a container. uv / pip / npm /
+        // curl all default to "happy-eyeballs" — try AAAA first, only
+        // fall back to A on NXDOMAIN, NOT on NOERROR + zero answers
+        // (RFC 8305 §3). With our authoritative-empty AAAA they treated
+        // CDN hostnames like files.pythonhosted.org as "no such host"
+        // and refused to retry over IPv4, breaking every PyPI sync.
+        if question.isAAAA,
+           let ipv6 = DNSNameResolver.resolveAAAA(name: question.name, in: containers) {
             return DNSQueryResult(
-                response: buildEmptyResponse(header: header, question: question),
-                kind: .empty(name: question.name)
+                response: buildAAAAResponse(header: header, question: question, ipv6: ipv6),
+                kind: .authoritativeAAAA(name: question.name, ipv6: ipv6)
             )
         }
-
-        // Everything else → upstream forwarding, if available.
+        // AAAA queries for non-container names + non-AAAA queries
+        // (anything past the A/AAAA fast paths above) → forward upstream.
         if let forward = forwardUpstream, let upstream = forward(query) {
             return DNSQueryResult(
                 response: upstream,

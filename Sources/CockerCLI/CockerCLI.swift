@@ -87,6 +87,13 @@ struct CockerCLI: AsyncParsableCommand {
             VersionCommand.self,
             InfoCommand.self,
             PruneCommand.self,
+
+            // iCloud Drive integration (macOS-specific)
+            ICloudCommand.self,
+
+            // Shell completion (bash / zsh / fish) — feeds modern
+            // terminal autocomplete (Warp, Zed, Kiro, …).
+            CompletionCommand.self,
         ],
         defaultSubcommand: nil
     )

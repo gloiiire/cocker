@@ -35,10 +35,31 @@ What works today, what's partial, what's missing. Anything not on this list is "
 | `cocker update` | ✅ works | |
 | `cocker login / logout` | ✅ works | Credentials persisted in `~/.cocker/credentials.json` (0o600) |
 | `cocker compose up / down / logs / ps / exec / build / pull / restart / pause / unpause` | ✅ works | Compose v3 spec via Yams |
+| `cocker compose watch` | ✅ works | FSEventStream-based hot-reload ; `--debounce-ms` (default 300 ms) ; auto-skips `~/Library/Caches/cocker/`, `.DS_Store`, `.Spotlight-V100`, `.fseventsd` |
+| `cocker compose logs -f` | ✅ works | follow honoured daemon-side (was one-shot tail pre-0.5.13.17) |
+| `cocker completion bash\|zsh\|fish` | ✅ works | generated from ArgumentParser command graph |
+| `cocker icloud status / prefetch / cache-clear` | ✅ works | cocker-specific ; inspect & control iCloud Drive auto-staging |
 | `cocker network create / rm / ls / inspect / connect / disconnect` | ✅ works | |
 | `cocker volume create / rm / ls / inspect` | ✅ works | |
 | `cocker system info / df / prune / events` | ✅ works | |
 | `cocker context` | ✅ works | |
+
+## Compose features
+
+| Feature | Status | Notes |
+|---|---|---|
+| `services:` core (`image`, `command`, `entrypoint`, `environment`, `ports`, `volumes`, `restart`) | ✅ works | |
+| `build:` (`context`, `dockerfile`, `args`) | ✅ works | |
+| `depends_on:` with `condition: service_healthy` / `service_started` / `service_completed_successfully` | ✅ works | since 0.4.2 |
+| `healthcheck:` (`test`, `interval`, `timeout`, `retries`, `start_period`, `disable`) | ✅ works | snake_case + camelCase accepted |
+| `${VAR}` / `${VAR:-default}` / `${VAR-default}` / `${VAR:?error}` substitution | ✅ works | since 0.5.13.19 — bash-style defaults previously dropped through literally |
+| `env_file:` | ✅ works | since 0.5.13.19 — was silently ignored before ; merged with `environment:` (inline wins) |
+| Anonymous volumes (`- /app/node_modules`) | ✅ works | since 0.5.13.18 — treated as managed volumes, auto-populated from image content on first mount |
+| Bind mounts with relative paths (`./backend:/app`) | ✅ works | since 0.5.13.18 — resolved against compose file directory |
+| `profiles:` | ✅ works | |
+| `networks:` (custom + IPAM) | ✅ works | bridge driver only |
+| `labels:` (array + dict) | ✅ works | |
+| `extends:`, `x-` extensions | ⚠️ partial | parsed, not all paths exercised |
 
 ## Docker HTTP API
 
