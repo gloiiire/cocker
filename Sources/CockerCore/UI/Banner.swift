@@ -298,6 +298,12 @@ public enum Banner {
         out += row("service",   "Manage Swarm services")
         out += row("node",      "Manage Swarm nodes")
 
+        out += header("ICLOUD (macOS)")
+        out += row("icloud",     "Inspect & control iCloud-aware behavior (status, prefetch, cache-clear)")
+
+        out += header("SHELL INTEGRATION")
+        out += row("completion", "Generate shell completion (bash / zsh / fish) — Warp/Zed/Kiro autocomplete")
+
         out += header("SYSTEM & AUTH")
         out += row("system, s",  "Manage Cocker (df, prune, info, events)")
         out += row("info",       "Display system-wide information")

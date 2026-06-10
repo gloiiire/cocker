@@ -1,0 +1,149 @@
+name: Bottle
+
+# Build Homebrew bottles for cocker on every release tag. A "bottle"
+# is a pre-compiled binary tarball that brew downloads instead of
+# running `swift build` on the user's machine — install drops from
+# ~3 min to ~5s. We build one per supported macOS arm64 release
+# (Sonoma 14, Sequoia 15), upload each as a release asset, then
+# rewrite the `bottle do` block in Formula/cocker.rb with the actual
+# sha256s and commit it back to main.
+#
+# Triggered AFTER the Release workflow has uploaded its source-tarball
+# assets, because brew bottling needs the formula's `url` tarball to
+# exist on the release.
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to bottle (e.g. v0.5.13.29)'
+        required: true
+
+permissions:
+  contents: write   # upload bottle assets + push formula update
+
+jobs:
+  bottle:
+    name: Build bottle (${{ matrix.macos }})
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # arm64_sequoia uses macos-15 runners ; arm64_sonoma uses
+          # macos-14. Keep this in sync with the formula's
+          # `depends_on macos:` floor when bumping.
+          - runner: macos-15
+            macos: sequoia
+          - runner: macos-14
+            macos: sonoma
+
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.workflow_run.head_branch }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout cocker @ tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+
+      - name: Setup Homebrew
+        run: |
+          # Use the runner's pre-installed brew. Ensure tap dir exists so
+          # `brew bottle` can write its output JSON.
+          brew --version
+          brew tap-info homebrew/core || true
+
+      # `brew install --build-bottle` runs the formula's `install` block
+      # in a sandbox that records the install prefix (Cellar/cocker/<ver>).
+      # We point brew at the formula in this repo via `--formula
+      # ./Formula/cocker.rb` so we don't need a published tap yet.
+      - name: Install with --build-bottle
+        run: |
+          # Strip the leading `v` from the tag : formula version uses
+          # bare semver (e.g. 0.5.13.29), the tag is v0.5.13.29.
+          VER="${{ steps.tag.outputs.tag }}"; VER="${VER#v}"
+          # Pin the formula's `version` to the tag we're bottling so the
+          # build prefix Cellar path matches what the bottle expects.
+          sed -i.bak "s/^  version \".*\"/  version \"$VER\"/" Formula/cocker.rb
+          # brew install runs the build path of the formula.
+          brew install --build-bottle --formula ./Formula/cocker.rb
+
+      - name: Build bottle tarball
+        id: build
+        run: |
+          # `brew bottle` produces :
+          #   - <name>-<ver>.<os>.bottle.tar.gz
+          #   - <name>-<ver>.<os>.bottle.json (sha256, rebuild count)
+          # Both land in $PWD. The tarball name embeds the os.arch combo
+          # so the formula can pick the right one at install time.
+          brew bottle --no-rebuild --json ./Formula/cocker.rb
+          # Rename the wonky default name (`cocker--<ver>.arm64_<os>.bottle.tar.gz`)
+          # to the URL the formula expects.
+          OLD=$(ls cocker--*.arm64_${{ matrix.macos }}.bottle.tar.gz | head -1)
+          NEW="cocker-${{ steps.tag.outputs.tag }}.arm64_${{ matrix.macos }}.bottle.tar.gz"
+          mv "$OLD" "$NEW"
+          # Same rename for the JSON (kept as build artifact for
+          # debugging ; not uploaded as a release asset).
+          mv cocker--*.arm64_${{ matrix.macos }}.bottle.json bottle-${{ matrix.macos }}.json
+          SHA=$(shasum -a 256 "$NEW" | cut -d' ' -f1)
+          echo "tarball=$NEW" >> $GITHUB_OUTPUT
+          echo "sha256=$SHA"  >> $GITHUB_OUTPUT
+
+      - name: Upload bottle to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" "${{ steps.build.outputs.tarball }}" --clobber
+
+      - name: Persist sha256 for the merge job
+        uses: actions/upload-artifact@v4
+        with:
+          name: sha-${{ matrix.macos }}
+          path: bottle-${{ matrix.macos }}.json
+
+  update-formula:
+    name: Rewrite bottle do block on main
+    needs: bottle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: shas
+
+      - name: Patch Formula/cocker.rb
+        run: |
+          # Extract sha256 from each macOS's bottle json (jq filter
+          # walks the standard `brew bottle --json` shape).
+          SEQ=$(jq -r 'first(.[]).bottle.tags.arm64_sequoia.sha256' shas/sha-sequoia/bottle-sequoia.json)
+          SON=$(jq -r 'first(.[]).bottle.tags.arm64_sonoma.sha256'  shas/sha-sonoma/bottle-sonoma.json)
+          sed -i "s|REPLACE_BOTTLE_SHA256_SEQUOIA|$SEQ|" Formula/cocker.rb
+          sed -i "s|REPLACE_BOTTLE_SHA256_SONOMA|$SON|"  Formula/cocker.rb
+
+      - name: Commit formula update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/cocker.rb
+          git diff --staged --quiet && exit 0
+          git commit -m "chore(bottle): refresh sha256 for $GITHUB_REF_NAME"
+          git push

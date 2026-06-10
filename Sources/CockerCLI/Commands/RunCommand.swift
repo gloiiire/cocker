@@ -44,6 +44,14 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customShort("m"), help: "Memory limit in MB")
     var memory: UInt64 = 512
 
+    @Option(name: .customLong("shm-size"),
+            help: "Size of /dev/shm in MB (default: kernel — usually 64). Common values: 1024 for postgres, 2048 for chromium.")
+    var shmSize: UInt64?
+
+    @Option(name: .customLong("stop-signal"),
+            help: "Signal to use on `cocker stop` before SIGKILL (default SIGTERM)")
+    var stopSignal: String?
+
     @Option(name: .customLong("hostname"), help: "Container hostname")
     var hostname: String?
 
@@ -129,6 +137,8 @@ struct RunCommand: AsyncParsableCommand {
         config.network = network
         config.cpuCount = cpus
         config.memoryMB = memory
+        config.shmSizeMB = shmSize
+        config.stopSignal = stopSignal
         config.hostname = hostname
         config.workdir = workdir
         config.user = user

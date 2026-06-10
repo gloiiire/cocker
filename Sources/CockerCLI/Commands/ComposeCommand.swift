@@ -25,6 +25,7 @@ struct ComposeCommand: AsyncParsableCommand {
             ComposePortCommand.self,
             ComposeImagesCommand.self,
             ComposeEventsCommand.self,
+            ComposeWatchCommand.self,
         ]
     )
 }
@@ -51,25 +52,89 @@ struct ComposeUpCommand: AsyncParsableCommand {
     var services: [String] = []
 
     mutating func run() async throws {
-        let composePath = resolvePath(file)
-        guard FileManager.default.fileExists(atPath: composePath) else {
-            throw CockerError.invalidComposeFile("File not found: \(composePath)")
+        let originalPath = resolvePath(file)
+        guard FileManager.default.fileExists(atPath: originalPath) else {
+            throw CockerError.invalidComposeFile("File not found: \(originalPath)")
         }
 
+        // iCloud Drive paths trigger EDEADLK ("Resource deadlock avoided")
+        // inside cockerd for every COPY past the first one — iCloud's
+        // `bird` daemon serializes file access in a way that deadlocks with
+        // cockerd's Swift concurrency runtime. The CLI runs as a regular
+        // user process and DOES have working iCloud access, so we stage
+        // the whole compose project dir to /tmp here, then point cockerd
+        // at the staged copy.
+        // Staging is cached at ~/Library/Caches/cocker/staging/<hash> so
+        // re-runs are incremental (rsync diffs the iCloud source). Bind
+        // mounts in compose services keep referencing the staged source
+        // for the lifetime of the container — that's why the staging
+        // dir is persistent, not /tmp ephemeral.
+        let stage = try await ICloudStaging.stageIfNeeded(originalPath: originalPath) { msg in
+            print(ANSI.colored(msg, ANSI.cyan))
+        }
+
+        // If we staged to /tmp, ComposeEngine would infer the project name
+        // from the staging dir's parent (something like
+        // `cocker-compose-stage-<UUID>`). Pin the project name to the
+        // ORIGINAL compose-file dir basename so containers/networks land
+        // under the user-recognizable name.
+        let effectiveProjectName = projectName ?? (stage.stagingRoot != nil
+            ? URL(fileURLWithPath: originalPath).deletingLastPathComponent().lastPathComponent
+            : nil)
+
         let client = IPCClient()
-        let payload = ComposeRequest(composePath: composePath, projectName: projectName, services: services, detach: detach)
+        let payload = ComposeRequest(composePath: stage.path, projectName: effectiveProjectName, services: services, detach: detach)
         let request = try IPCRequest(type: .composeUp, payload: payload)
 
-        try await client.sendStreaming(request) { event in
-            switch event.stream {
-            case .stdout: print(event.data, terminator: "")
-            case .stderr: fputs(event.data, stderr)
-            case .status: print(ANSI.colored(event.data, ANSI.cyan))
-            case .error: fputs("Error: \(event.data)\n", stderr)
+        // `-d` short-circuits the interactive footer : the user explicitly
+        // asked for background mode, so we just stream the build / start
+        // progress and exit when the daemon says it's done.
+        if detach {
+            try await client.sendStreaming(request) { event in
+                renderComposeEvent(event)
+            }
+            return
+        }
+
+        // Foreground mode : after the up sequence finishes, attach to the
+        // composed containers' logs and let the user hit `d` to detach
+        // without tearing the project down. Matches `docker compose up`'s
+        // "Attached to N containers" experience.
+        _ = try await InteractiveDetach.run { token in
+            try await client.sendStreaming(request) { event in
+                renderComposeEvent(event)
+            }
+            // After the up call returns the daemon is done building &
+            // starting. From here we attach to the project's running
+            // containers' logs — implemented in a follow-up patch so
+            // the existing teardown-on-exit semantics don't break.
+            // Until then, we simply hold the terminal so the user can
+            // detach cleanly with `d` instead of being dropped back to
+            // the shell the moment up finishes.
+            while !token.isCanceled {
+                try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
     }
+
 }
+
+/// Shared event renderer for compose streaming output. Free function so
+/// it can be captured by `@Sendable` closures without dragging the
+/// enclosing `mutating` command struct in.
+private func renderComposeEvent(_ event: StreamEvent) {
+    switch event.stream {
+    case .stdout: print(event.data, terminator: "")
+    case .stderr: fputs(event.data, stderr)
+    case .status: print(ANSI.colored(event.data, ANSI.cyan))
+    case .error: fputs("Error: \(event.data)\n", stderr)
+    }
+}
+
+// ICloudStaging lives in Sources/CockerCLI/ICloudStaging.swift now ; the
+// implementation grew enough optimizations (stable cache dir, brctl
+// pre-fetch, xattr-based detection, .cockerignore support) that it
+// deserved its own file and reuse from BuildCommand.
 
 struct ComposeDownCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "down", abstract: "Stop and remove containers, networks")
@@ -141,13 +206,29 @@ struct ComposeLogsCommand: AsyncParsableCommand {
     @Option(name: [.short, .customLong("project-name")], help: "Project name")
     var projectName: String?
 
+    @Option(name: .customLong("tail"),
+            help: "Number of lines to show from the end of the logs (default 50)")
+    var tail: Int = 50
+
     @Argument(help: "Services to show logs for (default: all)")
     var services: [String] = []
 
     mutating func run() async throws {
         let composePath = resolvePath(file)
+        // Default project name to the cwd basename when --project-name is
+        // omitted, so `cocker compose logs` from the project dir Just
+        // Works without arguments — matches docker compose's behavior.
+        let effectiveProjectName = projectName
+            ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent
+
         let client = IPCClient()
-        let payload = ComposeRequest(composePath: composePath, projectName: projectName, services: services)
+        let payload = ComposeRequest(
+            composePath: composePath,
+            projectName: effectiveProjectName,
+            services: services,
+            follow: follow,
+            tail: tail
+        )
         let request = try IPCRequest(type: .composeLogs, payload: payload)
 
         try await client.sendStreaming(request) { event in

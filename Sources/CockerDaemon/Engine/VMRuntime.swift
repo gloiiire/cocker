@@ -9,6 +9,47 @@ import CockerCore
 
 @MainActor
 final class VMRuntime: NSObject {
+
+    /// Docker-compatible volume seeding : when a fresh managed volume
+    /// is about to mount on `destination`, populate it with whatever
+    /// the image baked at that path. Mirrors docker's "anonymous volume
+    /// initialization" behaviour so node stacks (`/app/node_modules`),
+    /// Python virtualenvs (`/app/.venv`), Ruby gems, etc. don't vanish
+    /// when the user adds a bind mount on the parent dir.
+    ///
+    /// Safe to call unconditionally : it no-ops when `volumeDir` is
+    /// already populated, or when the image has nothing at
+    /// `destination`. The check is cheap (one `contentsOfDirectory`).
+    static func seedFromImageIfFresh(
+        volumeDir: URL,
+        imageRootfs: URL,
+        destination: String
+    ) {
+        // Already populated → never overwrite. Docker semantics : the
+        // seeding only happens on FIRST mount.
+        let existing = (try? FileManager.default.contentsOfDirectory(atPath: volumeDir.path)) ?? []
+        if !existing.isEmpty { return }
+
+        let imageContentPath = imageRootfs.appendingPathComponent(
+            destination.hasPrefix("/") ? String(destination.dropFirst()) : destination
+        )
+        var srcIsDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: imageContentPath.path, isDirectory: &srcIsDir),
+              srcIsDir.boolValue else { return }
+
+        // `cp -Rp src/. dst` copies the CONTENTS into dst rather than
+        // nesting src under dst. Use a subprocess so symlinks / mode
+        // bits / mtimes survive correctly — Foundation's copy APIs
+        // mangle some of these on macOS.
+        let cp = Process()
+        cp.executableURL = URL(fileURLWithPath: "/bin/cp")
+        cp.arguments = ["-Rp", imageContentPath.path + "/.", volumeDir.path]
+        cp.standardOutput = Pipe()
+        cp.standardError = Pipe()
+        try? cp.run()
+        cp.waitUntilExit()
+    }
+
     struct RunningVM {
         let vm: VZVirtualMachine
         let containerID: String
@@ -168,6 +209,17 @@ final class VMRuntime: NSObject {
                     // Fallback : legacy layout from <0.5.13.
                     let legacyDir = rootDir.appendingPathComponent("volumes/\(mount.source)/_data")
                     try FileManager.default.createDirectory(at: legacyDir, withIntermediateDirectories: true)
+                    // Same image-content seeding as the block-storage path :
+                    // a fresh anonymous volume is populated from whatever the
+                    // image baked at the destination path. Without this,
+                    // mounting `/app/node_modules` as an empty anon volume
+                    // hides nodemon / ts-node / etc. that `npm install`
+                    // baked into the image.
+                    Self.seedFromImageIfFresh(
+                        volumeDir: legacyDir,
+                        imageRootfs: rootfsPath,
+                        destination: mount.destination
+                    )
                     let volShare = VZSingleDirectoryShare(directory: VZSharedDirectory(url: legacyDir, readOnly: mount.readOnly))
                     let volFS = VZVirtioFileSystemDeviceConfiguration(tag: "vol\(i)")
                     volFS.share = volShare
@@ -196,6 +248,15 @@ final class VMRuntime: NSObject {
                 // Virtiofs path (directory bind mount, or legacy named
                 // volume whose data.img wasn't found above).
                 try FileManager.default.createDirectory(at: hostURL, withIntermediateDirectories: true)
+
+                if !mount.source.hasPrefix("/") {
+                    Self.seedFromImageIfFresh(
+                        volumeDir: hostURL,
+                        imageRootfs: rootfsPath,
+                        destination: mount.destination
+                    )
+                }
+
                 let volShare = VZSingleDirectoryShare(directory: VZSharedDirectory(url: hostURL, readOnly: mount.readOnly))
                 let volFS = VZVirtioFileSystemDeviceConfiguration(tag: "vol\(i)")
                 volFS.share = volShare

@@ -55,6 +55,13 @@ public struct Container: Codable, Sendable, Identifiable {
     /// container's main process. Empty/nil = init's default (SIGTERM).
     /// Examples : "SIGQUIT" for nginx, "SIGINT" for some PHP-FPM setups.
     public var stopSignal: String?
+    /// `--shm-size` : size of /dev/shm tmpfs inside the container in MiB.
+    /// nil = leave the in-container default (typically 64 MB on Linux).
+    /// Postgres needs ~1024+, Chromium-based stuff often demands 2048+,
+    /// without which the apps crash with cryptic "no space left on
+    /// device" errors. Plumbed through the kernel cmdline so cocker-init
+    /// can size the shm mount before the user process starts.
+    public var shmSizeMB: UInt64?
 
     public init(
         id: String = UUID().uuidString.prefix(12).lowercased(),
@@ -493,6 +500,16 @@ public struct RunConfig: Codable, Sendable {
     public var healthStartPeriod: TimeInterval?
     public var healthRetries: Int?
     public var healthDisable: Bool
+    /// Signal cocker-init sends to PID 1 on `docker stop` / `cocker stop`
+    /// before falling back to SIGKILL after the grace period. Default
+    /// SIGTERM matches Docker. Accepts `SIGTERM`, `SIGINT`, `SIGUSR1`,
+    /// `15`, etc. — passed through to the runtime as-is.
+    public var stopSignal: String?
+    /// Size of `/dev/shm` tmpfs inside the container in MiB. nil =
+    /// inherit kernel default (typically 64MB on Linux). Matches
+    /// Docker `--shm-size` ; postgres / redis / chromium tend to need
+    /// 1024+.
+    public var shmSizeMB: UInt64?
 
     public init(image: String, command: [String] = []) {
         self.image = image
@@ -529,6 +546,8 @@ public struct RunConfig: Codable, Sendable {
         self.healthStartPeriod = nil
         self.healthRetries = nil
         self.healthDisable = false
+        self.stopSignal = nil
+        self.shmSizeMB = nil
     }
 }
 

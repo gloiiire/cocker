@@ -114,6 +114,13 @@ public enum KernelCommandLine {
             parts.append("cocker.user=\(user)")
         }
 
+        // `--shm-size` : cocker-init reads this and re-mounts /dev/shm
+        // tmpfs with `size=Nm`. Default Linux gives only 64 MB which
+        // postgres / chromium / pytorch routinely overrun.
+        if let shm = params.container.shmSizeMB, shm > 0 {
+            parts.append("cocker.shm_mb=\(shm)")
+        }
+
         // Cross-arch build : tell cocker-init what foreign-arch ELFs to
         // route through qemu-user-static. Without these two params the
         // qemu_register_binfmt path in qemu.c is a no-op.

@@ -319,6 +319,40 @@ int main(int argc, char **argv) {
     switch_to_virtiofs();
     mount_volumes(cmdline);
 
+    /* `--shm-size` : Linux gives /dev/shm only 64 MB by default which
+     * postgres / redis / chromium / pytorch routinely overrun. When the
+     * user passes --shm-size=N to `cocker run`, we re-mount /dev/shm
+     * tmpfs with `size=Nm`. Done after switch_to_virtiofs so the mount
+     * lands on the post-switch /dev (otherwise it gets shadowed). The
+     * remount uses MS_REMOUNT semantics when /dev/shm already exists,
+     * or a fresh tmpfs mount when it doesn't (busybox-based images
+     * sometimes ship without /dev/shm at all). */
+    {
+        char *shm_mb_s = cmdline_get(cmdline, "shm_mb");
+        if (shm_mb_s) {
+            unsigned long mb = strtoul(shm_mb_s, NULL, 10);
+            if (mb > 0) {
+                char opts[64];
+                snprintf(opts, sizeof(opts), "size=%lum", mb);
+                mkdir("/dev/shm", 01777);
+                if (mount("tmpfs", "/dev/shm", "tmpfs",
+                          MS_NOSUID | MS_NODEV, opts) < 0) {
+                    /* Fallback to remount when /dev/shm was already
+                     * mounted by devtmpfs. */
+                    if (mount("tmpfs", "/dev/shm", "tmpfs",
+                              MS_REMOUNT | MS_NOSUID | MS_NODEV, opts) < 0) {
+                        info("/dev/shm size=%lum: %s", mb, strerror(errno));
+                    } else {
+                        info("/dev/shm remounted size=%lum", mb);
+                    }
+                } else {
+                    info("/dev/shm mounted size=%lum", mb);
+                }
+            }
+            free(shm_mb_s);
+        }
+    }
+
     /* Workaround Apple virtiofsd bug that breaks shadow-utils (groupadd,
      * useradd) — must happen BEFORE pin_resolv_conf so the runtime pin
      * lands on the tmpfs overlay and doesn't accidentally persist into

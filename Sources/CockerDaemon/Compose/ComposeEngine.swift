@@ -694,13 +694,46 @@ actor ComposeEngine {
         config.ports = (service.ports ?? []).compactMap { try? PortMapping.parse($0) }
 
         // Volumes
+        let composeDir = (composePath as NSString).deletingLastPathComponent
         config.volumes = (service.volumes ?? []).compactMap { s in
             let parts = s.split(separator: ":", maxSplits: 2).map(String.init)
-            if parts.count == 1 { return VolumeMount(source: parts[0], destination: parts[0]) }
+            // Single-part volume entry like `- /app/node_modules` is a
+            // Docker Compose ANONYMOUS volume — a per-container managed
+            // volume that "shadows" whatever's at that path inside the
+            // container (typical Node pattern : keep the image's Linux
+            // node_modules instead of letting the bind-mounted ./backend
+            // overwrite it with the host's). NOT a host bind mount.
+            if parts.count == 1 {
+                let dest = parts[0]
+                let normalized = dest
+                    .replacingOccurrences(of: "/", with: "_")
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+                let anonName = "\(projectName)_\(serviceName)_anon_\(normalized)"
+                return VolumeMount(source: anonName, destination: dest)
+            }
             if parts.count >= 2 {
                 let ro = parts.count == 3 && parts[2] == "ro"
-                // Prefix named volumes with project name
-                let src = parts[0].hasPrefix("/") ? parts[0] : "\(projectName)_\(parts[0])"
+                let rawSrc = parts[0]
+                let src: String
+                if rawSrc.hasPrefix("/") {
+                    // Absolute host path → bind mount.
+                    src = rawSrc
+                } else if rawSrc.hasPrefix("./") || rawSrc.hasPrefix("../") || rawSrc.contains("/") {
+                    // Compose-spec relative bind mount (`./backend`,
+                    // `../shared`, `subdir/foo`) — resolve against the
+                    // compose file's directory and pass to the volume
+                    // resolver as an absolute path so it's treated as a
+                    // bind mount, NOT a named volume.
+                    let resolved = URL(fileURLWithPath: composeDir)
+                        .appendingPathComponent(rawSrc)
+                        .standardizedFileURL
+                        .path
+                    src = resolved
+                } else {
+                    // No slash → genuine named volume reference. Prefix
+                    // with project name to namespace per project.
+                    src = "\(projectName)_\(rawSrc)"
+                }
                 return VolumeMount(source: src, destination: parts[1], readOnly: ro)
             }
             return nil
