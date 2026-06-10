@@ -274,17 +274,25 @@ public struct ComposeRequest: Codable, Sendable {
     /// created. Bind mounts are never touched (Docker semantics —
     /// volumes the user mounted from host paths are theirs to manage).
     public let removeVolumes: Bool
+    /// `compose logs -f` : stream log lines as they arrive. Old CLIs
+    /// don't send this field ; daemon falls back to a one-shot tail.
+    public let follow: Bool
+    /// How many tail lines to send before going live (or as a one-shot
+    /// when `follow == false`). Mirrors `docker compose logs --tail`.
+    public let tail: Int
     public init(composePath: String, projectName: String? = nil, services: [String] = [],
                 detach: Bool = false, activeProfiles: [String]? = nil,
-                removeVolumes: Bool = false) {
+                removeVolumes: Bool = false, follow: Bool = false, tail: Int = 50) {
         self.composePath = composePath; self.projectName = projectName
         self.services = services; self.detach = detach
         self.activeProfiles = activeProfiles
         self.removeVolumes = removeVolumes
+        self.follow = follow
+        self.tail = tail
     }
 
     enum CodingKeys: String, CodingKey {
-        case composePath, projectName, services, detach, activeProfiles, removeVolumes
+        case composePath, projectName, services, detach, activeProfiles, removeVolumes, follow, tail
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -296,6 +304,9 @@ public struct ComposeRequest: Codable, Sendable {
         // Default false : older CLIs that don't send the field keep the
         // pre-7.2 behaviour ("`down` never touches volumes").
         self.removeVolumes  = try c.decodeIfPresent(Bool.self, forKey: .removeVolumes) ?? false
+        // Same backwards-compat dance for follow/tail.
+        self.follow         = try c.decodeIfPresent(Bool.self, forKey: .follow) ?? false
+        self.tail           = try c.decodeIfPresent(Int.self,  forKey: .tail) ?? 50
     }
 }
 
@@ -443,7 +454,7 @@ public struct UpdateRequest: Codable, Sendable {
 public enum CockerVersion {
     // Bumped manually with each tag. TODO : drive from a Version.generated.swift
     // produced by the release workflow so this can't drift again.
-    public static let version = "0.5.11"
+    public static let version = "0.5.14.0"
     public static let apiVersion = "1.0"
     public static let buildTime = "2026-06-08"
     public static let minAPIVersion = "1.0"

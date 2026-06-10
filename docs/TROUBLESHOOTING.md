@@ -53,6 +53,41 @@ The L2 fabric only forwards Ethernet frames ; it doesn't synthesize TCP.
 
 The App Sandbox restricts user-signed daemons from `connect()`ing to private vmnet IPs. cockerd works around this by spawning `cocker-portfwd` (a separately-signed binary) and `/usr/bin/nc` (Apple-signed) for the actual outbound connection. If `cocker-portfwd` is missing or unsigned, host → container port forwarding silently fails — `brew reinstall cocker` should fix it.
 
+### iCloud Drive deadlocks (`EDEADLK` during build / compose up)
+
+If you see `cockerd` failing partway through `COPY` with
+`Resource deadlock avoided`, or `cocker compose up` hanging on the
+first `read()`, the project lives under iCloud Drive
+(`~/Library/Mobile Documents/com~apple~CloudDocs/` or a path with the
+"Desktop & Documents Folders" sync xattr).
+
+Apple's `bird` (the iCloud coordinator) serializes filesystem syscalls
+on iCloud-resident paths inside user-space. A long-running daemon
+issuing many concurrent `read()`s past the first few files trips
+`bird` into returning `EDEADLK`. This affects `cp -R`, `ditto`, and
+even raw `read()` from inside cockerd — there is no host-side fix.
+
+**Cocker handles this automatically since 0.5.13.20.** `cocker compose up`
+/ `cocker build` auto-detect iCloud paths, pre-fetch any dataless
+files, and rsync the tree to `~/Library/Caches/cocker/staging/` before
+handing it to the daemon. Subsequent runs are incremental.
+
+If you hit the deadlock on an older build, or want to inspect what
+cocker is doing :
+
+```bash
+cocker icloud status                  # what's dataless ?
+cocker icloud prefetch                # warm the cache via brctl
+cocker icloud cache-clear             # nuke the staging dir
+```
+
+Manual workaround if you're stuck on a build that pre-dates staging :
+copy the project out of iCloud (`rsync -a ~/Library/Mobile\ Documents/com~apple~CloudDocs/myproject ~/Projects/`)
+and run cocker from the local copy.
+
+The `COCKER_FORCE_STAGE=1` env var forces staging for non-iCloud paths
+too — useful when reproducing the issue against a local copy.
+
 ### Containers pile up after a crash
 
 `cockerd` reconciles on startup (since v0.2.0) but only marks them stopped — it doesn't delete them. List with `cocker ps -a` and bulk-remove with `cocker rm -f $(cocker ps -a -q)`.

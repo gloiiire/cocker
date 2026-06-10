@@ -1,9 +1,18 @@
 import Foundation
 import CockerCore
+#if canImport(Darwin)
+import Darwin
+#endif
 
 actor VolumeManager {
     private let store: StateStore
     private let volumesRoot: URL
+
+    /// Default sparse image size for new volumes (8 GiB). Sparse on APFS —
+    /// only the actually-written bytes consume disk space. Large enough for
+    /// a typical postgres / mysql dev workload ; users with bigger needs
+    /// can grow the image after the fact with `truncate -s N data.img`.
+    private static let defaultImgSize: UInt64 = 8 * 1024 * 1024 * 1024
 
     init(store: StateStore, rootDir: URL) {
         self.store = store
@@ -18,12 +27,66 @@ actor VolumeManager {
             throw CockerError.volumeAlreadyExists(request.name)
         }
 
-        let mountpoint = volumesRoot.appendingPathComponent("\(request.name)/_data")
-        try FileManager.default.createDirectory(at: mountpoint, withIntermediateDirectories: true)
+        // Block-storage layout : <root>/volumes/<name>/data.img is a sparse
+        // ext4 disk image attached to the VM as a virtio block device. The
+        // guest formats + mounts it on first attach (cocker-init handles
+        // mkfs.ext4 if no filesystem is present). Chown / chmod work
+        // natively inside a real Linux fs, unlike Apple's virtiofs which
+        // returns EPERM for guest-side metadata changes (broke postgres,
+        // mysql, every database that chowns its data dir at startup).
+        let volDir = volumesRoot.appendingPathComponent(request.name)
+        try FileManager.default.createDirectory(at: volDir, withIntermediateDirectories: true)
+        let imgURL = volDir.appendingPathComponent("data.img")
+        let fd = open(imgURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard fd >= 0 else {
+            throw CockerError.requestFailed("create volume \(request.name): \(String(cString: strerror(errno)))")
+        }
+        let rc = ftruncate(fd, off_t(Self.defaultImgSize))
+        close(fd)
+        guard rc == 0 else {
+            try? FileManager.default.removeItem(at: imgURL)
+            throw CockerError.requestFailed("ftruncate volume image: \(String(cString: strerror(errno)))")
+        }
+
+        // Format the sparse file as ext4 host-side using the user's
+        // brew-installed e2fsprogs (`brew install e2fsprogs`). Running it
+        // here means the volume is mountable immediately at attach time —
+        // no need to ship a static mke2fs in cocker-init's initrd or to
+        // hope the user's container image bundles e2fsprogs. If mke2fs
+        // isn't on disk we leave the .img unformatted and log a hint ;
+        // cocker-init will then try the in-image mke2fs as a fallback.
+        let mkfsCandidates = [
+            "/opt/homebrew/opt/e2fsprogs/sbin/mke2fs",
+            "/opt/homebrew/sbin/mke2fs",
+            "/usr/local/opt/e2fsprogs/sbin/mke2fs",
+            "/usr/local/sbin/mke2fs",
+        ]
+        if let mke2fs = mkfsCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: mke2fs)
+            proc.arguments = ["-t", "ext4", "-F", "-q", imgURL.path]
+            proc.standardOutput = Pipe()
+            proc.standardError = Pipe()
+            try proc.run()
+            proc.waitUntilExit()
+            if proc.terminationStatus != 0 {
+                try? FileManager.default.removeItem(at: imgURL)
+                throw CockerError.requestFailed(
+                    "mke2fs failed (exit \(proc.terminationStatus)) on \(imgURL.path)"
+                )
+            }
+        } else {
+            fputs(
+                "[volumes] warning: mke2fs not found on host (brew install e2fsprogs) — " +
+                "volume \(request.name) will be formatted on first container attach " +
+                "if its image bundles mkfs.ext4 (Alpine: apk add e2fsprogs)\n",
+                stderr
+            )
+        }
 
         let volume = VolumeInfo(
             name: request.name,
-            mountpoint: mountpoint.path,
+            mountpoint: imgURL.path,
             driver: request.driver,
             labels: request.labels
         )

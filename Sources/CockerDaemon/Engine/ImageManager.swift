@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import CockerCore
 import Crypto
@@ -453,10 +454,19 @@ actor ImageManager {
 actor DockerfileBuilder {
     private let imageManager: ImageManager
     private let vmRuntime: VMRuntime?  // optionnel : nil → RUN log un warning au lieu d'exécuter
-    private let config: BuildConfig
+    private var config: BuildConfig
     private let progressHandler: (StreamEvent) -> Void
     private var stepCount = 0
     private var totalSteps = 0
+    /// When the original context lives in iCloud Drive we stage a copy
+    /// under /tmp (see `build()` for the rationale) and rewrite
+    /// `config.contextPath` to point at it. Kept here so we can clean up
+    /// at the end of the build.
+    private var stagedContextDir: URL?
+    /// Patterns parsed from `.dockerignore` / `.cockerignore` at the build
+    /// context root. Consulted in every COPY to filter out files Docker's
+    /// build context normally excludes (node_modules, .git, etc.).
+    private var ignorePatterns: [String] = []
 
     // Build state
     private var currentRootfsPath: URL?
@@ -485,7 +495,29 @@ actor DockerfileBuilder {
     }
 
     func build() async throws -> ImageInfo {
-        let dockerfilePath = config.contextPath + "/" + config.dockerfile
+        defer {
+            if let staged = stagedContextDir {
+                try? FileManager.default.removeItem(at: staged)
+            }
+        }
+        // Cockerfile takes precedence over Dockerfile when both exist —
+        // lets users keep a Docker-flavored Dockerfile for compatibility
+        // with `docker build` while exposing cocker-specific tweaks
+        // (init.c kernel cmdline overrides, VM resource caps, etc.) in
+        // a Cockerfile. Honored only when the user didn't pick an
+        // explicit file via `-f`; an explicit `--file foo` wins.
+        let dockerfilePath: String
+        let userPickedFile = config.dockerfile != "Dockerfile"
+        if userPickedFile {
+            dockerfilePath = config.contextPath + "/" + config.dockerfile
+        } else {
+            let cockerCandidate = config.contextPath + "/Cockerfile"
+            if FileManager.default.fileExists(atPath: cockerCandidate) {
+                dockerfilePath = cockerCandidate
+            } else {
+                dockerfilePath = config.contextPath + "/" + config.dockerfile
+            }
+        }
         guard FileManager.default.fileExists(atPath: dockerfilePath) else {
             throw CockerError.dockerfileNotFound(dockerfilePath)
         }
@@ -493,9 +525,47 @@ actor DockerfileBuilder {
         let dockerfile = try String(contentsOfFile: dockerfilePath, encoding: .utf8)
         let instructions = try parseDockerfile(dockerfile)
 
+        // Load .dockerignore / .cockerignore from the context root so the
+        // COPY loop below can skip ignored paths the same way docker does.
+        // Only the file at the context root counts — Docker doesn't merge
+        // nested ones.
+        ignorePatterns = Self.loadIgnoreFile(at: config.contextPath)
+
         totalSteps = instructions.count
         log(.status, "Sending build context to Cocker daemon")
         log(.status, "Step 0/\(totalSteps): Parsing Dockerfile")
+
+        // When the build context lives in iCloud Drive
+        // (`~/Library/Mobile Documents/com~apple~CloudDocs/`), repeated COPY
+        // operations against the same files hit EDEADLK ("Resource deadlock
+        // avoided") inside cockerd because iCloud's `bird` daemon serializes
+        // access in a way that deadlocks with the daemon's own threads (the
+        // FIRST access works ; the SECOND fails). `ditto` from a terminal
+        // doesn't have this problem, so we stage the entire context to
+        // `/tmp` ONCE up front with `ditto` and rewrite `config.contextPath`
+        // to point at the staged copy. All subsequent COPYs read from a
+        // local /tmp tree, no iCloud involvement.
+        if config.contextPath.contains("/Mobile Documents/com~apple~CloudDocs/") {
+            let staged = FileManager.default.temporaryDirectory
+                .appendingPathComponent("cocker-context-\(UUID().uuidString)")
+            log(.stdout, " ---> Staging iCloud build context to \(staged.lastPathComponent)\n")
+            try FileManager.default.createDirectory(at: staged, withIntermediateDirectories: true)
+            let rsyncP = Process()
+            rsyncP.executableURL = URL(fileURLWithPath: "/usr/bin/rsync")
+            rsyncP.arguments = ["-a", config.contextPath + "/", staged.path + "/"]
+            let rsyncErr = Pipe()
+            rsyncP.standardError = rsyncErr
+            rsyncP.standardOutput = Pipe()
+            try rsyncP.run()
+            rsyncP.waitUntilExit()
+            if rsyncP.terminationStatus != 0 {
+                let errData = (try? rsyncErr.fileHandleForReading.readToEnd()) ?? Data()
+                let msg = String(data: errData, encoding: .utf8) ?? ""
+                throw CockerError.buildFailed("Failed to stage iCloud context: \(msg)")
+            }
+            stagedContextDir = staged
+            config.contextPath = staged.path
+        }
 
         // Accumulated image config
         var baseImage: String = ""
@@ -745,7 +815,30 @@ actor DockerfileBuilder {
                     log(.stderr, "Warning: COPY/ADD needs at least src and dst\n"); continue
                 }
                 let dst = parts.last!
-                let srcs = Array(parts.dropLast())
+                let rawSrcs = Array(parts.dropLast())
+
+                // Dockerfile COPY supports glob patterns in source paths
+                // (e.g. `COPY package*.json ./`). Expand each src against the
+                // build context root using fnmatch ; non-glob srcs pass
+                // through untouched. If a glob matches nothing we leave the
+                // original literal in place so the "not found" warning still
+                // fires for the user.
+                let expanded: [String] = rawSrcs.flatMap { src -> [String] in
+                    if !src.contains("*") && !src.contains("?") && !src.contains("[") {
+                        return [src]
+                    }
+                    let matches = Self.expandGlob(src, root: sourceRoot)
+                    return matches.isEmpty ? [src] : matches
+                }
+                // Apply .dockerignore / .cockerignore patterns only when the
+                // source dir is the build context (not for `--from=<stage>`
+                // copies — those obey the source stage's own filesystem).
+                let applyIgnore = (fromStage == nil) && !ignorePatterns.isEmpty
+                let srcs: [String] = expanded.filter { src in
+                    if !applyIgnore { return true }
+                    let rel = src.hasPrefix("/") ? String(src.dropFirst()) : src
+                    return !Self.isIgnoredPath(rel, patterns: ignorePatterns)
+                }
 
                 for src in srcs {
                     // Strip leading "/" so the path is appended UNDER the
@@ -753,6 +846,20 @@ actor DockerfileBuilder {
                     let srcRel = src.hasPrefix("/") ? String(src.dropFirst()) : src
                     let srcURL = sourceRoot.appendingPathComponent(srcRel)
                     let absWorkdir = rootfs.appendingPathComponent(workdir.hasPrefix("/") ? String(workdir.dropFirst()) : workdir)
+
+                    // `COPY . dst/` is supposed to copy the build context's
+                    // CONTENTS into dst, not the context dir itself nested
+                    // under dst. Swift's URL.lastPathComponent for paths
+                    // ending in "." returns "." literally, which used to
+                    // make the path arithmetic below produce `dst/./` and
+                    // either NOOP-loop or crash FileManager with "The file
+                    // 'foo' doesn't exist." Detecting this upfront and
+                    // recursing into the context for each entry is the
+                    // standard Docker semantics here.
+                    let isWholeContextCopy = (src == "." || src == "./")
+                    let srcBasename: String? = isWholeContextCopy
+                        ? nil
+                        : srcURL.lastPathComponent
 
                     // Resolve dst to an absolute URL inside the rootfs.
                     // Dockerfile dst rules:
@@ -767,20 +874,63 @@ actor DockerfileBuilder {
                             var isDir: ObjCBool = false
                             return FileManager.default.fileExists(atPath: probe.path, isDirectory: &isDir) && isDir.boolValue
                         }())
-                    let dstPath: String = dstIsDir
-                        ? (dst.hasSuffix("/") ? dst + srcURL.lastPathComponent
-                                              : "\(dst)/\(srcURL.lastPathComponent)")
-                        : dst
-
-                    let dstURL: URL
-                    if dstPath.hasPrefix("/") {
-                        dstURL = rootfs.appendingPathComponent(String(dstPath.dropFirst()))
+                    // When src is a whole context copy (`.` / `./`), the
+                    // destination IS the directory we merge into — no
+                    // basename to append.
+                    let dstPath: String
+                    if let basename = srcBasename, dstIsDir {
+                        dstPath = dst.hasSuffix("/")
+                            ? dst + basename
+                            : "\(dst)/\(basename)"
                     } else {
-                        dstURL = absWorkdir.appendingPathComponent(dstPath)
+                        dstPath = dst
+                    }
+
+                    // Normalize leading "./" so URL doesn't carry a literal
+                    // "/./" segment (FileManager copyItem chokes on those —
+                    // e.g. dst="./" + basename="x" → dstPath="./x" → the URL
+                    // ends up as "<workdir>/./x" and the copy fails with
+                    // "couldn't be copied to '.'").
+                    let normalizedDst: String = {
+                        if dstPath == "./" || dstPath == "." { return "" }
+                        if dstPath.hasPrefix("./") { return String(dstPath.dropFirst(2)) }
+                        return dstPath
+                    }()
+                    let dstURL: URL
+                    if normalizedDst.hasPrefix("/") {
+                        dstURL = rootfs.appendingPathComponent(String(normalizedDst.dropFirst()))
+                    } else if normalizedDst.isEmpty {
+                        dstURL = absWorkdir
+                    } else {
+                        dstURL = absWorkdir.appendingPathComponent(normalizedDst)
                     }
 
                     try FileManager.default.createDirectory(at: dstURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    if FileManager.default.fileExists(atPath: srcURL.path) {
+
+                    if isWholeContextCopy {
+                        // Iterate context entries and copy each one INTO dst.
+                        // Mirrors `cp -r src/. dst/` (note the trailing dot).
+                        try FileManager.default.createDirectory(at: dstURL, withIntermediateDirectories: true)
+                        let rawEntries = (try? FileManager.default.contentsOfDirectory(at: srcURL, includingPropertiesForKeys: nil, options: [])) ?? []
+                        // Filter out entries that match a .dockerignore /
+                        // .cockerignore pattern — same filter the CLI rsync
+                        // staging applies, but evaluated again here so plain
+                        // `cocker build` (not via compose) and any non-iCloud
+                        // build also honors the ignore file.
+                        let entries: [URL] = applyIgnore
+                            ? rawEntries.filter { !Self.isIgnoredPath($0.lastPathComponent, patterns: ignorePatterns) }
+                            : rawEntries
+                        for entry in entries {
+                            let entryDst = dstURL.appendingPathComponent(entry.lastPathComponent)
+                            if FileManager.default.fileExists(atPath: entryDst.path) {
+                                try? FileManager.default.removeItem(at: entryDst)
+                            }
+                            try Self.copyTree(from: entry, to: entryDst)
+                        }
+                        let skipped = rawEntries.count - entries.count
+                        let skipNote = skipped > 0 ? " (\(skipped) ignored)" : ""
+                        log(.stdout, " ---> COPY \(src) -> \(dstPath) (\(entries.count) entries)\(skipNote)\n")
+                    } else if FileManager.default.fileExists(atPath: srcURL.path) {
                         // Only remove the destination if it is an existing
                         // regular file we're about to overwrite — never a
                         // directory (would nuke unrelated files).
@@ -796,9 +946,9 @@ actor DockerfileBuilder {
                             if FileManager.default.fileExists(atPath: merged.path) {
                                 try FileManager.default.removeItem(at: merged)
                             }
-                            try FileManager.default.copyItem(at: srcURL, to: merged)
+                            try Self.copyTree(from: srcURL, to: merged)
                         } else {
-                            try FileManager.default.copyItem(at: srcURL, to: dstURL)
+                            try Self.copyTree(from: srcURL, to: dstURL)
                         }
                         log(.stdout, " ---> COPY \(src) -> \(dstPath)\n")
                     } else {
@@ -1056,6 +1206,158 @@ actor DockerfileBuilder {
         return imageInfo
     }
 
+    // MARK: - COPY filesystem helpers
+
+    /// Copy a file or directory tree from `src` to `dst` by spawning
+    /// `/bin/cp -Rp`. We deliberately use a subprocess instead of any
+    /// in-process API : on iCloud-managed sources (`~/Library/Mobile
+    /// Documents/com~apple~CloudDocs/`), `FileManager.copyItem`,
+    /// `copyfile(3)`, and even raw `open()`/`read()` from cockerd all
+    /// deadlock with `EDEADLK` ("Resource deadlock avoided") on the SECOND
+    /// concurrent access to a file in the same iCloud-managed directory —
+    /// iCloud's `bird` coordinator serializes inside the calling process.
+    /// A subprocess gets a fresh coordinator state per invocation, so each
+    /// `cp` runs cleanly.
+    static func copyTree(from src: URL, to dst: URL) throws {
+        // `cp -R src dst` copies src AS dst when dst doesn't exist. If dst
+        // already exists as a dir, cp would nest src INSIDE dst (i.e.
+        // dst/src.lastPathComponent), which is not what callers expect — they
+        // want dst itself to be the copy. We pre-check & remove an existing
+        // dst here so the resulting layout is predictable.
+        if FileManager.default.fileExists(atPath: dst.path) {
+            try FileManager.default.removeItem(at: dst)
+        }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/cp")
+        proc.arguments = ["-Rp", src.path, dst.path]
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        proc.standardOutput = Pipe()
+        try proc.run()
+        proc.waitUntilExit()
+        if proc.terminationStatus != 0 {
+            let errData = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
+            let msg = String(data: errData, encoding: .utf8) ?? ""
+            throw NSError(domain: "ImageManager.copyTree", code: Int(proc.terminationStatus), userInfo: [
+                NSLocalizedDescriptionKey: "cp -Rp \(src.lastPathComponent) → \(dst.lastPathComponent) failed (exit \(proc.terminationStatus)): \(msg.trimmingCharacters(in: .whitespacesAndNewlines))"
+            ])
+        }
+    }
+
+    // MARK: - .dockerignore / .cockerignore support
+
+    /// Parse `.cockerignore` (preferred) or `.dockerignore` at the build
+    /// context root. Returns the list of pattern lines, stripped of
+    /// comments and blank lines, preserving order so leading-negation
+    /// (`!pattern`) re-includes work the same way Docker's buildkit
+    /// resolves them.
+    static func loadIgnoreFile(at contextPath: String) -> [String] {
+        // .cockerignore wins if both exist, mirroring how Compose and
+        // Docker themselves let project-specific config override the
+        // shared default file.
+        for name in [".cockerignore", ".dockerignore"] {
+            let p = contextPath + "/" + name
+            guard let content = try? String(contentsOfFile: p, encoding: .utf8) else {
+                continue
+            }
+            return content.split(separator: "\n").compactMap { raw -> String? in
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if line.isEmpty || line.hasPrefix("#") { return nil }
+                return line
+            }
+        }
+        return []
+    }
+
+    /// True if `relPath` (relative to the build context root, no leading
+    /// `/`) matches an ignore pattern. Patterns containing `**` match
+    /// arbitrary path depth ; a single trailing `*` matches one segment
+    /// only. Leading `!` re-includes : applied in file order so a later
+    /// negation can rescue an earlier exclusion (Docker semantics).
+    static func isIgnoredPath(_ relPath: String, patterns: [String]) -> Bool {
+        if patterns.isEmpty { return false }
+        var ignored = false
+        for p in patterns {
+            let isNegate = p.hasPrefix("!")
+            let pat = isNegate ? String(p.dropFirst()) : p
+            if matchesPattern(pat, path: relPath) {
+                ignored = !isNegate
+            }
+        }
+        return ignored
+    }
+
+    private static func matchesPattern(_ pattern: String, path: String) -> Bool {
+        // Normalize : strip trailing "/" (Docker treats `dir` and `dir/`
+        // as the same), strip leading "/" (always rooted at context).
+        var pat = pattern
+        if pat.hasSuffix("/") { pat = String(pat.dropLast()) }
+        if pat.hasPrefix("/") { pat = String(pat.dropFirst()) }
+
+        // Bare basename → match anywhere in the tree (Docker's `node_modules`
+        // shouldn't require `**/node_modules` to match nested copies).
+        let path = path.hasPrefix("/") ? String(path.dropFirst()) : path
+
+        // Direct match on full path
+        if fnmatchMatch(pat, path) { return true }
+        // Match as prefix (so `node_modules` excludes `node_modules/foo/bar`)
+        if fnmatchMatch(pat, path) || path.hasPrefix(pat + "/") { return true }
+        // Bare-basename anywhere : prepend `**/` if no slash in pattern
+        if !pat.contains("/") {
+            if fnmatchMatch("**/" + pat, path) { return true }
+            if path.hasSuffix("/" + pat) { return true }
+            // any segment equals pat
+            for seg in path.split(separator: "/") where String(seg) == pat {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func fnmatchMatch(_ pattern: String, _ name: String) -> Bool {
+        // FNM_PATHNAME so `*` doesn't cross `/` boundaries — matches
+        // Docker / gitignore semantics. `**` is expanded as two passes.
+        let expanded = pattern.replacingOccurrences(of: "**", with: "*")
+        return pattern.withCString { _ in
+            expanded.withCString { pCStr in
+                name.withCString { nCStr in
+                    // FNM_PATHNAME = 2 on Darwin
+                    fnmatch(pCStr, nCStr, Int32(FNM_PATHNAME)) == 0
+                }
+            }
+        }
+    }
+
+    // MARK: - COPY glob expansion
+
+    /// Expand a Dockerfile COPY source pattern (`package*.json`, `src/*.ts`,
+    /// `foo/bar?.txt`) against the build context root. Glob chars are only
+    /// honored in the basename — `dir*/file.txt` falls back to literal.
+    /// Returns matching paths relative to the context root, or `[]` on no
+    /// match. Uses libc `fnmatch` so semantics match what Bash / coreutils
+    /// would do.
+    static func expandGlob(_ pattern: String, root: URL) -> [String] {
+        let dir = (pattern as NSString).deletingLastPathComponent
+        let name = (pattern as NSString).lastPathComponent
+        guard name.contains("*") || name.contains("?") || name.contains("[") else {
+            return []
+        }
+        let searchDir = dir.isEmpty ? root : root.appendingPathComponent(dir)
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: searchDir.path) else {
+            return []
+        }
+        let matches = entries.filter { entry in
+            pattern.withCString { _ in
+                name.withCString { pCStr in
+                    entry.withCString { eCStr in
+                        fnmatch(pCStr, eCStr, 0) == 0
+                    }
+                }
+            }
+        }
+        return matches.map { dir.isEmpty ? $0 : "\(dir)/\($0)" }.sorted()
+    }
+
     // MARK: - COPY --from=<image> support
 
     /// Resolves a `--from=<value>` flag to an extracted-rootfs directory when
@@ -1163,8 +1465,17 @@ actor DockerfileBuilder {
         let tmpTar = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".tar.gz")
         defer { try? FileManager.default.removeItem(at: tmpTar) }
 
-        var tarArgs = ["-czf", tmpTar.path, "-C", rootfs.path]
-        tarArgs += changedPaths.map { $0.hasPrefix("/") ? String($0.dropFirst()) : $0 }.filter { !$0.isEmpty }
+        // Pass paths via -T <file> instead of argv — RUN steps that install
+        // node_modules / .venv / GOPATH routinely generate 10k+ paths, well
+        // past NSConcreteTask's 4096-argv limit, and we crashed with
+        // "too many arguments (14925) -- limit is 4096".
+        let pathsFile = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".paths")
+        defer { try? FileManager.default.removeItem(at: pathsFile) }
+        let pathsContent = changedPaths
+            .map { $0.hasPrefix("/") ? String($0.dropFirst()) : $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+        try pathsContent.write(to: pathsFile, atomically: true, encoding: .utf8)
 
         // Add whiteout files for deleted paths (write .wh. files to a temp dir)
         let whiteoutDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -1191,7 +1502,7 @@ actor DockerfileBuilder {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        proc.arguments = tarArgs
+        proc.arguments = ["-czf", tmpTar.path, "-C", rootfs.path, "-T", pathsFile.path]
         let errPipe = Pipe()
         proc.standardError = errPipe
         try proc.run()

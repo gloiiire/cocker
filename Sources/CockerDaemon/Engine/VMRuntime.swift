@@ -9,6 +9,47 @@ import CockerCore
 
 @MainActor
 final class VMRuntime: NSObject {
+
+    /// Docker-compatible volume seeding : when a fresh managed volume
+    /// is about to mount on `destination`, populate it with whatever
+    /// the image baked at that path. Mirrors docker's "anonymous volume
+    /// initialization" behaviour so node stacks (`/app/node_modules`),
+    /// Python virtualenvs (`/app/.venv`), Ruby gems, etc. don't vanish
+    /// when the user adds a bind mount on the parent dir.
+    ///
+    /// Safe to call unconditionally : it no-ops when `volumeDir` is
+    /// already populated, or when the image has nothing at
+    /// `destination`. The check is cheap (one `contentsOfDirectory`).
+    static func seedFromImageIfFresh(
+        volumeDir: URL,
+        imageRootfs: URL,
+        destination: String
+    ) {
+        // Already populated → never overwrite. Docker semantics : the
+        // seeding only happens on FIRST mount.
+        let existing = (try? FileManager.default.contentsOfDirectory(atPath: volumeDir.path)) ?? []
+        if !existing.isEmpty { return }
+
+        let imageContentPath = imageRootfs.appendingPathComponent(
+            destination.hasPrefix("/") ? String(destination.dropFirst()) : destination
+        )
+        var srcIsDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: imageContentPath.path, isDirectory: &srcIsDir),
+              srcIsDir.boolValue else { return }
+
+        // `cp -Rp src/. dst` copies the CONTENTS into dst rather than
+        // nesting src under dst. Use a subprocess so symlinks / mode
+        // bits / mtimes survive correctly — Foundation's copy APIs
+        // mangle some of these on macOS.
+        let cp = Process()
+        cp.executableURL = URL(fileURLWithPath: "/bin/cp")
+        cp.arguments = ["-Rp", imageContentPath.path + "/.", volumeDir.path]
+        cp.standardOutput = Pipe()
+        cp.standardError = Pipe()
+        try? cp.run()
+        cp.waitUntilExit()
+    }
+
     struct RunningVM {
         let vm: VZVirtualMachine
         let containerID: String
@@ -80,12 +121,12 @@ final class VMRuntime: NSObject {
         fputs("[vm] createVM enter\n", stderr); fflush(stderr)
         let config = VZVirtualMachineConfiguration()
 
-        // Boot loader
+        // Boot loader — cmdline gets assigned AFTER volume processing
+        // below so it can include the block-device paths for each volume
+        // (resolved dynamically based on whether the source is a .img file
+        // or a directory).
         let bootLoader = VZLinuxBootLoader(kernelURL: kernelPath)
         bootLoader.initialRamdiskURL = initrdPath
-        let cmdline = buildKernelCommandLine(for: container, rootfsPath: rootfsPath)
-        bootLoader.commandLine = cmdline
-        fputs("[vm] cmdline (\(cmdline.count) chars): \(cmdline)\n", stderr); fflush(stderr)
         config.bootLoader = bootLoader
 
         // CPU & Memory
@@ -138,21 +179,92 @@ final class VMRuntime: NSObject {
         fputs("[vm] virtiofs root config OK\n", stderr); fflush(stderr)
         var fsDevices: [VZVirtioFileSystemDeviceConfiguration] = [fsConfig]
 
-        // Additional volume mounts via virtiofs
+        // Additional volume mounts. Two backends :
+        //   1. Block storage (.img file) — attached as VZVirtioBlockDevice.
+        //      Used for named volumes that need real Linux fs semantics
+        //      (chown/chmod inside the guest). Default for new volumes
+        //      created by VolumeManager since 0.5.13.
+        //   2. Virtiofs (directory) — attached as VZVirtioFileSystem.
+        //      Used for bind mounts (`/host/path:/container/path`) and
+        //      legacy directory-based named volumes.
+        //
+        // For each volume we emit a cmdline spec (collected in
+        // `volumeSpecs`) that tells cocker-init what kind of attachment
+        // to mount where. Block devices land at /dev/vd[a-z] in PCI
+        // attachment order ; we track the index so the cmdline gets the
+        // right path.
+        var storageDevices: [VZStorageDeviceConfiguration] = []
+        var volumeSpecs: [String] = []
+        var blockIdx = 0
         for (i, mount) in container.volumes.enumerated() {
             let hostURL: URL
             if mount.source.hasPrefix("/") {
+                // Bind mount — always virtiofs (no .img conversion).
                 hostURL = URL(fileURLWithPath: mount.source)
             } else {
-                // Named volume
-                hostURL = rootDir.appendingPathComponent("volumes/\(mount.source)/_data")
+                // Named volume — managed by VolumeManager. New volumes
+                // are .img files ; legacy ones are _data directories.
+                hostURL = rootDir.appendingPathComponent("volumes/\(mount.source)/data.img")
+                if !FileManager.default.fileExists(atPath: hostURL.path) {
+                    // Fallback : legacy layout from <0.5.13.
+                    let legacyDir = rootDir.appendingPathComponent("volumes/\(mount.source)/_data")
+                    try FileManager.default.createDirectory(at: legacyDir, withIntermediateDirectories: true)
+                    // Same image-content seeding as the block-storage path :
+                    // a fresh anonymous volume is populated from whatever the
+                    // image baked at the destination path. Without this,
+                    // mounting `/app/node_modules` as an empty anon volume
+                    // hides nodemon / ts-node / etc. that `npm install`
+                    // baked into the image.
+                    Self.seedFromImageIfFresh(
+                        volumeDir: legacyDir,
+                        imageRootfs: rootfsPath,
+                        destination: mount.destination
+                    )
+                    let volShare = VZSingleDirectoryShare(directory: VZSharedDirectory(url: legacyDir, readOnly: mount.readOnly))
+                    let volFS = VZVirtioFileSystemDeviceConfiguration(tag: "vol\(i)")
+                    volFS.share = volShare
+                    fsDevices.append(volFS)
+                    volumeSpecs.append("virtiofs:vol\(i):\(mount.destination)")
+                    continue
+                }
             }
-            try FileManager.default.createDirectory(at: hostURL, withIntermediateDirectories: true)
-            let volShare = VZSingleDirectoryShare(directory: VZSharedDirectory(url: hostURL, readOnly: mount.readOnly))
-            let volFS = VZVirtioFileSystemDeviceConfiguration(tag: "vol\(i)")
-            volFS.share = volShare
-            fsDevices.append(volFS)
+
+            // Detect block-storage (.img file) vs virtiofs (directory).
+            var isDir: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: hostURL.path, isDirectory: &isDir)
+            if exists && !isDir.boolValue {
+                // Block storage path. Attach as virtio block device, build
+                // a cmdline spec that points cocker-init at /dev/vd<X>.
+                let attachment = try VZDiskImageStorageDeviceAttachment(url: hostURL, readOnly: mount.readOnly)
+                let blockDevice = VZVirtioBlockDeviceConfiguration(attachment: attachment)
+                storageDevices.append(blockDevice)
+                // /dev/vd[a-z] follows attach order. We track our own
+                // index to stay aligned even if other (non-volume) block
+                // devices get added later.
+                let letter = String(UnicodeScalar(0x61 + blockIdx)!) // a, b, c…
+                volumeSpecs.append("blk:/dev/vd\(letter):\(mount.destination)")
+                blockIdx += 1
+            } else {
+                // Virtiofs path (directory bind mount, or legacy named
+                // volume whose data.img wasn't found above).
+                try FileManager.default.createDirectory(at: hostURL, withIntermediateDirectories: true)
+
+                if !mount.source.hasPrefix("/") {
+                    Self.seedFromImageIfFresh(
+                        volumeDir: hostURL,
+                        imageRootfs: rootfsPath,
+                        destination: mount.destination
+                    )
+                }
+
+                let volShare = VZSingleDirectoryShare(directory: VZSharedDirectory(url: hostURL, readOnly: mount.readOnly))
+                let volFS = VZVirtioFileSystemDeviceConfiguration(tag: "vol\(i)")
+                volFS.share = volShare
+                fsDevices.append(volFS)
+                volumeSpecs.append("virtiofs:vol\(i):\(mount.destination)")
+            }
         }
+        config.storageDevices = storageDevices
 
         // Cross-arch builds : if the build container is labelled with
         // `com.cocker.qemu-arch`, share `~/.cocker/qemu` so the in-VM
@@ -225,6 +337,13 @@ final class VMRuntime: NSObject {
         let socketDevice = VZVirtioSocketDeviceConfiguration()
         config.socketDevices = [socketDevice]
 
+        // Now that volumes have been resolved (block device indices
+        // assigned, virtiofs tags emitted), build the kernel cmdline
+        // with the per-volume specs and hand it to the boot loader.
+        let cmdline = buildKernelCommandLine(for: container, rootfsPath: rootfsPath, volumeSpecs: volumeSpecs)
+        bootLoader.commandLine = cmdline
+        fputs("[vm] cmdline (\(cmdline.count) chars): \(cmdline)\n", stderr); fflush(stderr)
+
         do {
             try config.validate()
             fputs("[vm] config.validate() OK\n", stderr); fflush(stderr)
@@ -239,7 +358,7 @@ final class VMRuntime: NSObject {
 
     // MARK: - Kernel command line
 
-    private func buildKernelCommandLine(for container: Container, rootfsPath: URL) -> String {
+    private func buildKernelCommandLine(for container: Container, rootfsPath: URL, volumeSpecs: [String]) -> String {
         // For cross-arch builds, label "com.cocker.qemu-arch" is stamped
         // on the synthetic build container so we know which qemu binary
         // to plumb. Production runs leave it empty.
@@ -252,7 +371,8 @@ final class VMRuntime: NSObject {
             dnsVsockPort: 5353,
             cockerSwitchGateway: NetworkManager.cockerSwitchGateway,
             qemuArch: qemuArch,
-            qemuPath: qemuPath
+            qemuPath: qemuPath,
+            volumeSpecs: volumeSpecs
         ))
     }
 

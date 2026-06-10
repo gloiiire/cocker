@@ -26,6 +26,13 @@ public struct KernelCommandLineParams: Sendable {
     /// directory containing it as a virtiofs share named "qemu" at
     /// `/opt/cocker/qemu/`. nil when cross-arch isn't requested.
     public let qemuPath: String?
+    /// Pre-resolved per-volume cmdline values, one per container.volumes
+    /// entry in the same order. Format : `<type>:<src>:<target>` where
+    /// type ∈ {"virtiofs", "blk"}. VMRuntime computes these because
+    /// only it knows whether the source resolved to a directory (virtiofs)
+    /// or a .img file (block device + which /dev/vd<X> letter). Empty
+    /// array → cmdline emits no `cocker.vol*` params at all.
+    public let volumeSpecs: [String]
 
     public init(container: Container,
                 dnsIP: String,
@@ -33,7 +40,8 @@ public struct KernelCommandLineParams: Sendable {
                 dnsVsockPort: UInt32 = 5353,
                 cockerSwitchGateway: String,
                 qemuArch: String? = nil,
-                qemuPath: String? = nil) {
+                qemuPath: String? = nil,
+                volumeSpecs: [String] = []) {
         self.container = container
         self.dnsIP = dnsIP
         self.dnsPort = dnsPort
@@ -41,6 +49,7 @@ public struct KernelCommandLineParams: Sendable {
         self.cockerSwitchGateway = cockerSwitchGateway
         self.qemuArch = qemuArch
         self.qemuPath = qemuPath
+        self.volumeSpecs = volumeSpecs
     }
 }
 
@@ -83,8 +92,18 @@ public enum KernelCommandLine {
             parts.append("cocker.port.\(port.containerPort)=\(port.hostPort)/\(port.proto.rawValue)")
         }
 
-        for (i, mount) in params.container.volumes.enumerated() {
-            parts.append("cocker.vol\(i)=vol\(i):\(mount.destination)")
+        // Per-volume cmdline. VMRuntime hands us the resolved spec
+        // (already type-tagged with `virtiofs:` or `blk:`). If empty we
+        // fall back to the legacy synthesis so non-VM call sites (tests,
+        // tooling that pre-dates block storage) keep working.
+        if !params.volumeSpecs.isEmpty {
+            for (i, spec) in params.volumeSpecs.enumerated() {
+                parts.append("cocker.vol\(i)=\(spec)")
+            }
+        } else {
+            for (i, mount) in params.container.volumes.enumerated() {
+                parts.append("cocker.vol\(i)=virtiofs:vol\(i):\(mount.destination)")
+            }
         }
 
         if let workdir = params.container.env["WORKDIR"] {
@@ -93,6 +112,13 @@ public enum KernelCommandLine {
 
         if let user = params.container.env["USER"] {
             parts.append("cocker.user=\(user)")
+        }
+
+        // `--shm-size` : cocker-init reads this and re-mounts /dev/shm
+        // tmpfs with `size=Nm`. Default Linux gives only 64 MB which
+        // postgres / chromium / pytorch routinely overrun.
+        if let shm = params.container.shmSizeMB, shm > 0 {
+            parts.append("cocker.shm_mb=\(shm)")
         }
 
         // Cross-arch build : tell cocker-init what foreign-arch ELFs to

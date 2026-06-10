@@ -1,5 +1,202 @@
 # Changelog
 
+## 0.5.13.26 — `cocker compose watch` (FSEvents hot-reload)
+
+### Added
+- **`cocker compose watch`** — new subcommand. Brings the project up via
+  `compose up -d` and then opens a recursive `FSEventStream` on the
+  source directory ; rebuilds + restarts on batched events.
+  - `--debounce-ms <N>` configures the batching window (default 300 ms).
+    Multiple edits within the window collapse into one rebuild.
+  - Auto-skips `~/Library/Caches/cocker/`, `.DS_Store`,
+    `.Spotlight-V100`, `.fseventsd` so the staging cache doesn't
+    re-trigger itself.
+  - FSEvents chosen over `DispatchSource.makeFileSystemObjectSource`
+    because subdir-recursive watches on the latter require thousands of
+    open FDs + a re-walk on every `mkdir`. FSEvents is the right
+    primitive on macOS for this.
+
+## 0.5.13.25 — `cocker compose up` interactive detach
+
+### Added
+- `cocker compose up` (without `-d`) now opens an attached session and
+  prints a footer telling the user how to detach :
+  - Press **`d`** → detach (containers keep running) — matches Docker
+    Compose v2 UX. Previously the only exit was Ctrl-C which always
+    tore the stack down.
+  - Press **Ctrl-C** → traditional teardown.
+  - Stdin is auto-detected via `isatty` ; piped input (e.g.
+    `cocker compose up | tee`) skips raw TTY mode so the pipe behaves.
+- `cocker compose up -d` is unchanged (no footer, returns immediately).
+
+## 0.5.13.24 — `cocker daemon logs` colorization
+
+### Added
+- `cocker daemon logs` (and `-f`) now ANSI-colorizes log lines by level
+  when stdout is a TTY :
+  - `INFO` → green
+  - `WARN` → yellow
+  - `ERROR` → red
+  - `DEBUG` → dim
+  - `[module]` tags → cyan
+  - timestamp prefix → dim
+- New `--no-color` flag for cases where TTY autodetection isn't enough
+  (e.g. piping into a pager that strips ANSI but is otherwise a TTY).
+- The on-disk `~/.cocker/cockerd.log` file stays plain text — log
+  aggregators, `grep`, `tail`, etc. continue to work unchanged.
+  Coloring is a render-time concern of `cocker daemon logs`, not the
+  daemon writer.
+
+## 0.5.13.23 — `cocker completion <shell>`
+
+### Added
+- New `cocker completion bash|zsh|fish` subcommand. Generates the
+  completion script straight from the ArgumentParser command graph, so
+  it's always in sync with the live CLI surface. Modern terminals
+  (Warp, Zed, Kiro, VS Code terminal, iTerm autosuggest) parse these
+  scripts to drive their inline suggestion popups — that's the
+  "`$ ps / inspect / volume / compose …`" picker users see in Zed/Kiro
+  the moment they install the completion.
+- Drop-in install paths documented in `--help` and in `README.md`.
+
+## 0.5.13.22 — `Cockerfile` preference
+
+### Added
+- When a `Cockerfile` exists in the build context, it's used in
+  preference to `Dockerfile`. This lets a repo carry a
+  Docker-compatible `Dockerfile` and a cocker-specific `Cockerfile`
+  side by side : opt into cocker-only build instructions without
+  breaking the CI job that still runs `docker build`. `Dockerfile`
+  remains the fallback when no `Cockerfile` is present.
+
+## 0.5.13.21 — `cocker icloud` command family
+
+### Added
+- New top-level `cocker icloud` subcommand with three operations,
+  exposing what cocker sees about Apple's `bird` (iCloud Drive
+  coordinator) :
+  - **`cocker icloud status [path] [--json]`** — scans the directory
+    with `URLResourceValues.ubiquitousItemDownloadingStatus` and prints
+    counts of Materialized / Dataless / Downloading + total + pending
+    bytes + in-flight progress. Predicts whether the next staging will
+    be fast or slow.
+  - **`cocker icloud prefetch [path]`** — fires `brctl download` and
+    reports a before/after delta of materialized files. Same thing the
+    transparent staging does silently, but exposed so users can warm
+    the cache ahead of a big `compose up`.
+  - **`cocker icloud cache-clear`** — wipes
+    `~/Library/Caches/cocker/staging/` and reports bytes freed.
+
+## 0.5.13.20 — iCloud Drive auto-staging (default for iCloud-resident projects)
+
+### Added
+- `cocker compose up` / `cocker build` auto-detect when the build
+  context lives in iCloud Drive (path under
+  `~/Library/Mobile Documents/com~apple~CloudDocs/`, or carrying a
+  `com.apple.fileprovider.*` xattr — which also covers
+  "Desktop & Documents Folders" sync) and stage the tree to
+  `~/Library/Caches/cocker/staging/<basename>-<hash>/` via rsync
+  before handing it to `cockerd`.
+- Subsequent runs are **incremental** : rsync's diff means only files
+  whose iCloud mtime changed get re-read from `bird`. The staging
+  cache persists across CLI invocations.
+- `.dockerignore` and `.cockerignore` from the project tree + a small
+  hardcoded default set (`.git`, `node_modules`, `.DS_Store`,
+  `*.icloud`) are honoured by the rsync step.
+- Dataless files are auto-detected via
+  `URLResourceValues.ubiquitousItemDownloadingStatus` and downloaded
+  via Apple's `startDownloadingUbiquitousItem` with progress reporting
+  before the rsync starts. When everything is already local, the
+  pre-fetch step is skipped entirely.
+
+### Why
+- Apple's `bird` daemon serializes filesystem syscalls on iCloud paths
+  by intercepting them in user-space. When a long-running daemon
+  (`cockerd`) issues many concurrent `read()`s against iCloud-resident
+  files, `bird` returns `EDEADLK` ("Resource deadlock avoided") past
+  the first few files. This breaks `cp -R`, `ditto`, and even raw
+  `read()` from inside the daemon — `COPY` past the first layer would
+  stall or fail with no useful diagnostic. The rsync-via-CLI path
+  side-steps the deadlock entirely because the staging happens before
+  `cockerd` ever touches the source tree.
+
+### Env vars
+- `COCKER_FORCE_STAGE=1` — force staging even for non-iCloud paths
+  (for CI / testing the staging code).
+- `COCKER_ICLOUD_TIMEOUT=30` — bird query timeout in seconds
+  (default 30). Bump on slow networks where the initial materialization
+  pass takes longer than that.
+
+## 0.5.13.19 — Compose `${VAR:-default}` substitution + `env_file:`
+
+### Fixed
+- **`${VAR:-default}` substitution in compose files** : the
+  bash-style default-fallback form was being passed through literally
+  to the daemon. Hit in the wild as a postgres "extension owner: must
+  be member of role" error when
+  `POSTGRES_USER: ${POSTGRES_USER:-app}` ended up as the literal string
+  rather than `app`. Yams interpolation now matches the docker-compose
+  spec — bare `${VAR}`, `${VAR:-default}`, `${VAR-default}`,
+  `${VAR:?error}` all work.
+- **`env_file:` is now actually loaded.** The compose parser knew about
+  the field but the loader silently dropped it before passing
+  `RunConfig` to `ContainerEngine` — every service ended up with only
+  inline `environment:` vars and people debugged ghost env mismatches
+  for hours. Now `env_file:` is parsed, the referenced file is read
+  relative to the compose dir, and entries are merged into the env
+  with `environment:` taking precedence (matches Docker semantics).
+
+## 0.5.13.18 — Compose volume + bind-mount semantics fixes
+
+### Fixed
+- **Anonymous volumes** (`- /app/node_modules`) are now treated as
+  managed volumes, not bind mounts. Previously the engine interpreted
+  the bare target as `target:target` and tried to bind-mount the empty
+  host path — which on first boot wiped whatever the image had baked
+  into `/app/node_modules`. This is the canonical
+  "`nodemon: not found`" pain in node compose stacks. The fix matches
+  Docker semantics : an anonymous volume is auto-created, named with a
+  stable hash of the service+path, and populated from the image's
+  content on first mount.
+- **Bind mounts with relative paths** (`./backend:/app`) are now
+  resolved against the compose file's directory, not against
+  `cockerd`'s CWD. Previously `cockerd` running with a different CWD
+  would silently mount the wrong directory (or fail to mount).
+- **Managed volumes are auto-populated from image content on first
+  mount** (Docker semantics). When a volume's host-side data dir is
+  empty and the target path exists inside the image, cocker now
+  copies the image content into the volume so the first boot sees the
+  expected files. This is the other half of the
+  `nodemon: not found` fix.
+
+## 0.5.13.17 — Compose runtime fixes
+
+### Fixed
+- **`compose logs -f` is now honoured daemon-side.** It used to be a
+  one-shot tail : the daemon read the existing buffer and immediately
+  closed the stream, no matter what `-f` said. The follow path now
+  ties into the same ring-buffer poll loop `cocker logs -f` uses.
+- **`compose ps` works without explicit `-f docker-compose.yml`.**
+  The discovery code now walks up from `$PWD` looking for any of
+  `docker-compose.yml`, `docker-compose.yaml`, `compose.yml`,
+  `cocker-compose.yml`, matching docker-compose's own search behaviour.
+
+## 0.5.13.16 — Build fixes for real-world Dockerfiles
+
+### Fixed
+- **`COPY package*.json ./`** (and other globs) now expand via
+  `fnmatch` before the COPY instruction runs. Previously the literal
+  `package*.json` was looked up on disk and missed every file.
+- **`.dockerignore` / `.cockerignore` apply during `COPY` too**, not
+  just during the CLI staging step. Dockerfiles that rely on ignore
+  rules to keep `node_modules/` out of an image layer now match
+  Docker's behaviour.
+- **`tar -T file` for layers with 10k+ files.** Past about 4 K argv
+  entries, `NSConcreteTask` refuses to spawn (`E2BIG`-class limit
+  in Foundation's argv plumbing on macOS). Layer build for large
+  contexts now writes the file list to a temp file and feeds it via
+  `tar -T -`. Tested up to 50 K-file `node_modules` trees.
+
 ## 0.5.5 — Three install-time bugs you actually hit on `brew install`
 
 ### 1. Postinstall installed the initrd in `/private/tmp/...`, not in `~/.cocker/`

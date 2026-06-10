@@ -138,9 +138,21 @@ func main() async {
     // this here (rather than inside ContainerEngine.init) so the engine
     // doesn't depend on CommandLine.arguments[0] — that makes it easier to
     // construct an engine in tests with an arbitrary port forwarder.
+    //
+    // Match our own binary's suffix : if we're running as `cockerd-dev`
+    // (SUFFIX=-dev install), look for `cocker-portfwd-dev` next to us
+    // instead of falling back to a prod `cocker-portfwd` that may not
+    // exist in `~/.local/bin/` at all.
+    let cockerdName = URL(fileURLWithPath: CommandLine.arguments[0]).lastPathComponent
+    let portFwdSuffix: String = {
+        if cockerdName.hasPrefix("cockerd") {
+            return String(cockerdName.dropFirst("cockerd".count))
+        }
+        return ""
+    }()
     let portFwdBinary = URL(fileURLWithPath: CommandLine.arguments[0])
         .deletingLastPathComponent()
-        .appendingPathComponent("cocker-portfwd")
+        .appendingPathComponent("cocker-portfwd\(portFwdSuffix)")
 
     // Background lease-pool watchdog. macOS vmnet's bootpd refuses new
     // leases past ~256 entries in /var/db/dhcpd_leases ; under sustained

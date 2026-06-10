@@ -466,6 +466,48 @@ private func isNonDefaultRoot(_ root: URL) -> Bool {
     return root.standardizedFileURL.path != defaultRoot.standardizedFileURL.path
 }
 
+/// Derive the launchd plist path for a given data dir. Mirrors what
+/// install.sh writes : `~/.cocker` → `com.cocker.cockerd.plist`,
+/// `~/.cocker-dev` → `com.cocker.cockerd-dev.plist`. The suffix is the
+/// part of the data dir's basename after `.cocker` (empty for prod).
+private func launchdPlistPath(for root: URL) -> URL {
+    let base = root.lastPathComponent          // .cocker, .cocker-dev, …
+    let suffix: String
+    if base == ".cocker" {
+        suffix = ""
+    } else if base.hasPrefix(".cocker") {
+        suffix = String(base.dropFirst(".cocker".count))
+    } else {
+        suffix = ""
+    }
+    return URL(fileURLWithPath: NSHomeDirectory())
+        .appendingPathComponent("Library/LaunchAgents/com.cocker.cockerd\(suffix).plist")
+}
+
+/// Run /bin/launchctl with the given args. Surfaces stderr on failure
+/// so the user gets the actual reason (already loaded, no such job, …)
+/// rather than a generic "command exited non-zero".
+@discardableResult
+private func runLaunchctl(_ args: [String]) throws -> Int32 {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    proc.arguments = args
+    let errPipe = Pipe()
+    proc.standardError = errPipe
+    try proc.run()
+    proc.waitUntilExit()
+    if proc.terminationStatus != 0 {
+        let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderr = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        throw ValidationError(
+            "launchctl \(args.joined(separator: " ")) exited " +
+            "\(proc.terminationStatus): \(stderr.isEmpty ? "(no stderr)" : stderr)"
+        )
+    }
+    return proc.terminationStatus
+}
+
 /// Read the PID from the PID file ; nil if the file doesn't exist or is
 /// malformed. Does NOT verify the process is alive — call `isAlive(_:)` after.
 private func readPID(_ url: URL) -> pid_t? {
@@ -539,8 +581,33 @@ struct DaemonStartCommand: AsyncParsableCommand {
           help: "Run cockerd in the foreground (Ctrl-C to stop) — same as just `cockerd`")
     var foreground = false
 
+    @Flag(name: [.short, .customLong("service")],
+          help: "Bootstrap the launchd job instead of spawning a one-off process (use after install.sh).")
+    var service = false
+
     mutating func run() async throws {
         let paths = defaultPaths()
+
+        // --service / -s : delegate to launchd. install.sh shipped a plist
+        // at ~/Library/LaunchAgents/com.cocker.cockerd${suffix}.plist that
+        // has RunAtLoad=true and KeepAlive=true ; `launchctl bootstrap`
+        // loads it AND starts the daemon. Different code path entirely
+        // from the PID-file-based spawn below.
+        if service {
+            let plist = launchdPlistPath(for: paths.root)
+            guard FileManager.default.fileExists(atPath: plist.path) else {
+                throw ValidationError(
+                    "No launchd plist at \(plist.path). " +
+                    "Did you install via ./install.sh ? Without it there's no service to manage."
+                )
+            }
+            try runLaunchctl(["bootstrap", "gui/\(getuid())", plist.path])
+            print("✓ launchd job \(plist.lastPathComponent) bootstrapped")
+            print("  KeepAlive=true → daemon auto-restarts on crash")
+            print("  → cocker daemon status     to inspect")
+            print("  → cocker daemon stop -s    to stop (no respawn)")
+            return
+        }
 
         if let pid = readPID(paths.pidFile), isAlive(pid) {
             print("cockerd is already running (pid \(pid))")
@@ -630,8 +697,32 @@ struct DaemonStopCommand: AsyncParsableCommand {
             help: "Seconds to wait for graceful shutdown before SIGKILL")
     var timeout: Int = 10
 
+    @Flag(name: [.short, .customLong("service")],
+          help: "Bootout the launchd job so KeepAlive doesn't respawn it (counterpart to `daemon start -s`).")
+    var service = false
+
     mutating func run() async throws {
         let paths = defaultPaths()
+
+        // --service / -s : bootout the launchd job. SIGTERM would normally
+        // get instantly undone by KeepAlive=true ; bootout removes the
+        // job from launchd's bookkeeping so no respawn happens until the
+        // user bootstraps it again (`daemon start -s` or relog).
+        if service {
+            let plist = launchdPlistPath(for: paths.root)
+            guard FileManager.default.fileExists(atPath: plist.path) else {
+                throw ValidationError(
+                    "No launchd plist at \(plist.path). " +
+                    "There's no service to stop ; you probably want `cocker daemon stop` (no -s)."
+                )
+            }
+            try runLaunchctl(["bootout", "gui/\(getuid())", plist.path])
+            try? FileManager.default.removeItem(at: paths.pidFile)
+            print("✓ launchd job \(plist.lastPathComponent) booted out (no respawn)")
+            print("  → cocker daemon start -s   to bring it back up")
+            return
+        }
+
         guard let pid = readPID(paths.pidFile), isAlive(pid) else {
             print("cockerd is not running")
             try? FileManager.default.removeItem(at: paths.pidFile)
@@ -669,13 +760,19 @@ struct DaemonRestartCommand: AsyncParsableCommand {
             help: "Path to the cockerd binary (defaults to autodetect)")
     var binary: String?
 
+    @Flag(name: [.short, .customLong("service")],
+          help: "Bootout + bootstrap the launchd job instead of SIGTERM-then-spawn (use after install.sh).")
+    var service = false
+
     mutating func run() async throws {
         // ArgumentParser only initializes @Option/@Flag values during parse().
         // Direct `Type()` instantiation leaves them unset and crashes the run.
         var stop = try DaemonStopCommand.parse([])
+        stop.service = service
         try await stop.run()
         var start = try DaemonStartCommand.parse([])
         start.binary = binary
+        start.service = service
         try await start.run()
     }
 }
@@ -766,6 +863,10 @@ struct DaemonLogsCommand: AsyncParsableCommand {
             help: "Print the last N lines (default 50)")
     var tail: Int = 50
 
+    @Flag(name: .customLong("no-color"),
+          help: "Disable level/module colorization (forced off when stdout isn't a TTY)")
+    var noColor = false
+
     mutating func run() async throws {
         let paths = defaultPaths()
         guard FileManager.default.fileExists(atPath: paths.logFile.path) else {
@@ -774,8 +875,12 @@ struct DaemonLogsCommand: AsyncParsableCommand {
             return
         }
 
-        // We just exec `tail` — it does the platform-correct thing for both
-        // -n and -f, including handling log rotation gracefully.
+        // We still use `tail` for the platform-correct -n / -f / log
+        // rotation handling, but pipe its output through our colorizer
+        // so each line gets ANSI escapes applied by log level. cockerd
+        // writes plain text to its log file (the file is consumed by
+        // grep / log aggregators that don't want escape sequences), so
+        // re-colorizing has to happen at read time.
         var args: [String] = []
         args.append(contentsOf: ["-n", "\(tail)"])
         if follow { args.append("-f") }
@@ -784,7 +889,123 @@ struct DaemonLogsCommand: AsyncParsableCommand {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/tail")
         proc.arguments = args
+
+        // Force-off colors if redirected (typical: `cocker daemon logs >
+        // session.log`). Mirrors how `ls` / `git` decide on color.
+        let useColor = !noColor && isatty(fileno(stdout)) != 0
+
+        if !useColor {
+            // Hot path : no colorizer at all, pass `tail` straight
+            // through to inherit stdout. Cheaper than piping when the
+            // user just wants to grep.
+            try proc.run()
+            proc.waitUntilExit()
+            return
+        }
+
+        let pipe = Pipe()
+        proc.standardOutput = pipe
         try proc.run()
+
+        let colorizer = LogColorizer()
+        let handle = pipe.fileHandleForReading
+        var carry = Data()
+        while true {
+            let chunk = handle.availableData
+            if chunk.isEmpty {
+                if !proc.isRunning { break }
+                continue
+            }
+            carry.append(chunk)
+            while let nlRange = carry.range(of: Data([0x0A])) {
+                let lineData = carry.subdata(in: 0..<nlRange.lowerBound)
+                carry.removeSubrange(0..<nlRange.upperBound)
+                if let line = String(data: lineData, encoding: .utf8) {
+                    print(colorizer.render(line))
+                }
+            }
+        }
+        if !carry.isEmpty, let line = String(data: carry, encoding: .utf8) {
+            print(colorizer.render(line))
+        }
         proc.waitUntilExit()
+    }
+}
+
+/// Re-colorize cockerd log lines on the fly. The on-disk format is
+/// plain text — `<iso-timestamp>  <LEVEL>   [<module>] <message>` —
+/// because consumers like `grep`, log shippers, and `journalctl`-style
+/// tooling all assume escape-free input. So we don't make cockerd emit
+/// ANSI to its file ; we apply colors here, in the user-facing reader.
+///
+/// Color choices match what cockerd's banner-time stdout uses when run
+/// in the foreground :
+///   - timestamp: dim grey (de-emphasize, the eye lands on level)
+///   - INFO  : green
+///   - WARN  : yellow
+///   - ERROR : red
+///   - DEBUG : dim
+///   - [module] : cyan
+///   - message body : default fg
+struct LogColorizer {
+    // Single regex with named-ish capture groups would be cleaner but
+    // pulls in NSRegularExpression machinery for very little gain in
+    // a hot loop. The format is rigid enough that a hand-rolled
+    // splitter is both faster and easier to maintain.
+    func render(_ line: String) -> String {
+        // Lines that don't match our format (banner art, multi-line
+        // stack traces, etc.) pass through untouched — better than
+        // accidentally mangling something we can't classify.
+        guard let leveled = splitLevel(line) else { return line }
+
+        let timestamp = ANSI.colored(leveled.timestamp, ANSI.dim)
+        let levelColor: String
+        switch leveled.level {
+        case "INFO":  levelColor = ANSI.green
+        case "WARN", "WARNING": levelColor = ANSI.yellow
+        case "ERROR", "FATAL":  levelColor = ANSI.red
+        case "DEBUG", "TRACE":  levelColor = ANSI.dim
+        default: levelColor = ANSI.reset
+        }
+        let level = ANSI.colored(leveled.level.padding(toLength: 5, withPad: " ", startingAt: 0), levelColor)
+        let rest = colorizeModule(in: leveled.rest)
+        return "\(timestamp)  \(level)  \(rest)"
+    }
+
+    private struct LeveledLine {
+        let timestamp: String
+        let level: String
+        let rest: String
+    }
+
+    /// Parse `<timestamp>  <LEVEL>   <rest>` (two+ spaces between).
+    /// Tolerant of any whitespace count so we don't drift if cockerd
+    /// ever changes its formatter alignment.
+    private func splitLevel(_ line: String) -> LeveledLine? {
+        // Timestamp is fixed-width ISO-8601 with `Z` suffix : it's
+        // exactly 24 chars long in cockerd's formatter. Bail if the
+        // line is shorter or doesn't end with `Z` at index 23.
+        guard line.count >= 30 else { return nil }
+        let tsEnd = line.index(line.startIndex, offsetBy: 24)
+        let timestamp = String(line[..<tsEnd])
+        guard timestamp.hasSuffix("Z") else { return nil }
+        let after = line[tsEnd...].drop(while: { $0 == " " })
+        // Level is one ASCII word followed by whitespace.
+        guard let wordEnd = after.firstIndex(where: { $0 == " " }) else { return nil }
+        let level = String(after[..<wordEnd])
+        let knownLevels: Set<String> = ["INFO", "WARN", "WARNING", "ERROR", "FATAL", "DEBUG", "TRACE"]
+        guard knownLevels.contains(level.uppercased()) else { return nil }
+        let rest = String(after[wordEnd...].drop(while: { $0 == " " }))
+        return LeveledLine(timestamp: timestamp, level: level.uppercased(), rest: rest)
+    }
+
+    /// Cyan-ify any `[module]` prefix the log emitter wrote.
+    private func colorizeModule(in body: String) -> String {
+        guard body.hasPrefix("["), let close = body.firstIndex(of: "]") else {
+            return body
+        }
+        let module = String(body[body.startIndex...close])
+        let tail = String(body[body.index(after: close)...])
+        return ANSI.colored(module, ANSI.cyan) + tail
     }
 }
