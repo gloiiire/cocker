@@ -31,6 +31,7 @@ struct DaemonCommand: AsyncParsableCommand {
             DaemonClearLeasesCommand.self,
             DaemonHelperInstallCommand.self,
             DaemonTLSInitCommand.self,
+            DaemonResignCommand.self,
         ]
     )
 }
@@ -307,6 +308,122 @@ struct DaemonTLSInitCommand: AsyncParsableCommand {
 /// 256 entries and new containers fail DHCP. The file is root-owned, so
 /// we shell out to `sudo` ; the user gets a password prompt unless they
 /// installed the LaunchDaemon helper (`cocker daemon helper-install`).
+/// `cocker daemon resign` — re-sign cockerd with the user's Apple
+/// Development certificate so it can launch VMs without ad-hoc
+/// fallback. Necessary after `brew install` because Homebrew's
+/// post_install runs inside a sandbox that denies access to
+/// `~/Library/Keychains/`, so `security find-identity` returns
+/// empty and the formula has to fall back to ad-hoc signing.
+/// Run from the user's shell (outside the sandbox), this command
+/// reads the real keychain and re-signs in place.
+struct DaemonResignCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "resign",
+        abstract: "Re-sign cockerd with your Apple Development cert (post-brew-install)",
+        discussion: """
+        Why this exists : `brew install cocker`'s post-install hook can't
+        read your login keychain — Homebrew sandboxes it away — so cockerd
+        ends up ad-hoc signed. That's fine for local boot, but the
+        TeamIdentifier is missing and the binary can't be moved between
+        machines. This command runs `security find-identity` outside the
+        sandbox, picks the first Apple Development (or Developer ID
+        Application) cert, and resigns the brew-installed cockerd with it.
+
+        Run it once after `brew install cocker` or `brew upgrade cocker`.
+
+        Override the cert by passing --identity "<full cert name>".
+        """
+    )
+
+    @Option(name: [.short, .customLong("identity")],
+            help: "Signing identity to use (defaults to the first Apple Development cert found).")
+    var identity: String?
+
+    @Option(name: .customLong("cockerd"),
+            help: "Path to the cockerd binary to resign (defaults to /opt/homebrew/opt/cocker/bin/cockerd).")
+    var cockerdPath: String = "/opt/homebrew/opt/cocker/bin/cockerd"
+
+    @Option(name: .customLong("entitlements"),
+            help: "Path to the entitlements plist (defaults to /opt/homebrew/share/cocker/cockerd.entitlements).")
+    var entitlementsPath: String = "/opt/homebrew/share/cocker/cockerd.entitlements"
+
+    mutating func run() async throws {
+        guard FileManager.default.isExecutableFile(atPath: cockerdPath) else {
+            fputs("Error: cockerd not found at \(cockerdPath)\n", stderr)
+            fputs("Pass --cockerd <path> if you installed it elsewhere.\n", stderr)
+            throw ExitCode.failure
+        }
+        guard FileManager.default.fileExists(atPath: entitlementsPath) else {
+            fputs("Error: entitlements not found at \(entitlementsPath)\n", stderr)
+            throw ExitCode.failure
+        }
+
+        // Resolve the signing identity.
+        let cert: String
+        if let explicit = identity {
+            cert = explicit
+        } else if let detected = try Self.detectIdentity() {
+            cert = detected
+        } else {
+            fputs("Error: no \"Apple Development\" or \"Developer ID Application\" cert in your keychain.\n", stderr)
+            fputs("Generate one in Xcode → Settings → Accounts → Manage Certificates → +.\n", stderr)
+            throw ExitCode.failure
+        }
+        print("Signing \(cockerdPath) with: \(cert)")
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        proc.arguments = [
+            "--force",
+            "--sign", cert,
+            "--entitlements", entitlementsPath,
+            cockerdPath,
+        ]
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        try proc.run()
+        proc.waitUntilExit()
+        let errData = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
+        if !errData.isEmpty {
+            fputs(String(data: errData, encoding: .utf8) ?? "", stderr)
+        }
+        guard proc.terminationStatus == 0 else {
+            fputs("codesign failed (exit \(proc.terminationStatus)).\n", stderr)
+            throw ExitCode.failure
+        }
+        print("Signed. Restart the daemon to pick up the new signature:")
+        print("  brew services restart cocker")
+    }
+
+    /// Shells out to `/usr/bin/security find-identity -v -p codesigning`
+    /// and returns the first matching Apple Development / Developer ID
+    /// Application certificate, or nil if none found.
+    private static func detectIdentity() throws -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        proc.arguments = ["find-identity", "-v", "-p", "codesigning"]
+        let outPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = Pipe()
+        try proc.run()
+        proc.waitUntilExit()
+        let outData = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
+        let outStr = String(data: outData, encoding: .utf8) ?? ""
+
+        for kind in ["Apple Development", "Developer ID Application"] {
+            for line in outStr.split(separator: "\n") {
+                if line.contains(kind),
+                   let openIdx = line.firstIndex(of: "\""),
+                   let closeIdx = line.lastIndex(of: "\""),
+                   openIdx < closeIdx {
+                    return String(line[line.index(after: openIdx)..<closeIdx])
+                }
+            }
+        }
+        return nil
+    }
+}
+
 struct DaemonClearLeasesCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "clear-leases",
