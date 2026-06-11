@@ -494,12 +494,41 @@ private func kernelRootsFromContainerBinary() -> [String] {
 /// postinstall stranded the file there (HOME-sandbox bug pre-0.5.5),
 /// `cockerd setup` calls this to recover. Returns nil if no Homebrew
 /// install is present (= the user is on a source/install.sh build).
+///
+/// Path resolution is layered, most-portable-first :
+///   1. `$HOMEBREW_PREFIX/share/cocker/initrd.img` — set by brew shellenv,
+///      respects custom prefixes (Linuxbrew, dev installs to ~/brew, etc).
+///   2. Sibling to the running binary : `argv[0]/../../share/cocker/...`.
+///      Works regardless of brew prefix because the path is derived from
+///      cockerd's own location. Robust to symlinks because resolvingSymlinks
+///      collapses /opt/homebrew/bin/cockerd → Cellar/.../bin/cockerd before
+///      we go up two levels.
+///   3. The two historically hardcoded brew prefixes, kept as a last
+///      resort so a stripped HOMEBREW_PREFIX + broken argv[0] still
+///      finds the file on a default install.
+///
+/// Apple's container hit a related bug (1.0.0_1) and fixed it with an
+/// `env_script` wrapper that exports an install-root env var; we don't
+/// need that because cocker resolves sibling binaries via the executable's
+/// own parent, not via a lexical grandparent of argv[0].
 private func discoverShippedCockerInitrd() -> String? {
-    let candidates = [
-        "/opt/homebrew/share/cocker/initrd.img",   // Apple Silicon (default brew prefix)
-        "/usr/local/share/cocker/initrd.img",      // Intel Mac (legacy brew prefix)
-    ]
-    return candidates.first { FileManager.default.fileExists(atPath: $0) }
+    let fm = FileManager.default
+    var candidates: [String] = []
+
+    if let prefix = ProcessInfo.processInfo.environment["HOMEBREW_PREFIX"], !prefix.isEmpty {
+        candidates.append("\(prefix)/share/cocker/initrd.img")
+    }
+
+    // argv[0] → resolve symlinks → bin/cockerd → ../share/cocker/initrd.img
+    let argv0 = CommandLine.arguments[0]
+    let exe = URL(fileURLWithPath: argv0).resolvingSymlinksInPath()
+    let prefixFromExe = exe.deletingLastPathComponent().deletingLastPathComponent().path
+    candidates.append("\(prefixFromExe)/share/cocker/initrd.img")
+
+    candidates.append("/opt/homebrew/share/cocker/initrd.img")   // Apple Silicon (default brew prefix)
+    candidates.append("/usr/local/share/cocker/initrd.img")      // Intel Mac (legacy brew prefix)
+
+    return candidates.first { fm.fileExists(atPath: $0) }
 }
 
 private func which(_ tool: String) -> String? {
