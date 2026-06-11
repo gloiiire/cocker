@@ -56,6 +56,16 @@ void net_setup_eth0_dhcp(void);
  * cocker.cnet_mac). No-op if cocker.cnet_ip is absent. */
 void net_setup_eth1_static(const char *cmdline);
 
+/* MARK: - dhcp_min.c */
+
+/* Minimal embedded DHCPv4 client — used as a fallback when the
+ * container image doesn't ship a /sbin/udhcpc or /sbin/dhclient
+ * (slim Python / Node / distroless / scratch images). Runs one
+ * full DISCOVER → OFFER → REQUEST → ACK cycle, configures eth0,
+ * sets the default route. Returns 0 on success, -1 on any failure
+ * (caller is expected to retry). */
+int dhcp_embedded_lease(void);
+
 /* MARK: - dns_proxy.c */
 
 /* Spawn the in-VM DNS proxy that binds 0.0.0.0:53 and tunnels every UDP
