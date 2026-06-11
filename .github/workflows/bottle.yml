@@ -221,32 +221,59 @@ jobs:
           done
 
       # Patch the source formula's bottle do block with the actual
-      # sha256s we just computed, commit, push to main. The
-      # `sync-homebrew-tap` workflow that fires on this same tag will
-      # then carry the patched formula into the user-facing tap repo.
-      - name: Rewrite Formula sha256s and push
+      # sha256s we just computed. Commit on main via GitHub's contents
+      # API — that path produces a signed commit (the "GitHub
+      # web-flow" signer) which satisfies main's `required_signatures`
+      # rule. The PAT (RELEASE_PUSH_TOKEN, fine-grained on
+      # gloiiire/cocker with Contents R/W) is the admin user's token,
+      # so it bypasses `pull_request` and `required_status_checks` via
+      # the `RepositoryRole=admin` entry in main's ruleset
+      # bypass_actors. `git push` would fail because github-actions[bot]
+      # cannot sign and isn't in bypass_actors on a personal repo.
+      - name: Rewrite Formula sha256s and commit (signed, via API)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          REPO="${{ github.repository }}"
+          TAG="${{ steps.tag.outputs.tag }}"
+          SHA_TAHOE="${{ steps.assemble.outputs.sha_tahoe }}"
+          SHA_SEQUOIA="${{ steps.assemble.outputs.sha_sequoia }}"
+          SHA_SONOMA="${{ steps.assemble.outputs.sha_sonoma }}"
 
-          # Switch to main FIRST, then sed. Previous version sed'd the
-          # tag's checkout then ran `git checkout - -- Formula/cocker.rb`
-          # which restored Formula from the tag (reverting our changes)
-          # — "No formula change" with placeholders still in main.
-          git fetch origin main --quiet
-          git checkout main
-          git pull origin main --ff-only --quiet
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::RELEASE_PUSH_TOKEN secret is not set."
+            echo "Generate a fine-grained PAT for ${REPO} with Contents: Read and write"
+            echo "and store it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
 
-          sed -i "s|REPLACE_BOTTLE_SHA256_TAHOE|${{ steps.assemble.outputs.sha_tahoe }}|"   Formula/cocker.rb
-          sed -i "s|REPLACE_BOTTLE_SHA256_SEQUOIA|${{ steps.assemble.outputs.sha_sequoia }}|" Formula/cocker.rb
-          sed -i "s|REPLACE_BOTTLE_SHA256_SONOMA|${{ steps.assemble.outputs.sha_sonoma }}|"  Formula/cocker.rb
+          # Fetch current main Formula
+          FILE_META=$(curl -fsS \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/Formula/cocker.rb?ref=main")
+          FILE_SHA=$(echo "$FILE_META" | jq -r '.sha')
+          echo "$FILE_META" | jq -r '.content' | base64 -d > /tmp/cocker.rb
 
-          git add Formula/cocker.rb
-          if git diff --staged --quiet; then
-            echo "No formula change (sha256s already in place ?)"
+          # Patch placeholders. If none present, nothing to do.
+          if ! grep -q REPLACE_BOTTLE_SHA256_TAHOE /tmp/cocker.rb; then
+            echo "No REPLACE_BOTTLE_SHA256_* placeholders on main — already patched."
             exit 0
           fi
-          git commit -m "chore(bottle): refresh sha256 for ${{ steps.tag.outputs.tag }}"
-          git push origin main
+          sed -i "s|REPLACE_BOTTLE_SHA256_TAHOE|${SHA_TAHOE}|"   /tmp/cocker.rb
+          sed -i "s|REPLACE_BOTTLE_SHA256_SEQUOIA|${SHA_SEQUOIA}|" /tmp/cocker.rb
+          sed -i "s|REPLACE_BOTTLE_SHA256_SONOMA|${SHA_SONOMA}|"  /tmp/cocker.rb
+
+          B64=$(base64 -w0 /tmp/cocker.rb)
+          RESP=$(curl -fsS -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/Formula/cocker.rb" \
+            -d "$(jq -n \
+              --arg msg "chore(bottle): refresh sha256 for ${TAG}" \
+              --arg content "$B64" \
+              --arg sha "$FILE_SHA" \
+              --arg branch "main" \
+              '{message:$msg, content:$content, sha:$sha, branch:$branch}')")
+          NEW_SHA=$(echo "$RESP" | jq -r '.commit.sha')
+          echo "Signed commit on main: $NEW_SHA"
