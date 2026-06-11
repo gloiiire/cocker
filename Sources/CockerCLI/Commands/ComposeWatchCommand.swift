@@ -38,6 +38,22 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             help: "Coalesce file events for this many ms before rebuilding (default 300)")
     var debounceMs: Int = 300
 
+    @Flag(name: [.short, .customLong("detach")],
+          help: "Run the watch loop in the background. Returns the PID and exits.")
+    var detach: Bool = false
+
+    @Flag(name: .customLong("stop"),
+          help: "Stop a previously detached watch loop for this project.")
+    var stop: Bool = false
+
+    @Flag(name: .customLong("status"),
+          help: "Show whether a detached watch is running for this project.")
+    var status: Bool = false
+
+    @Flag(name: .customLong("logs"),
+          help: "Tail the detached watch's log file (like `tail -f`).")
+    var logs: Bool = false
+
     mutating func run() async throws {
         let originalPath = resolveComposePath(file)
         guard FileManager.default.fileExists(atPath: originalPath) else {
@@ -45,6 +61,25 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         }
         let projectDir = (originalPath as NSString).deletingLastPathComponent
         let effectiveProjectName = projectName ?? (projectDir as NSString).lastPathComponent
+
+        // Sub-commands disguised as flags. ArgumentParser doesn't make
+        // it cheap to nest subcommands two levels deep ("compose watch
+        // stop") so we route on flags ; the help text reads cleanly
+        // because each flag is self-describing.
+        if stop   { try handleStop(projectDir: projectDir); return }
+        if status { handleStatus(projectDir: projectDir); return }
+        if logs   { try handleLogs(projectDir: projectDir); return }
+
+        // `--detach` : re-exec ourselves without -d, fully detached. The
+        // parent prints the PID and exits. The child reparents to launchd
+        // (PPID=1) and writes its output to <projectDir>/.cocker/watch.log
+        // so the user can `tail -f` it later. We funnel both the "up"
+        // pre-step and the loop output into the same log so a single
+        // tail captures everything from boot onward.
+        if detach {
+            try detachAndExit(projectDir: projectDir, originalArgs: CommandLine.arguments)
+            return
+        }
 
         print(ANSI.colored("Bringing up project \(effectiveProjectName) before watching…", ANSI.cyan))
         try await composeUp(originalPath: originalPath, projectName: effectiveProjectName)
@@ -69,6 +104,152 @@ struct ComposeWatchCommand: AsyncParsableCommand {
                 fputs("Reload failed: \(error)\n", stderr)
             }
         }
+    }
+
+    private static func pidFilePath(_ projectDir: String) -> String {
+        projectDir + "/.cocker/watch.pid"
+    }
+    private static func logFilePath(_ projectDir: String) -> String {
+        projectDir + "/.cocker/watch.log"
+    }
+
+    /// Returns the pid stored in `.cocker/watch.pid` if (and only if)
+    /// the process is still alive. Self-cleans stale files from a
+    /// previous crash so subsequent commands don't trip over a ghost.
+    private static func livePID(projectDir: String) -> Int32? {
+        let path = pidFilePath(projectDir)
+        guard let raw = try? String(contentsOfFile: path, encoding: .utf8),
+              let pid = Int32(raw.trimmingCharacters(in: .whitespacesAndNewlines))
+        else { return nil }
+        if kill(pid, 0) == 0 { return pid }
+        // Process gone — stale pidfile.
+        try? FileManager.default.removeItem(atPath: path)
+        return nil
+    }
+
+    private func handleStop(projectDir: String) throws {
+        guard let pid = Self.livePID(projectDir: projectDir) else {
+            print("No watch running for this project.")
+            return
+        }
+        if kill(pid, SIGTERM) != 0 {
+            throw CockerError.requestFailed("kill \(pid): \(String(cString: strerror(errno)))")
+        }
+        // Wait up to ~2s for it to actually exit, then SIGKILL if needed.
+        for _ in 0..<20 {
+            if kill(pid, 0) != 0 { break }
+            usleep(100_000)
+        }
+        if kill(pid, 0) == 0 { _ = kill(pid, SIGKILL) }
+        try? FileManager.default.removeItem(atPath: Self.pidFilePath(projectDir))
+        print(ANSI.colored("Stopped watch (pid \(pid)).", ANSI.green))
+    }
+
+    private func handleStatus(projectDir: String) {
+        if let pid = Self.livePID(projectDir: projectDir) {
+            print(ANSI.colored("Watch is running.", ANSI.green))
+            print("  pid : \(pid)")
+            print("  log : \(Self.logFilePath(projectDir))")
+        } else {
+            print(ANSI.colored("No watch running for this project.", ANSI.yellow))
+        }
+    }
+
+    private func handleLogs(projectDir: String) throws {
+        let log = Self.logFilePath(projectDir)
+        if !FileManager.default.fileExists(atPath: log) {
+            print("No log file yet at \(log).")
+            return
+        }
+        // exec tail -f so the user gets the native scrolling experience
+        // (Ctrl-C → SIGINT → tail exits cleanly). Swift can't bridge
+        // varargs `execl`, so we materialize a NULL-terminated argv
+        // array for `execv`.
+        let argv: [UnsafeMutablePointer<CChar>?] = [
+            strdup("tail"),
+            strdup("-f"),
+            strdup(log),
+            nil,
+        ]
+        _ = execv("/usr/bin/tail", argv)
+        throw CockerError.requestFailed("exec tail: \(String(cString: strerror(errno)))")
+    }
+
+    /// Fork the watch loop into a fully detached background process and
+    /// exit cleanly. We re-exec the same `cocker compose watch` command
+    /// minus the `-d/--detach` flag, with stdin closed and stdout/stderr
+    /// redirected to `<projectDir>/.cocker/watch.log`. The child runs
+    /// the normal foreground loop ; the parent prints the PID and the
+    /// log path so the user can `tail -f` or `kill` it later.
+    private func detachAndExit(projectDir: String, originalArgs: [String]) throws {
+        // Refuse to start a second watch loop for the same project —
+        // two foreground watchers both calling `compose up --build` in
+        // response to the same events would race and double-rebuild.
+        if let existing = Self.livePID(projectDir: projectDir) {
+            print(ANSI.colored("Watch already running (pid \(existing)).", ANSI.yellow))
+            print("  log  : \(Self.logFilePath(projectDir))")
+            print("  stop : cocker compose watch --stop")
+            print("  tail : cocker compose watch --logs")
+            return
+        }
+
+        // Resolve the executable path before fork — Process.arguments
+        // can be relative in some shells, and Foundation.Process doesn't
+        // do a $PATH search the way exec*() would.
+        let argv0 = originalArgs[0]
+        let exePath: String
+        if argv0.hasPrefix("/") {
+            exePath = argv0
+        } else {
+            exePath = which(tool: (argv0 as NSString).lastPathComponent)
+                ?? "/usr/bin/env"
+        }
+
+        // Strip `-d` / `--detach` so the child runs in foreground.
+        let filtered = originalArgs.dropFirst().filter { $0 != "-d" && $0 != "--detach" }
+
+        let logDir = projectDir + "/.cocker"
+        try? FileManager.default.createDirectory(atPath: logDir,
+                                                 withIntermediateDirectories: true)
+        let logPath = Self.logFilePath(projectDir)
+        let pidPath = Self.pidFilePath(projectDir)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: exePath)
+        proc.arguments = Array(filtered)
+        proc.currentDirectoryURL = URL(fileURLWithPath: projectDir)
+        // Truncate the log on every fresh start so users don't trail
+        // through stale output from yesterday's watch.
+        FileManager.default.createFile(atPath: logPath, contents: nil)
+        guard let logHandle = FileHandle(forWritingAtPath: logPath) else {
+            throw CockerError.requestFailed("Could not open log file at \(logPath)")
+        }
+        proc.standardInput = FileHandle.nullDevice
+        proc.standardOutput = logHandle
+        proc.standardError = logHandle
+
+        try proc.run()
+        let pid = proc.processIdentifier
+        try? "\(pid)\n".write(toFile: pidPath, atomically: true, encoding: .utf8)
+
+        print(ANSI.colored("Started watch in background.", ANSI.green))
+        print("  pid    : \(pid)")
+        print("  log    : \(logPath)")
+        print("  status : cocker compose watch --status")
+        print("  tail   : cocker compose watch --logs")
+        print("  stop   : cocker compose watch --stop")
+    }
+
+    /// Crude $PATH walk so `Process` can find the exe by basename when
+    /// argv[0] was launched relatively. Falls back to nil — caller will
+    /// substitute a safe default.
+    private func which(tool: String) -> String? {
+        let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
+        for dir in path.split(separator: ":") {
+            let candidate = "\(dir)/\(tool)"
+            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+        }
+        return nil
     }
 
     /// Call into the same staging + IPC pipeline `compose up` uses, but

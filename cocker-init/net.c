@@ -75,19 +75,38 @@ static void run_dhcp_client(void) {
     for (int i = 0; clients[i]; i++) {
         if (access(clients[i], X_OK) == 0) { client = clients[i]; break; }
     }
-    if (!client) { info("no DHCP client found (udhcpc/dhclient)"); return; }
 
-    /* Two attempts back-to-back. If the first udhcpc exits non-zero, vmnet's
-     * bootpd may not have been ready yet (cold cache) — a 1 s sleep usually
-     * smooths it out. cockerd has a host-side fallback via
-     * /var/db/dhcpd_leases for the case where this still fails. */
-    for (int attempt = 0; attempt < 2; attempt++) {
-        info("started DHCP client %s (attempt %d)", client, attempt + 1);
-        int rc = spawn_dhcp_attempt(client);
-        if (rc == 0) return;
-        info("DHCP attempt %d failed (rc=%d)", attempt + 1, rc);
+    if (client) {
+        /* Two attempts back-to-back. If the first udhcpc exits non-zero,
+         * vmnet's bootpd may not have been ready yet (cold cache) — a 1 s
+         * sleep usually smooths it out. cockerd has a host-side fallback
+         * via /var/db/dhcpd_leases for the case where this still fails. */
+        for (int attempt = 0; attempt < 2; attempt++) {
+            info("started DHCP client %s (attempt %d)", client, attempt + 1);
+            int rc = spawn_dhcp_attempt(client);
+            if (rc == 0) return;
+            info("DHCP attempt %d failed (rc=%d)", attempt + 1, rc);
+            sleep(1);
+        }
+    }
+
+    /* No rootfs DHCP client (most slim Python / Node / scratch-derived
+     * images) — fall through to the in-tree embedded client (see
+     * dhcp_min.c). Without this, eth0 stays IP-less, /cocker-ip never
+     * gets written, and cockerd port-forwarding loops at 127.0.0.1 in
+     * the VM (visible to the user as "API replies from inside the
+     * container but localhost:PORT on the host returns connection
+     * refused"). */
+    if (!client) {
+        info("no DHCP client found in image rootfs — using embedded client");
+    } else {
+        info("rootfs DHCP client failed — falling back to embedded client");
+    }
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (dhcp_embedded_lease() == 0) return;
         sleep(1);
     }
+    info("embedded DHCP client also failed after 3 attempts");
 }
 
 static void report_eth0_ip(void) {

@@ -57,7 +57,7 @@ jobs:
           cd cocker-init
           zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init \
                  init.c cmdline.c net.c dns_proxy.c spec.c qemu.c \
-                 exec_listener.c caps.c health_poll.c etc_overlay.c
+                 exec_listener.c caps.c health_poll.c etc_overlay.c dhcp_min.c
           cp cocker-init ../dist/cocker-init-${{ github.ref_name }}-aarch64-linux
           cp initrd.img ../dist/initrd-${{ github.ref_name }}.img
 
