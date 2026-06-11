@@ -6,7 +6,7 @@ class Cocker < Formula
   version "0.5.15"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
   # Placeholder — replace with `shasum -a 256` of the actual release tarball.
-  sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
+  sha256 "26cacd744a1df63e712d70f73590de82c322823f9b2ea49ccf3a56a0414a4c38"
   license "MIT"
   head "https://github.com/gloiiire/cocker.git", branch: "main"
 
@@ -28,9 +28,9 @@ class Cocker < Formula
   # tag so they stay in lock-step.
   bottle do
     root_url "https://github.com/gloiiire/cocker/releases/download/v0.5.15"
-    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "REPLACE_BOTTLE_SHA256_TAHOE"
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "REPLACE_BOTTLE_SHA256_SEQUOIA"
-    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "REPLACE_BOTTLE_SHA256_SONOMA"
+    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "7200b3ec7f7f2ba94dd665c77fd127f4a1175c5879638ee5c7c48d51d19e13cb"
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "7200b3ec7f7f2ba94dd665c77fd127f4a1175c5879638ee5c7c48d51d19e13cb"
+    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "7200b3ec7f7f2ba94dd665c77fd127f4a1175c5879638ee5c7c48d51d19e13cb"
   end
 
   depends_on arch: :arm64
