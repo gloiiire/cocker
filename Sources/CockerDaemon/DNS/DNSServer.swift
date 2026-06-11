@@ -113,11 +113,15 @@ actor DNSServer {
                 Darwin.accept(fd, nil, nil)
             }.value
             if cfd < 0 { try? await Task.sleep(nanoseconds: 50_000_000); continue }
-            Task { await self.handleTCPClient(fd: cfd) }
+            // Task.detached for same reason as the UDP path : avoid
+            // serializing concurrent queries on the actor's executor.
+            Task.detached(priority: .userInitiated) { [weak self] in
+                await self?.handleTCPClient(fd: cfd)
+            }
         }
     }
 
-    private func handleTCPClient(fd: Int32) async {
+    nonisolated private func handleTCPClient(fd: Int32) async {
         await handleStreamedDNSQuery(fd: fd)
     }
 
@@ -125,7 +129,17 @@ actor DNSServer {
     /// back framed, close the fd. Used by both the TCP listener and the vsock
     /// listener — the wire is identical (RFC 1035 §4.2.2). Caller transfers
     /// fd ownership.
-    func handleStreamedDNSQuery(fd: Int32) async {
+    ///
+    /// **Why this is nonisolated** : the heavy step is `forwardToUpstream`,
+    /// a synchronous UDP roundtrip to 1.1.1.1 with a 2-second timeout.
+    /// Inside actor isolation, every concurrent query would serialize
+    /// behind that 2-second wait (uv pip install fires 7+ A+AAAA pairs
+    /// in parallel → 28+ seconds of head-of-line blocking → EAI_AGAIN).
+    /// Making this nonisolated lets each Task.detached run the resolver
+    /// in true parallel ; the only shared state we touch is `state.
+    /// allContainers` which is itself an actor and handles concurrent
+    /// reads cleanly.
+    nonisolated func handleStreamedDNSQuery(fd: Int32) async {
         defer { close(fd) }
         var lenBuf: [UInt8] = [0, 0]
         guard Self.readAll(fd: fd, into: &lenBuf, count: 2) else { return }
@@ -144,7 +158,7 @@ actor DNSServer {
             forwardUpstream: { q in forwardToUpstream(q, upstream: upstream) }
         ) else { return }
 
-        logResult(result.kind)
+        Self.logResult(result.kind)
 
         let response = result.response
         let prefix: [UInt8] = [UInt8((response.count >> 8) & 0xFF), UInt8(response.count & 0xFF)]
@@ -152,7 +166,7 @@ actor DNSServer {
         _ = response.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, response.count) }
     }
 
-    private func logResult(_ kind: DNSQueryAnswerKind) {
+    nonisolated private static func logResult(_ kind: DNSQueryAnswerKind) {
         switch kind {
         case .authoritativeA(let n, let ip):     logDNS(n, result: ip, authoritative: true)
         case .authoritativeAAAA(let n, let ip6): logDNS(n, result: ip6, authoritative: true)
@@ -250,13 +264,23 @@ actor DNSServer {
                 return "\(b[0]).\(b[1]).\(b[2]).\(b[3])"
             }
 
-            Task { await self.handlePacket(packet, clientIP: clientIP, clientPort: clientPort, viaFD: fd) }
+            // Task.detached so the per-query handler doesn't run on the
+            // DNSServer actor's executor — concurrent UDP queries now
+            // truly parallelize through forwardToUpstream's 2s blocking
+            // recv, instead of queuing up head-of-line.
+            Task.detached(priority: .userInitiated) { [weak self] in
+                await self?.handlePacket(packet, clientIP: clientIP, clientPort: clientPort, viaFD: fd)
+            }
         }
     }
 
     // MARK: - Packet handler
 
-    private func handlePacket(_ data: Data, clientIP: String, clientPort: UInt16, viaFD: Int32) async {
+    /// Nonisolated UDP handler — same reasoning as `handleStreamedDNSQuery` :
+    /// forwardToUpstream blocks for up to 2s, and isolating it on the
+    /// DNSServer actor serialized every concurrent query (uv pip
+    /// install's parallel A+AAAA bursts hit 8+ second pile-ups → EAI_AGAIN).
+    nonisolated private func handlePacket(_ data: Data, clientIP: String, clientPort: UInt16, viaFD: Int32) async {
         let containers = await state.allContainers(includeAll: false)
         let upstream = Self.upstreamDNS
         guard let result = DNSQueryProcessor.process(
@@ -265,13 +289,15 @@ actor DNSServer {
             forwardUpstream: { q in forwardToUpstream(q, upstream: upstream) }
         ) else { return }
 
-        logResult(result.kind)
-        sendResponse(result.response, toIP: clientIP, port: clientPort, viaFD: viaFD)
+        Self.logResult(result.kind)
+        Self.sendResponse(result.response, toIP: clientIP, port: clientPort, viaFD: viaFD)
     }
 
     // MARK: - Send response
 
-    private func sendResponse(_ data: Data, toIP ip: String, port: UInt16, viaFD: Int32) {
+    /// Nonisolated so the per-query Tasks can write back without
+    /// re-entering the actor.
+    nonisolated private static func sendResponse(_ data: Data, toIP ip: String, port: UInt16, viaFD: Int32) {
         var dest = sockaddr_in()
         dest.sin_family = sa_family_t(AF_INET)
         dest.sin_port = port.bigEndian
@@ -289,7 +315,7 @@ actor DNSServer {
 
     // MARK: - Logging
 
-    private func logDNS(_ name: String, result: String, authoritative: Bool) {
+    nonisolated private static func logDNS(_ name: String, result: String, authoritative: Bool) {
         let tag = authoritative ? "✓" : "→"
         print("[dns] \(tag) \(name) → \(result)")
     }
