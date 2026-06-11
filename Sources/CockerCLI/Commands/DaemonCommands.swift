@@ -636,7 +636,7 @@ struct DaemonStartCommand: AsyncParsableCommand {
                                                contents: nil)
                 return FileHandle(forWritingAtPath: paths.logFile.path)!
             }()
-        try? log.seekToEnd()
+        _ = try? log.seekToEnd()
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cockerd)

@@ -155,13 +155,27 @@ final class FSEventWatcher {
             FSEventStreamSetDispatchQueue(stream, .main)
             FSEventStreamStart(stream)
 
+            // Wrap the FSEventStreamRef so the @Sendable termination
+            // closure can carry it across actor boundaries. The stream
+            // is single-owner (this scope creates + tears down) and
+            // FSEventStream*() functions are themselves thread-safe.
+            let streamBox = SendableFSEventStream(stream)
             continuation.onTermination = { _ in
-                FSEventStreamStop(stream)
-                FSEventStreamInvalidate(stream)
-                FSEventStreamRelease(stream)
+                FSEventStreamStop(streamBox.stream)
+                FSEventStreamInvalidate(streamBox.stream)
+                FSEventStreamRelease(streamBox.stream)
             }
         }
     }
+}
+
+/// @unchecked Sendable wrapper for FSEventStreamRef so the cleanup
+/// closure (which AsyncStream stores as @Sendable) can carry it across
+/// actor boundaries. FSEventStream*() functions are thread-safe ; the
+/// box itself only ever holds one stream owned by the producer scope.
+private final class SendableFSEventStream: @unchecked Sendable {
+    let stream: FSEventStreamRef
+    init(_ stream: FSEventStreamRef) { self.stream = stream }
 }
 
 /// Reference-counted wrapper for the FSEventStream callback's context
