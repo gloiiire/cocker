@@ -71,7 +71,25 @@ public actor IPCClient {
         try writeFrame(data)
 
         while true {
-            let frameData = try readFrame()
+            let frameData: Data
+            do {
+                frameData = try readFrame()
+            } catch CockerError.daemonNotRunning {
+                // Clean EOF from the daemon after the last frame was sent.
+                // `compose logs -f` hits this when every followed container
+                // exits — the task group drains, the streaming operation
+                // closes its side, and our next read returns 0. Treat as
+                // normal end-of-stream, not as a crash.
+                return
+            }
+            // Zero-length frame = explicit clean close sentinel. Some
+            // streaming paths emit one before tearing down (notably
+            // composeLogs when all child log streams finish at once).
+            // Without this short-circuit we'd hand an empty Data() to
+            // JSONDecoder and surface the very confusing
+            // "DecodingError.dataCorrupted: Unexpected character around
+            // line 1, column 1" the user actually saw.
+            if frameData.isEmpty { return }
             let response = try JSONDecoder().decode(IPCResponse.self, from: frameData)
             if !response.success, let err = response.error {
                 throw CockerError.requestFailed(err)
