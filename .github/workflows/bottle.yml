@@ -223,10 +223,26 @@ jobs:
           # ${TAG} → user got 404 because brew asked for
           # `cocker-0.5.14.3.arm64_tahoe.bottle.tar.gz` but we'd
           # uploaded `cocker-v0.5.14.3.arm64_tahoe.bottle.tar.gz`.
+          # Reproducible tarball : identical input bytes must produce
+          # identical sha256, otherwise a Bottle re-run (e.g. because
+          # the upstream Release retried) overwrites the released file
+          # with a NEW sha while the previous run's sha is already
+          # baked into Formula on main → brew gets a checksum
+          # mismatch at install time. Three pins :
+          #   --sort=name              deterministic entry order
+          #   --mtime, --owner, --group fixed values, not the runner's
+          #                            ctime / uid / gid
+          #   gzip -n                  strip the gzip mtime+filename
+          #                            header so the .gz envelope is
+          #                            also bit-identical.
           mkdir -p out
           for os in tahoe sequoia sonoma; do
             NAME="cocker-${VER}.arm64_${os}.bottle.tar.gz"
-            tar -C bottle-staging -czf "out/${NAME}" "cocker/${VER}"
+            tar -C bottle-staging --sort=name \
+                --mtime='2025-01-01 00:00:00 UTC' \
+                --owner=0 --group=0 --numeric-owner \
+                -cf - "cocker/${VER}" \
+              | gzip -9 -n > "out/${NAME}"
             SHA=$(sha256sum "out/${NAME}" | awk '{print $1}')
             echo "sha_${os}=${SHA}" >> "$GITHUB_OUTPUT"
             echo "Built ${NAME}"

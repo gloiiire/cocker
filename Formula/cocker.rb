@@ -3,7 +3,7 @@ require "etc"
 class Cocker < Formula
   desc "Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework"
   homepage "https://github.com/gloiiire/cocker"
-  version "0.5.15.7"
+  version "0.5.15.8"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
   # Placeholder — replace with `shasum -a 256` of the actual release tarball.
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
@@ -27,10 +27,10 @@ class Cocker < Formula
   # both `version "..."` AND this `vX.Y.Z` substring on every release
   # tag so they stay in lock-step.
   bottle do
-    root_url "https://github.com/gloiiire/cocker/releases/download/v0.5.15.7"
-    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "71fb2ff0ec53a1f2eddd0e1454260e509f8b222e236ae0467a112ac4640923f5"
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "71fb2ff0ec53a1f2eddd0e1454260e509f8b222e236ae0467a112ac4640923f5"
-    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "71fb2ff0ec53a1f2eddd0e1454260e509f8b222e236ae0467a112ac4640923f5"
+    root_url "https://github.com/gloiiire/cocker/releases/download/v0.5.15.8"
+    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "REPLACE_BOTTLE_SHA256_TAHOE"
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "REPLACE_BOTTLE_SHA256_SEQUOIA"
+    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "REPLACE_BOTTLE_SHA256_SONOMA"
   end
 
   depends_on arch: :arm64
@@ -110,58 +110,31 @@ class Cocker < Formula
   end
 
   def post_install
-    # --- 1. Sign cockerd with the user's Apple Development certificate ---
+    # --- 1. Ad-hoc sign cockerd with the virtualization entitlement ---
     #
-    # `Utils.safe_popen_read("security", ...)` returned an empty string
-    # on at least one user's keychain even though `security find-identity`
-    # in their shell printed the cert correctly. Suspected cause is the
-    # post_install sandbox blocking the keychain DB read. Shell out
-    # through /bin/sh which inherits the user's keychain context cleanly,
-    # and also accept the (rare) Developer ID Application form as a fall-
-    # back so users with a paid cert aren't punted to ad-hoc either.
+    # Homebrew runs post_install inside a seatbelt sandbox that denies
+    # filesystem access to ~/Library/Keychains/. Inside that sandbox,
+    # `security find-identity` returns an empty list even when the
+    # user has a perfectly good Apple Development cert installed —
+    # `security` succeeds, the keychain file read silently fails. So
+    # we don't try to detect a real cert here ; we always ad-hoc sign,
+    # which works inside the sandbox AND lets cockerd boot VMs on the
+    # same machine it was signed on (macOS honors the virtualization
+    # entitlement for ad-hoc signatures of locally-built binaries).
+    #
+    # Users who want a TeamIdentifier-bearing signature (required to
+    # copy the binary across machines, or to satisfy stricter signing
+    # policies) should run :
+    #
+    #     cocker daemon resign
+    #
+    # which runs in the user's shell context, reads the keychain
+    # normally, and re-signs cockerd in place.
     require "open3"
-    sec_out, _err, sec_status = Open3.capture3(
-      "/bin/sh", "-c", "/usr/bin/security find-identity -v -p codesigning 2>&1"
-    )
-    cert = nil
-    if sec_status.success?
-      ["Apple Development", "Developer ID Application"].each do |kind|
-        m = sec_out.lines.grep(/#{Regexp.escape(kind)}/).first&.match(/"([^"]+)"/)&.[](1)
-        cert = m and break
-      end
-    end
-
-    sign_args = if cert.nil?
-      opoo <<~EOS
-        No "Apple Development" signing certificate found in your Keychain.
-
-        Falling back to ad-hoc signing with the virtualization entitlement.
-        macOS still honours that entitlement for binaries compiled on the
-        same machine (the local-development case Homebrew is doing here),
-        so cockerd will be able to boot VMs. Upgrade to a real Apple
-        Development cert if you want to copy the binary across machines :
-
-          1. Open Xcode → Settings → Accounts
-          2. Sign in with your Apple ID (free)
-          3. Click "Manage Certificates" → "+" → "Apple Development"
-          4. Then: brew postinstall cocker
-      EOS
-      ohai "Ad-hoc signing cockerd with virtualization entitlement"
-      ["-"]
-    else
-      ohai "Signing cockerd with: #{cert}"
-      [cert]
-    end
-
-    # `system "codesign"` previously raised even when codesign actually
-    # succeeded — codesign prints "replacing existing signature" to
-    # stderr on the upgrade path, and Homebrew's `system` apparently
-    # treated that as failure. Capture stdout/stderr/status explicitly
-    # so we only abort when codesign's exitstatus is non-zero, and
-    # surface the actual error if there is one.
+    ohai "Ad-hoc signing cockerd with virtualization entitlement"
     cs_out, cs_err, cs_status = Open3.capture3(
       "/usr/bin/codesign", "--force",
-      "--sign", sign_args.first,
+      "--sign", "-",
       "--entitlements", (share/"cocker/cockerd.entitlements").to_s,
       (bin/"cockerd").to_s
     )
@@ -169,8 +142,25 @@ class Cocker < Formula
       opoo "codesign failed (exit #{cs_status.exitstatus}): #{cs_err.strip}"
       opoo "cockerd may not be able to launch VMs until re-signed manually."
     end
+    # codesign prints "replacing existing signature" to stderr on every
+    # upgrade — informational, not a failure. ohai (not opoo) keeps
+    # it in the calm-log lane.
     ohai "codesign: #{cs_err.strip}" unless cs_err.empty?
     ohai cs_out.strip unless cs_out.empty?
+
+    # Tell the user how to get a real cert signature without making
+    # the install feel broken.
+    opoo <<~EOS
+      cockerd was ad-hoc signed (Homebrew's sandbox denies keychain access,
+      so we can't read your Apple Development cert from inside the install).
+
+      To resign with your real cert (TeamIdentifier-bearing, portable across
+      machines) :
+
+        cocker daemon resign
+
+      Re-run after every `brew upgrade cocker`.
+    EOS
 
     # --- 2. Provision ~/.cocker/kernel/ (kernel symlink + initrd copy) ---
     # IMPORTANT : `Dir.home` returns Homebrew's fake-home sandbox in the
