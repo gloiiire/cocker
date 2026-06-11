@@ -547,15 +547,41 @@ final class DaemonServer {
         to fd: Int32,
         operation: @escaping (@escaping (StreamEvent) -> Void) async throws -> Void
     ) async throws {
+        // Serialize concurrent writes to the same fd.
+        //
+        // compose logs -f spawns one Task per followed container and
+        // multiplexes their output through `send(...)`. Without this
+        // lock, two Tasks can interleave their IPCFramer.write calls
+        // (length header from one, payload bytes from another) and the
+        // client surfaces the result as
+        //   "DecodingError.dataCorrupted: Unable to convert data to a
+        //   string using the detected encoding."
+        // because what reaches JSONDecoder is half-frames glued together.
+        let writer = FrameWriteSerializer()
         try await operation { event in
             let response = try? IPCResponse(requestId: requestId, payload: event, isStreaming: true, isLast: false)
             if let data = try? JSONEncoder().encode(response) {
-                try? IPCFramer.write(data, to: fd)
+                writer.write(data, to: fd)
             }
         }
+        // Operation has completed → all per-container Tasks have exited
+        // → no more concurrent writers. Final marker is safe to write
+        // directly without going through the serializer.
         let done = try IPCResponse(requestId: requestId, payload: StreamEvent(stream: .status, data: ""), isStreaming: true, isLast: true)
-        let data = try JSONEncoder().encode(done)
-        try IPCFramer.write(data, to: fd)
+        let doneData = try JSONEncoder().encode(done)
+        try IPCFramer.write(doneData, to: fd)
+    }
+
+    /// Wraps IPCFramer.write in an NSLock so concurrent callers can't
+    /// interleave the framer's two-step length-then-payload pattern.
+    /// The class is `@unchecked Sendable` because NSLock is sound under
+    /// concurrent access ; we just need to convince Swift 6's checker.
+    private final class FrameWriteSerializer: @unchecked Sendable {
+        private let lock = NSLock()
+        func write(_ data: Data, to fd: Int32) {
+            lock.lock(); defer { lock.unlock() }
+            try? IPCFramer.write(data, to: fd)
+        }
     }
 
     // MARK: - Feature helpers
