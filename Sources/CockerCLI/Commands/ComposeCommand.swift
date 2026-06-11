@@ -200,7 +200,10 @@ struct ComposeLogsCommand: AsyncParsableCommand {
     @Flag(name: [.short, .customLong("follow")], help: "Follow log output")
     var follow = false
 
-    @Option(name: [.short, .customLong("file")], help: "Compose file path")
+    // `--file` has no short alias on `logs` — `-f` is reserved for
+    // `--follow` here (matches docker compose). Other subcommands keep
+    // `-f / --file` because they don't take a `--follow` flag.
+    @Option(name: .customLong("file"), help: "Compose file path")
     var file: String = "cocker-compose.yml"
 
     @Option(name: [.short, .customLong("project-name")], help: "Project name")
