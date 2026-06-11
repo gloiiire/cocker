@@ -309,7 +309,7 @@ final class ContainerEngine {
         // Drain the eth0 MAC VZ generated during createVM and persist it so
         // the IP-discovery task below can use it for /var/db/dhcpd_leases
         // fallback when the in-VM /cocker-ip write loses the race.
-        if let mac = await vmRuntime.takeNATMAC(forContainer: id) {
+        if let mac = vmRuntime.takeNATMAC(forContainer: id) {
             container.natMAC = mac
             try? await state.updateContainer(id: id) { c in c.natMAC = mac }
             fputs("[eng] nat MAC=\(mac)\n", stderr); fflush(stderr)
@@ -408,7 +408,7 @@ final class ContainerEngine {
         let taskID = UUID()
         let task = Task { [weak self] in
             await self?.watchContainer(id: id, rm: rm)
-            await self?.markWatcherFinished(id: id, taskID: taskID)
+            self?.markWatcherFinished(id: id, taskID: taskID)
         }
         watcherTasks[id] = TaskRecord(task: task, id: taskID, alive: true)
     }
@@ -440,7 +440,7 @@ final class ContainerEngine {
         let taskID = UUID()
         let task = Task { [weak self] in
             await self?.runHealthcheckLoop(containerID: id, spec: spec)
-            await self?.markHealthFinished(id: id, taskID: taskID)
+            self?.markHealthFinished(id: id, taskID: taskID)
         }
         healthTasks[id] = TaskRecord(task: task, id: taskID, alive: true)
     }
@@ -949,7 +949,7 @@ final class ContainerEngine {
             throw CockerError.containerNotFound(id)
         }
 
-        let historical = await vmRuntime.logs(containerID: container.id, tail: request.tail)
+        let historical = vmRuntime.logs(containerID: container.id, tail: request.tail)
         let follow = request.follow
         let containerID = container.id
 
@@ -968,14 +968,14 @@ final class ContainerEngine {
                 var lastCount = historical.count
                 while true {
                     try? await Task.sleep(nanoseconds: 100_000_000)
-                    let current = await self.vmRuntime.logs(containerID: containerID, tail: 0)
+                    let current = self.vmRuntime.logs(containerID: containerID, tail: 0)
                     if current.count > lastCount {
                         for event in current.dropFirst(lastCount) {
                             continuation.yield(event)
                         }
                         lastCount = current.count
                     }
-                    if !(await self.vmRuntime.isRunning(containerID: containerID)) {
+                    if !self.vmRuntime.isRunning(containerID: containerID) {
                         break
                     }
                 }
@@ -1138,7 +1138,7 @@ final class ContainerEngine {
         else { return }
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         if let handle = try? FileHandle(forWritingTo: path) {
-            try? handle.seekToEnd()
+            _ = try? handle.seekToEnd()
             try? handle.write(contentsOf: line)
             try? handle.close()
         } else {
@@ -1179,7 +1179,7 @@ final class ContainerEngine {
             if await state.container(id: id)?.status == .paused {
                 continue
             }
-            if !(await vmRuntime.isRunning(containerID: id)) {
+            if !vmRuntime.isRunning(containerID: id) {
                 guard let container = await state.container(id: id) else { break }
 
                 // Give cocker-init's "exited with code N" line a moment to
@@ -1188,7 +1188,7 @@ final class ContainerEngine {
                 // up-to-date the instant VM state flips to stopped.
                 var parsedCode: Int32? = nil
                 for _ in 0..<10 {
-                    parsedCode = await vmRuntime.exitCode(forContainer: id)
+                    parsedCode = vmRuntime.exitCode(forContainer: id)
                     if parsedCode != nil { break }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }

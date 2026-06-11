@@ -43,7 +43,39 @@ actor StateStore {
 
     init(rootDir: URL) throws {
         self.stateFile = rootDir.appendingPathComponent("state.json")
-        try load()
+        // Load synchronously inside the actor's init — Swift 6 forbids
+        // calling actor-isolated methods (like `load()`) from a
+        // nonisolated init, but a self-contained load function that
+        // returns a new State and gets assigned right here is fine.
+        self.state = try Self.readState(from: stateFile)
+    }
+
+    /// Pure read helper used by `init`. Doesn't touch actor state, so
+    /// it can be called from the nonisolated init context that Swift 6
+    /// strict concurrency enforces.
+    private static func readState(from stateFile: URL) throws -> State {
+        guard FileManager.default.fileExists(atPath: stateFile.path),
+              let data = try? Data(contentsOf: stateFile)
+        else { return State() }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let loaded = try? decoder.decode(State.self, from: data) else {
+            let backup = stateFile.appendingPathExtension("corrupted.\(Int(Date().timeIntervalSince1970))")
+            try? FileManager.default.copyItem(at: stateFile, to: backup)
+            fputs("[state] WARN : state.json failed to decode ; preserved as \(backup.path) and starting empty\n", stderr)
+            return State()
+        }
+        if loaded.schemaVersion > Self.currentSchemaVersion {
+            fputs("[state] FATAL : state.json schemaVersion=\(loaded.schemaVersion) exceeds this cockerd's max (\(Self.currentSchemaVersion)). Upgrade cockerd or roll back the file.\n", stderr)
+            exit(64)  // EX_USAGE — operator must intervene
+        }
+        var migrated = loaded
+        if migrated.schemaVersion < Self.currentSchemaVersion {
+            fputs("[state] migrating state.json from v\(migrated.schemaVersion) → v\(Self.currentSchemaVersion)\n", stderr)
+            migrated.schemaVersion = Self.currentSchemaVersion
+        }
+        return migrated
     }
 
     /// Reconcile persisted state with reality. cockerd loses its VM handles
@@ -80,37 +112,6 @@ actor StateStore {
     }
 
     // MARK: - Persistence
-
-    private func load() throws {
-        guard FileManager.default.fileExists(atPath: stateFile.path),
-              let data = try? Data(contentsOf: stateFile)
-        else { return }
-
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        guard let loaded = try? decoder.decode(State.self, from: data) else {
-            // Corrupted / truncated state.json — preserve the broken file
-            // for forensics and start fresh instead of silently wiping
-            // every container the user had.
-            let backup = stateFile.appendingPathExtension("corrupted.\(Int(Date().timeIntervalSince1970))")
-            try? FileManager.default.copyItem(at: stateFile, to: backup)
-            fputs("[state] WARN : state.json failed to decode ; preserved as \(backup.path) and starting empty\n", stderr)
-            return
-        }
-        // Refuse to load future versions — we don't know the new fields'
-        // invariants and silently downgrading them could corrupt data.
-        if loaded.schemaVersion > Self.currentSchemaVersion {
-            fputs("[state] FATAL : state.json schemaVersion=\(loaded.schemaVersion) exceeds this cockerd's max (\(Self.currentSchemaVersion)). Upgrade cockerd or roll back the file.\n", stderr)
-            exit(64)  // EX_USAGE — operator must intervene
-        }
-        state = loaded
-        // Migrate older files in-memory. The next save() writes back at
-        // currentSchemaVersion.
-        if state.schemaVersion < Self.currentSchemaVersion {
-            fputs("[state] migrating state.json from v\(state.schemaVersion) → v\(Self.currentSchemaVersion)\n", stderr)
-            state.schemaVersion = Self.currentSchemaVersion
-        }
-    }
 
     func save() throws {
         let encoder = JSONEncoder()

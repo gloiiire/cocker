@@ -433,7 +433,6 @@ actor ComposeEngine {
 
     func pull(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
         let compose = try loadComposeFile(at: request.composePath)
-        let projectName = request.projectName ?? inferProjectName(from: request.composePath)
         let services = request.services.isEmpty ? Array(compose.services.keys) : request.services
 
         for serviceName in services {

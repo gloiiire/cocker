@@ -1,6 +1,7 @@
 import Foundation
 import Network
-import Security
+@preconcurrency import Security
+@preconcurrency import CoreFoundation
 @preconcurrency import CockerCore
 
 /// TLS-over-TCP wrapper around the Docker API server. Started when the
@@ -18,6 +19,16 @@ import Security
 /// SecureTransport is deprecated since macOS 10.15 ; Network.framework
 /// is the supported path forward. The `nw_protocol_options_set_*`
 /// C helpers expose enough knobs for mTLS without dragging in NIOSSL.
+
+/// Generic @unchecked Sendable box. Used here to carry SecKey/CFData
+/// (neither is Sendable in Apple's headers) into a @Sendable closure
+/// that touches them on a single dispatch — the wrap is sound because
+/// we never hand the value to another concurrent reader.
+private final class UncheckedBox<T>: @unchecked Sendable {
+    let value: T
+    init(_ value: T) { self.value = value }
+}
+
 @MainActor
 final class DockerAPITLSListener {
     private let port: NWEndpoint.Port
@@ -89,10 +100,16 @@ final class DockerAPITLSListener {
             // TLS timeout. After this single call subsequent signs
             // return in milliseconds.
             let scratch = Data(repeating: 0, count: 32) as CFData
+            // SecKey + CFData aren't Sendable in their public headers,
+            // and SecKeyCreateSignature is thread-safe in practice (we
+            // only hold them on this single dispatch). Box them so the
+            // @Sendable closure captures the unchecked wrapper instead.
+            let boxedKey = UncheckedBox(key)
+            let boxedScratch = UncheckedBox(scratch)
             await withCheckedContinuation { (k: CheckedContinuation<Void, Never>) in
                 DispatchQueue.global(qos: .userInitiated).async {
                     var err: Unmanaged<CFError>?
-                    _ = SecKeyCreateSignature(key, .ecdsaSignatureMessageX962SHA256, scratch, &err)
+                    _ = SecKeyCreateSignature(boxedKey.value, .ecdsaSignatureMessageX962SHA256, boxedScratch.value, &err)
                     k.resume()
                 }
             }
@@ -174,11 +191,16 @@ final class DockerAPITLSListener {
         let l = try NWListener(using: params, on: port)
         listener = l
         l.newConnectionHandler = { [weak self] conn in
+            // Snapshot self into a local so the nested Task closure
+            // (which is @Sendable) captures the local instead of trying
+            // to re-capture the outer var — Swift 6 strict concurrency
+            // rejects the latter.
+            let strongSelf = self
             conn.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    Task { @MainActor [weak self] in
-                        self?.handleConnection(conn)
+                    Task { @MainActor in
+                        strongSelf?.handleConnection(conn)
                     }
                 case .failed(let err):
                     CockerLog.shared.warn("docker-api-tls", "conn failed: \(err)")
@@ -268,13 +290,16 @@ final class DockerAPITLSListener {
             }
             let response = await self.dockerAPI.routeAndSerialize(request)
             // Write response back over the TLS connection in one shot,
-            // then close.
-            let s = DispatchSemaphore(value: 0)
-            conn.send(content: response, completion: .contentProcessed { err in
-                if let err { CockerLog.shared.warn("docker-api-tls", "send error: \(err)") }
-                s.signal()
-            })
-            s.wait()
+            // then close. Use withCheckedContinuation instead of a
+            // DispatchSemaphore so we don't block the cooperative thread
+            // pool — Swift 6 marks DispatchSemaphore.wait() unavailable
+            // from async contexts for exactly that reason.
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                conn.send(content: response, completion: .contentProcessed { err in
+                    if let err { CockerLog.shared.warn("docker-api-tls", "send error: \(err)") }
+                    cont.resume()
+                })
+            }
             conn.cancel()
         }
     }

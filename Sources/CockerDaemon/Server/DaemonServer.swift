@@ -392,7 +392,7 @@ final class DaemonServer {
                     // Always emit the tail backlog first so the user sees
                     // context even when nothing new is being printed.
                     for container in containers {
-                        let backlog = await self.engine.vmRuntime.logs(containerID: container.id, tail: req.tail)
+                        let backlog = self.engine.vmRuntime.logs(containerID: container.id, tail: req.tail)
                         for event in backlog {
                             send(StreamEvent(stream: event.stream, data: "[\(container.name)] \(event.data)"))
                         }
@@ -476,7 +476,7 @@ final class DaemonServer {
                 try sendResponse(requestId: request.id, payload: result, to: fd)
 
             case .events:
-                let stream = await engine.eventStream()
+                let stream = engine.eventStream()
                 try await streamResponse(requestId: request.id, stream: stream, to: fd)
 
             case .top:
@@ -615,7 +615,12 @@ final class DaemonServer {
         var entries: [DiffEntry] = []
 
         if let enumerator = fm.enumerator(at: rootfsDir, includingPropertiesForKeys: [.isDirectoryKey]) {
-            for case let url as URL in enumerator {
+            // for-case on FileManager.DirectoryEnumerator calls
+            // makeIterator() which Swift 6 marks unavailable from async
+            // contexts. Drive it with nextObject() directly — same
+            // semantics, no implicit iterator.
+            while let any = enumerator.nextObject() {
+                guard let url = any as? URL else { continue }
                 let rel = url.path.replacingOccurrences(of: rootfsDir.path, with: "")
                 if rel.isEmpty { continue }
                 let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false

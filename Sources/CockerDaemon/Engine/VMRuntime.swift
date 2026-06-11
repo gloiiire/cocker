@@ -904,7 +904,7 @@ final class VMRuntime: NSObject {
 
         if let fh = FileHandle(forWritingAtPath: path.path) {
             defer { try? fh.close() }
-            try? fh.seekToEnd()
+            _ = try? fh.seekToEnd()
             try? fh.write(contentsOf: withNL)
         } else {
             try? withNL.write(to: path)
@@ -1103,6 +1103,14 @@ final class VMRuntime: NSObject {
     }
 }
 
+/// @unchecked Sendable box for VZVirtioSocketConnection — only used to
+/// extend its retain across a @Sendable async closure ; we never read
+/// or write the wrapped value from multiple threads.
+final class ConnectionHolder: @unchecked Sendable {
+    let connection: VZVirtioSocketConnection
+    init(_ connection: VZVirtioSocketConnection) { self.connection = connection }
+}
+
 /// Single-shot resume guard. NSLock-backed so the timeout / connect
 /// callbacks can race from different queues without double-resuming the
 /// continuation.
@@ -1164,7 +1172,14 @@ extension VMRuntime {
                     guard let data = try? JSONEncoder().encode(Req(cmd: argv, env: [:])) else {
                         resumeOnce(1); return
                     }
-                    let retained = connection  // keep ARC happy during the read
+                    // Box the connection in an @unchecked Sendable holder
+                    // so DispatchQueue.global().async (a @Sendable closure)
+                    // can keep it alive without tripping Swift 6's
+                    // strict-concurrency check. VZVirtioSocketConnection
+                    // isn't Sendable but we never touch it across threads —
+                    // the box just extends its retain count past the
+                    // socketDevice.connect callback's lifetime.
+                    let retained = ConnectionHolder(connection)
 
                     DispatchQueue.global().async {
                         _ = retained

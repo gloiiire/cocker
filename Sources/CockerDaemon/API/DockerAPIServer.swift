@@ -423,10 +423,6 @@ final class DockerAPIServer {
 
     private func handleInfo() async -> HTTPResponse {
         let info = await engine.info()
-        var sysinfo = utsname(); uname(&sysinfo)
-        let kernel = withUnsafeBytes(of: sysinfo.release) {
-            String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
-        }
         let dockerInfo = DockerInfo(
             ID: "COCKER:\(ProcessInfo.processInfo.hostName)",
             Containers: info.containers,
@@ -452,7 +448,7 @@ final class DockerAPIServer {
         // drop everything else — matches `docker events --filter` usage
         // in the wild without dragging in the full filter language.
         let filterSpec = Self.parseEventsFilter(req.query["filters"])
-        let stream = await engine.eventStream()
+        let stream = engine.eventStream()
         for await event in stream {
             // Engine event wire format is "<type>\t<action>\t<id>" — split
             // it back into the proper Docker fields so `docker events` /
@@ -590,7 +586,7 @@ final class DockerAPIServer {
                     guard let containerPort = UInt16(parts.first ?? "") else { continue }
                     let proto = parts.count > 1 ? String(parts[1]) : "tcp"
 
-                    for binding in (hostBindings ?? []) {
+                    for binding in hostBindings {
                         let hostPort = UInt16(binding.HostPort ?? "") ?? containerPort
                         config.ports.append(PortMapping(
                             hostPort: hostPort,
