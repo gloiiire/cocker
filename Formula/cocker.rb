@@ -3,7 +3,7 @@ require "etc"
 class Cocker < Formula
   desc "Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework"
   homepage "https://github.com/gloiiire/cocker"
-  version "0.5.15.8"
+  version "0.5.15.9"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
   # Placeholder — replace with `shasum -a 256` of the actual release tarball.
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
@@ -27,10 +27,10 @@ class Cocker < Formula
   # both `version "..."` AND this `vX.Y.Z` substring on every release
   # tag so they stay in lock-step.
   bottle do
-    root_url "https://github.com/gloiiire/cocker/releases/download/v0.5.15.8"
-    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "1c5f2736173c38cefa4ada8e61b7a54950b7a5b88f809d043f2cb3d924ad085b"
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "1c5f2736173c38cefa4ada8e61b7a54950b7a5b88f809d043f2cb3d924ad085b"
-    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "1c5f2736173c38cefa4ada8e61b7a54950b7a5b88f809d043f2cb3d924ad085b"
+    root_url "https://github.com/gloiiire/cocker/releases/download/v0.5.15.9"
+    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "REPLACE_BOTTLE_SHA256_TAHOE"
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "REPLACE_BOTTLE_SHA256_SEQUOIA"
+    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "REPLACE_BOTTLE_SHA256_SONOMA"
   end
 
   depends_on arch: :arm64
@@ -163,47 +163,59 @@ class Cocker < Formula
     EOS
 
     # --- 2. Provision ~/.cocker/kernel/ (kernel symlink + initrd copy) ---
-    # IMPORTANT : `Dir.home` returns Homebrew's fake-home sandbox in the
-    # postinstall context (something like /private/tmp/cocker-postinstall-XXXX/),
-    # so writing relative to it lands files in a tmpdir that vanishes when
-    # the install ends — exactly the bug we shipped through v0.5.4 where
-    # the initrd was being "installed" to /private/tmp/.../.cocker/kernel/
-    # instead of the user's real ~/.cocker/kernel/.
-    # `Etc.getpwuid(Process.uid).dir` always returns the real home of the
-    # user running brew, regardless of any HOME env override.
-    real_home   = Pathname.new(Etc.getpwuid(Process.uid).dir)
-    cocker_root = real_home/".cocker"
-    kernel_dir  = cocker_root/"kernel"
-    kernel_dir.mkpath
+    #
+    # Brew's post_install runs inside a seatbelt sandbox that denies
+    # writes to ~/. The Pathname / FileUtils.cp calls below RAISE
+    # SystemCallError when the sandbox denies them, which historically
+    # surfaced as "Warning: The post-install step did not complete
+    # successfully" — alarming, but actually harmless because cocker's
+    # `~/.cocker/kernel/initrd.img` was created as a SYMLINK to
+    # `<prefix>/share/cocker/initrd.img` on the very first install,
+    # and brew updates the file in <prefix>/share/ normally, so the
+    # user keeps getting the freshest initrd through the symlink.
+    #
+    # Wrap the whole block in rescue so a sandbox-denied write doesn't
+    # blow up the install. If anything failed, point the user at
+    # `cocker daemon setup` which runs the same steps from their
+    # shell (outside the sandbox) and can actually write to ~/.cocker/.
+    setup_ok = true
+    begin
+      # `Dir.home` returns Homebrew's fake-home sandbox in the
+      # postinstall context (something like /private/tmp/cocker-postinstall-XXXX/).
+      # `Etc.getpwuid(Process.uid).dir` returns the real home regardless.
+      real_home   = Pathname.new(Etc.getpwuid(Process.uid).dir)
+      cocker_root = real_home/".cocker"
+      kernel_dir  = cocker_root/"kernel"
+      kernel_dir.mkpath
 
-    apple_kernel = real_home/"Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
-    if apple_kernel.exist?
-      vmlinuz = kernel_dir/"vmlinuz"
-      vmlinuz.unlink if vmlinuz.symlink? || vmlinuz.exist?
-      vmlinuz.make_symlink(apple_kernel.realpath)
-      ohai "Linked kernel: #{vmlinuz} → #{apple_kernel.realpath.basename}"
-    else
+      apple_kernel = real_home/"Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
+      if apple_kernel.exist?
+        vmlinuz = kernel_dir/"vmlinuz"
+        vmlinuz.unlink if vmlinuz.symlink? || vmlinuz.exist?
+        vmlinuz.make_symlink(apple_kernel.realpath)
+        ohai "Linked kernel: #{vmlinuz} → #{apple_kernel.realpath.basename}"
+      end
+
+      # Earlier formulas (≤ v0.5.5) symlinked kernel_dir/"initrd.img" to
+      # share/cocker/initrd.img. FileUtils.cp refuses to copy a file over
+      # a symlink resolving to itself ("same file" ArgumentError) so we
+      # unlink first.
+      target = kernel_dir/"initrd.img"
+      target.unlink if target.symlink? || target.exist?
+      cp share/"cocker/initrd.img", target
+      ohai "Installed initrd: #{target}"
+    rescue StandardError => e
+      setup_ok = false
       opoo <<~EOS
-        Apple Container Linux kernel not found at:
-          #{apple_kernel}
+        Could not refresh ~/.cocker/kernel/ from inside the Homebrew sandbox
+        (#{e.class}: #{e.message.split("\n").first}). cocker still works via
+        the existing symlinks. To do a clean refresh, run :
 
-        Install Apple's container CLI to provision it:
-          brew install container
+          cocker daemon setup
 
-        Then finish setup by running:
-          brew postinstall cocker
+        from your shell at any time after install.
       EOS
     end
-
-    # Earlier formulas (≤ v0.5.5) symlinked kernel_dir/"initrd.img" to
-    # share/cocker/initrd.img instead of copying it. FileUtils.cp refuses
-    # to copy a file over a symlink that resolves to itself ("same file"
-    # ArgumentError), which silently broke every subsequent upgrade's
-    # post_install. Unlink first so we always end up with a real file.
-    target = kernel_dir/"initrd.img"
-    target.unlink if target.symlink? || target.exist?
-    cp share/"cocker/initrd.img", target
-    ohai "Installed initrd: #{target}"
 
     # --- 3. Lease-pool helper LaunchDaemon (one-time root install) ---
     # macOS vmnet's bootpd saturates around 256 DHCP leases ; without
