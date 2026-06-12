@@ -32,6 +32,7 @@ struct DaemonCommand: AsyncParsableCommand {
             DaemonHelperInstallCommand.self,
             DaemonTLSInitCommand.self,
             DaemonResignCommand.self,
+            DaemonSetupCommand.self,
         ]
     )
 }
@@ -421,6 +422,83 @@ struct DaemonResignCommand: AsyncParsableCommand {
             }
         }
         return nil
+    }
+}
+
+/// `cocker daemon setup` — refresh `~/.cocker/kernel/` from the user's
+/// shell (outside Homebrew's sandbox). Run after `brew install` or
+/// `brew upgrade cocker` if you saw the "post-install step did not
+/// complete successfully" warning, OR after installing apple/container
+/// to pick up the Linux kernel symlink.
+struct DaemonSetupCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "setup",
+        abstract: "Refresh ~/.cocker/kernel/ (symlink Apple kernel + copy initrd)",
+        discussion: """
+        Why this exists : `brew install cocker`'s post-install hook tries
+        to write to ~/.cocker/kernel/ but Homebrew's sandbox denies writes
+        outside its own dirs, so the warning "post-install step did not
+        complete successfully" surfaces even when cocker boots fine via
+        the existing symlinks. This command runs the same steps in your
+        shell context where the writes actually go through.
+
+        What it does :
+          1. Refresh ~/.cocker/kernel/vmlinuz → symlink to Apple's Linux
+             kernel at ~/Library/Application Support/com.apple.container/
+             kernels/default.kernel-arm64.
+          2. Refresh ~/.cocker/kernel/initrd.img → copy of the cocker-init
+             initrd shipped with the binary (<prefix>/share/cocker/initrd.img).
+        """
+    )
+
+    @Option(name: .customLong("share-prefix"),
+            help: "Prefix containing share/cocker (defaults to /opt/homebrew or /usr/local).")
+    var sharePrefix: String?
+
+    mutating func run() async throws {
+        let home = NSHomeDirectory()
+        let cockerRoot = home + "/.cocker"
+        let kernelDir = cockerRoot + "/kernel"
+        let fm = FileManager.default
+        try fm.createDirectory(atPath: kernelDir, withIntermediateDirectories: true)
+
+        // 1. Apple kernel symlink
+        let appleKernel = "\(home)/Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
+        if fm.fileExists(atPath: appleKernel) {
+            let resolved = URL(fileURLWithPath: appleKernel).resolvingSymlinksInPath().path
+            let vmlinuz = kernelDir + "/vmlinuz"
+            try? fm.removeItem(atPath: vmlinuz)
+            try fm.createSymbolicLink(atPath: vmlinuz, withDestinationPath: resolved)
+            print("✓ Linked kernel: \(vmlinuz) → \((resolved as NSString).lastPathComponent)")
+        } else {
+            print("⚠ Apple kernel not found at \(appleKernel)")
+            print("  Install Apple's container CLI: brew install container")
+        }
+
+        // 2. Initrd copy from share/cocker/
+        let prefix = sharePrefix ?? Self.detectSharePrefix()
+        let srcInitrd = prefix + "/share/cocker/initrd.img"
+        guard fm.fileExists(atPath: srcInitrd) else {
+            fputs("Error: initrd not found at \(srcInitrd)\n", stderr)
+            fputs("Pass --share-prefix <prefix> if cocker was installed elsewhere.\n", stderr)
+            throw ExitCode.failure
+        }
+        let target = kernelDir + "/initrd.img"
+        try? fm.removeItem(atPath: target)
+        try fm.copyItem(atPath: srcInitrd, toPath: target)
+        print("✓ Installed initrd: \(target)")
+    }
+
+    /// Pick the brew share prefix by file existence — Apple Silicon
+    /// default vs Intel/legacy. Falls back to /opt/homebrew when
+    /// neither exists ; that's the most common installs.
+    private static func detectSharePrefix() -> String {
+        for p in ["/opt/homebrew", "/usr/local"] {
+            if FileManager.default.fileExists(atPath: p + "/share/cocker/initrd.img") {
+                return p
+            }
+        }
+        return "/opt/homebrew"
     }
 }
 
