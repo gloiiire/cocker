@@ -41,9 +41,55 @@ actor StateStore {
     private let stateFile: URL
     private var state: State = State()
 
+    /// Cached encoder/decoder. Recreating them per call cost a per-update
+    /// allocation that shows up as multi-millisecond CPU spikes under
+    /// healthcheck churn (one save per probe × N running containers). Both
+    /// are configured once with the project's ISO-8601 date strategy.
+    private static let encoder: JSONEncoder = {
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        e.outputFormatting = .prettyPrinted
+        return e
+    }()
+    private static let decoder: JSONDecoder = {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }()
+
     init(rootDir: URL) throws {
         self.stateFile = rootDir.appendingPathComponent("state.json")
-        try load()
+        // Load synchronously inside the actor's init — Swift 6 forbids
+        // calling actor-isolated methods (like `load()`) from a
+        // nonisolated init, but a self-contained load function that
+        // returns a new State and gets assigned right here is fine.
+        self.state = try Self.readState(from: stateFile)
+    }
+
+    /// Pure read helper used by `init`. Doesn't touch actor state, so
+    /// it can be called from the nonisolated init context that Swift 6
+    /// strict concurrency enforces.
+    private static func readState(from stateFile: URL) throws -> State {
+        guard FileManager.default.fileExists(atPath: stateFile.path),
+              let data = try? Data(contentsOf: stateFile)
+        else { return State() }
+
+        guard let loaded = try? Self.decoder.decode(State.self, from: data) else {
+            let backup = stateFile.appendingPathExtension("corrupted.\(Int(Date().timeIntervalSince1970))")
+            try? FileManager.default.copyItem(at: stateFile, to: backup)
+            fputs("[state] WARN : state.json failed to decode ; preserved as \(backup.path) and starting empty\n", stderr)
+            return State()
+        }
+        if loaded.schemaVersion > Self.currentSchemaVersion {
+            fputs("[state] FATAL : state.json schemaVersion=\(loaded.schemaVersion) exceeds this cockerd's max (\(Self.currentSchemaVersion)). Upgrade cockerd or roll back the file.\n", stderr)
+            exit(64)  // EX_USAGE — operator must intervene
+        }
+        var migrated = loaded
+        if migrated.schemaVersion < Self.currentSchemaVersion {
+            fputs("[state] migrating state.json from v\(migrated.schemaVersion) → v\(Self.currentSchemaVersion)\n", stderr)
+            migrated.schemaVersion = Self.currentSchemaVersion
+        }
+        return migrated
     }
 
     /// Reconcile persisted state with reality. cockerd loses its VM handles
@@ -81,48 +127,31 @@ actor StateStore {
 
     // MARK: - Persistence
 
-    private func load() throws {
-        guard FileManager.default.fileExists(atPath: stateFile.path),
-              let data = try? Data(contentsOf: stateFile)
-        else { return }
-
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        guard let loaded = try? decoder.decode(State.self, from: data) else {
-            // Corrupted / truncated state.json — preserve the broken file
-            // for forensics and start fresh instead of silently wiping
-            // every container the user had.
-            let backup = stateFile.appendingPathExtension("corrupted.\(Int(Date().timeIntervalSince1970))")
-            try? FileManager.default.copyItem(at: stateFile, to: backup)
-            fputs("[state] WARN : state.json failed to decode ; preserved as \(backup.path) and starting empty\n", stderr)
-            return
-        }
-        // Refuse to load future versions — we don't know the new fields'
-        // invariants and silently downgrading them could corrupt data.
-        if loaded.schemaVersion > Self.currentSchemaVersion {
-            fputs("[state] FATAL : state.json schemaVersion=\(loaded.schemaVersion) exceeds this cockerd's max (\(Self.currentSchemaVersion)). Upgrade cockerd or roll back the file.\n", stderr)
-            exit(64)  // EX_USAGE — operator must intervene
-        }
-        state = loaded
-        // Migrate older files in-memory. The next save() writes back at
-        // currentSchemaVersion.
-        if state.schemaVersion < Self.currentSchemaVersion {
-            fputs("[state] migrating state.json from v\(state.schemaVersion) → v\(Self.currentSchemaVersion)\n", stderr)
-            state.schemaVersion = Self.currentSchemaVersion
-        }
-    }
-
     func save() throws {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = .prettyPrinted
-        let data = try encoder.encode(state)
-        try data.write(to: stateFile, options: .atomic)
-        // state.json carries container labels + env vars + restart policy.
-        // env can hold secrets (DB passwords, API tokens) — make the file
-        // owner-only readable so other local users can't enumerate them.
-        // 0o600 mirrors the credentials.json secrecy contract we already
-        // enforce in CredentialStore.
+        let data = try Self.encoder.encode(state)
+        // Atomic write goes through a temp file — chmod the temp before the
+        // rename so the window during which a passer-by could open the new
+        // file at 0o644 is zero (Foundation's `.atomic` does
+        // open(tmp)/write/close(tmp)/rename(tmp,dst)). state.json carries
+        // container labels + env vars + restart policy ; env can hold
+        // secrets (DB passwords, API tokens) so the contract is owner-only.
+        let tmp = stateFile.appendingPathExtension("tmp.\(getpid()).\(UInt32.random(in: 0..<UInt32.max))")
+        try data.write(to: tmp)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                                 ofItemAtPath: tmp.path)
+        do {
+            // Replace existing atomically. macOS rename(2) is atomic between
+            // paths on the same volume — both tmp and stateFile live in
+            // ~/.cocker/ so we're safe.
+            _ = try FileManager.default.replaceItemAt(stateFile, withItemAt: tmp)
+        } catch {
+            // Fallback : straight move. The temp still has 0o600 perms.
+            try? FileManager.default.removeItem(at: stateFile)
+            try FileManager.default.moveItem(at: tmp, to: stateFile)
+        }
+        // Belt + suspenders : re-assert perms on the final path. Some
+        // FileManager.replaceItemAt implementations copy perms from the
+        // destination, which can be wider than we want.
         try? FileManager.default.setAttributes([.posixPermissions: 0o600],
                                                  ofItemAtPath: stateFile.path)
     }
@@ -130,10 +159,19 @@ actor StateStore {
     // MARK: - Containers
 
     func container(id: String) -> Container? {
-        // Exact match
+        // Exact id match wins immediately.
         if let c = state.containers[id] { return c }
-        // Prefix match
-        return state.containers.values.first { $0.id.hasPrefix(id) || $0.name == id }
+        // Then full-name match (always valid regardless of length).
+        if let byName = state.containers.values.first(where: { $0.name == id }) {
+            return byName
+        }
+        // Prefix-id match only when the supplied prefix is unambiguous. Docker
+        // uses 12 chars as the minimum short id ; we mirror that to dodge the
+        // class of bug fixed in `volume(id:)` — a lookup like "a"/"b" would
+        // otherwise match any container whose UUID happens to start with that
+        // letter and pick one non-deterministically.
+        guard id.count >= 12 else { return nil }
+        return state.containers.values.first { $0.id.hasPrefix(id) }
     }
 
     func allContainers(includeAll: Bool = false) -> [Container] {
@@ -167,18 +205,35 @@ actor StateStore {
     func generateName() -> String {
         let adjectives = ["happy", "sad", "brave", "bold", "calm", "cool", "fast", "keen", "wild", "wise"]
         let nouns = ["newton", "turing", "ritchie", "woz", "knuth", "hopper", "lovelace", "babbage", "von_neumann"]
-        var name: String
-        repeat {
-            name = "\(adjectives.randomElement()!)_\(nouns.randomElement()!)"
-        } while nameExists(name)
-        return name
+        // 10 × 9 = 90 base combinations. Past that, blindly retrying would
+        // spin the actor forever and lock the entire state store ; the prior
+        // `repeat { ... } while nameExists` was a trivial DoS for anyone
+        // running >90 containers. We try a bounded number of fresh draws,
+        // then escalate to "<adjective>_<noun>_<counter>" with a probing loop
+        // that's guaranteed to terminate.
+        for _ in 0..<32 {
+            let base = "\(adjectives.randomElement()!)_\(nouns.randomElement()!)"
+            if !nameExists(base) { return base }
+        }
+        let base = "\(adjectives.randomElement()!)_\(nouns.randomElement()!)"
+        var counter = 2
+        while nameExists("\(base)_\(counter)") { counter += 1 }
+        return "\(base)_\(counter)"
     }
 
     // MARK: - Networks
 
     func network(id: String) -> NetworkInfo? {
         if let n = state.networks[id] { return n }
-        return state.networks.values.first { $0.name == id || $0.id.hasPrefix(id) }
+        if let byName = state.networks.values.first(where: { $0.name == id }) {
+            return byName
+        }
+        // 12-char minimum on prefix-id match : same rationale as
+        // `container(id:)` and `volume(id:)` above — a 1-char query would
+        // otherwise match any UUID starting with that hex digit (~6 % chance
+        // per existing network) and pick one arbitrarily.
+        guard id.count >= 12 else { return nil }
+        return state.networks.values.first { $0.id.hasPrefix(id) }
     }
 
     func allNetworks() -> [NetworkInfo] {
@@ -239,9 +294,15 @@ actor StateStore {
 
     func pruneUnusedVolumes() throws -> [String] {
         let usedVolumes = Set(state.containers.values.flatMap { $0.volumes.map { $0.source } })
-        let unused = state.volumes.values.filter { !usedVolumes.contains($0.name) && !usedVolumes.contains($0.mountpoint) }
+        let unused = state.volumes.values.filter {
+            !usedVolumes.contains($0.name) && !usedVolumes.contains($0.mountpoint)
+        }
         let names = unused.map { $0.name }
-        for n in names { state.volumes.removeValue(forKey: n) }
+        // The dict is keyed by `volume.id` (see `store(volume:)`), NOT by
+        // name : the prior `removeValue(forKey: n)` silently did nothing
+        // whenever id != name (i.e. for every non-trivial volume) and the
+        // returned `names` list lied about what got removed.
+        for v in unused { state.volumes.removeValue(forKey: v.id) }
         try save()
         return names
     }

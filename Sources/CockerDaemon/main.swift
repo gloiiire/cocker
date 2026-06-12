@@ -304,42 +304,52 @@ func main() async {
     // (and dropping the in-flight container watcher state with it).
     let sighupSrc = DispatchSource.makeSignalSource(signal: SIGHUP, queue: .main)
 
-    let cleanup = {
+    /// Graceful shutdown : tear every async-aware service down before exit so
+    /// the next daemon doesn't inherit orphan port-forwarders and so DNS /
+    /// IPC clients see a clean disconnect. Awaiting is mandatory — the
+    /// pre-fix code dispatched `Task { await ... }` then called `exit(0)`
+    /// in the same closure, killing the process before the Tasks had a
+    /// chance to run.
+    @MainActor func gracefulShutdown() async {
         server.stop()
         dockerAPI.stop()
-        Task { await dns.stop() }
-        // Tear down every child port-forwarder synchronously before exit so
-        // the next daemon doesn't inherit our orphans (defence in depth on
-        // top of the startup pkill).
-        Task { await engine.portForwarder.stopAll() }
+        await dns.stop()
+        await engine.portForwarder.stopAll()
+        tlsTcpListener?.stop()
         PIDFile.clear(pidFile)
     }
 
     sigintSrc.setEventHandler {
         log.info("signal", "SIGINT received, shutting down")
-        cleanup()
-        exit(0)
+        Task { @MainActor in
+            await gracefulShutdown()
+            exit(0)
+        }
     }
     sigtermSrc.setEventHandler {
         log.info("signal", "SIGTERM received, shutting down")
-        cleanup()
-        exit(0)
+        Task { @MainActor in
+            await gracefulShutdown()
+            exit(0)
+        }
     }
 
     sighupSrc.setEventHandler {
-        // Re-read $COCKER_LOG_LEVEL and swap the global logger. We
-        // don't reload the format because most consumers (journald,
-        // Loki ingest) can't switch JSON↔text mid-stream.
-        let env = ProcessInfo.processInfo.environment["COCKER_LOG_LEVEL"]
-        let newLevel = LogLevel.parse(env)
-        log.info("signal", "SIGHUP received — log level → \(newLevel.label)")
-        // CockerLog.shared is a let ; we rebuild and replace via the
-        // setter helper if one exists. If not, just log that the user
-        // should restart for level changes. Most ops use bounded
-        // restarts anyway ; SIGHUP without a runtime-mutable level is
-        // still useful as a "wake up the daemon" prompt that flushes
-        // log buffers and triggers a lease watchdog re-check.
-        // Flush pending log writes by forcing one no-op info.
+        // Runtime log-level swap isn't supported because CockerLog.shared
+        // is a value-type singleton ; pretending otherwise (as the prior
+        // code did with a fake "log level → X" line) misled operators who
+        // expected COCKER_LOG_LEVEL changes to take effect. We do two
+        // useful things instead, both of which match Unix daemon conventions
+        // for SIGHUP : (1) force a log rotation, (2) probe + report current
+        // lease pool state so the operator gets a fresh observability ping.
+        let currentLevel = LogLevel.parse(ProcessInfo.processInfo.environment["COCKER_LOG_LEVEL"])
+        log.info("signal",
+            "SIGHUP — rotating cockerd.log (live log-level swap not supported ; " +
+            "current level=\(currentLevel.label), restart cockerd to change it)")
+        try? LogRotator.rotate(file: logFile, keep: 5)
+        let pool = ContainerEngine.leasePoolCount()
+        let helper = ContainerEngine.leasePoolHelperInstalled() ? "yes" : "no"
+        log.info("vmnet", "lease pool=\(pool)/256, helper=\(helper)")
     }
 
     sigintSrc.resume()
@@ -494,21 +504,77 @@ private func kernelRootsFromContainerBinary() -> [String] {
 /// postinstall stranded the file there (HOME-sandbox bug pre-0.5.5),
 /// `cockerd setup` calls this to recover. Returns nil if no Homebrew
 /// install is present (= the user is on a source/install.sh build).
+///
+/// Path resolution is layered, most-portable-first :
+///   1. `$HOMEBREW_PREFIX/share/cocker/initrd.img` — set by brew shellenv,
+///      respects custom prefixes (Linuxbrew, dev installs to ~/brew, etc).
+///   2. Sibling to the running binary : `argv[0]/../../share/cocker/...`.
+///      Works regardless of brew prefix because the path is derived from
+///      cockerd's own location. Robust to symlinks because resolvingSymlinks
+///      collapses /opt/homebrew/bin/cockerd → Cellar/.../bin/cockerd before
+///      we go up two levels.
+///   3. The two historically hardcoded brew prefixes, kept as a last
+///      resort so a stripped HOMEBREW_PREFIX + broken argv[0] still
+///      finds the file on a default install.
+///
+/// Apple's container hit a related bug (1.0.0_1) and fixed it with an
+/// `env_script` wrapper that exports an install-root env var; we don't
+/// need that because cocker resolves sibling binaries via the executable's
+/// own parent, not via a lexical grandparent of argv[0].
 private func discoverShippedCockerInitrd() -> String? {
-    let candidates = [
-        "/opt/homebrew/share/cocker/initrd.img",   // Apple Silicon (default brew prefix)
-        "/usr/local/share/cocker/initrd.img",      // Intel Mac (legacy brew prefix)
-    ]
-    return candidates.first { FileManager.default.fileExists(atPath: $0) }
+    let fm = FileManager.default
+    var candidates: [String] = []
+
+    if let prefix = ProcessInfo.processInfo.environment["HOMEBREW_PREFIX"], !prefix.isEmpty {
+        candidates.append("\(prefix)/share/cocker/initrd.img")
+    }
+
+    // argv[0] → resolve symlinks → bin/cockerd → ../share/cocker/initrd.img
+    let argv0 = CommandLine.arguments[0]
+    let exe = URL(fileURLWithPath: argv0).resolvingSymlinksInPath()
+    let prefixFromExe = exe.deletingLastPathComponent().deletingLastPathComponent().path
+    candidates.append("\(prefixFromExe)/share/cocker/initrd.img")
+
+    candidates.append("/opt/homebrew/share/cocker/initrd.img")   // Apple Silicon (default brew prefix)
+    candidates.append("/usr/local/share/cocker/initrd.img")      // Intel Mac (legacy brew prefix)
+
+    return candidates.first { fm.fileExists(atPath: $0) }
 }
 
 private func which(_ tool: String) -> String? {
     let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-    for dir in path.split(separator: ":") {
-        let candidate = "\(dir)/\(tool)"
+    for dir in path.split(separator: ":", omittingEmptySubsequences: true) {
+        let d = String(dir)
+        // **S4 fix** : refuse empty entries ("::") AND any relative PATH
+        // component ("." or unrooted directories). A misconfigured PATH
+        // that contains `.` would otherwise let `which("container")`
+        // resolve to a same-named binary in whatever cwd cockerd happens
+        // to be launched from — useful for attackers planting bait
+        // binaries in build context directories.
+        guard d.hasPrefix("/") else { continue }
+        let candidate = "\(d)/\(tool)"
         if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
     }
     return nil
+}
+
+/// Sanity-check that a kernel path the daemon is about to symlink into
+/// `~/.cocker/kernel/vmlinuz` lives in a directory we'd expect (Homebrew
+/// prefix, Apple's container .pkg layout, the user's ~/.container, …). A
+/// kernel found anywhere else is suspicious enough to surface : an
+/// attacker who could plant a vmlinuz in a world-writable temp dir would
+/// otherwise see cockerd happily boot every container off it.
+private func kernelPathLooksTrusted(_ path: String) -> Bool {
+    let trustedRoots = [
+        "/opt/homebrew/",
+        "/usr/local/",
+        "/Library/",
+        "\(NSHomeDirectory())/.container/",
+        "\(NSHomeDirectory())/.cocker/",
+        "\(NSHomeDirectory())/Library/Application Support/com.apple.container",
+        "\(NSHomeDirectory())/Library/Application Support/com.apple.container.runtime",
+    ]
+    return trustedRoots.contains { path.hasPrefix($0) }
 }
 
 private struct DiscoveredKernel {
@@ -561,6 +627,17 @@ private func discoverAppleKernel() -> DiscoveredKernel? {
 /// `kernelDir`. Returns true on success. Errors are printed in-place so
 /// the caller can keep its happy-path branching simple.
 private func linkKernel(_ k: DiscoveredKernel, into kernelDir: URL) -> Bool {
+    // S7 — warn (don't refuse) if the discovered kernel sits in a
+    // directory we don't recognise. We don't refuse outright because
+    // power users intentionally bind-mount custom kernels into
+    // ~/.container ; printing the path makes the trust decision
+    // visible at install time so the user can spot anything odd.
+    if !kernelPathLooksTrusted(k.vmlinuz) {
+        print("Warning: kernel path \(k.vmlinuz) is outside the usual " +
+              "Homebrew / Apple container / ~/.container prefixes. " +
+              "Verify it's the kernel you intended to install before " +
+              "starting cockerd.")
+    }
     let dstKernel = kernelDir.appendingPathComponent("vmlinuz")
     let dstInitrd = kernelDir.appendingPathComponent("initrd.img")
     try? FileManager.default.removeItem(at: dstKernel)
@@ -575,6 +652,15 @@ private func linkKernel(_ k: DiscoveredKernel, into kernelDir: URL) -> Bool {
                 at: dstInitrd,
                 withDestinationURL: URL(fileURLWithPath: initrd)
             )
+        }
+        // **B14 fix** : verify the symlink target is reachable post-creation.
+        // A pre-existing broken symlink (kernel file later deleted by user)
+        // would otherwise let cockerd start and explode on first run with
+        // an opaque VZ "config validate" error. fileExists follows symlinks,
+        // so a true return == the underlying file is reachable.
+        guard FileManager.default.fileExists(atPath: dstKernel.path) else {
+            print("Error: kernel symlink at \(dstKernel.path) doesn't resolve to a file (broken link or missing source).")
+            return false
         }
         return true
     } catch {

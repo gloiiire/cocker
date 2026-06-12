@@ -71,7 +71,25 @@ public actor IPCClient {
         try writeFrame(data)
 
         while true {
-            let frameData = try readFrame()
+            let frameData: Data
+            do {
+                frameData = try readFrame()
+            } catch CockerError.daemonNotRunning {
+                // Clean EOF from the daemon after the last frame was sent.
+                // `compose logs -f` hits this when every followed container
+                // exits — the task group drains, the streaming operation
+                // closes its side, and our next read returns 0. Treat as
+                // normal end-of-stream, not as a crash.
+                return
+            }
+            // Zero-length frame = explicit clean close sentinel. Some
+            // streaming paths emit one before tearing down (notably
+            // composeLogs when all child log streams finish at once).
+            // Without this short-circuit we'd hand an empty Data() to
+            // JSONDecoder and surface the very confusing
+            // "DecodingError.dataCorrupted: Unexpected character around
+            // line 1, column 1" the user actually saw.
+            if frameData.isEmpty { return }
             let response = try JSONDecoder().decode(IPCResponse.self, from: frameData)
             if !response.success, let err = response.error {
                 throw CockerError.requestFailed(err)
@@ -95,7 +113,12 @@ public actor IPCClient {
 
     private func readFrame() throws -> Data {
         let header = try readExactly(4)
-        let length = header.withUnsafeBytes { $0.load(as: UInt32.self) }.bigEndian
+        // **I2 fix** : `load(as:)` requires its buffer to satisfy the
+        // target type's alignment. `Data`'s underlying storage doesn't
+        // guarantee that — `loadUnaligned` is documented to do the right
+        // thing on every supported architecture and is what Apple's own
+        // sample code switched to in Swift 5.7+.
+        let length = header.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.bigEndian
         guard length < 100 * 1024 * 1024 else {  // 100 MB sanity limit
             throw CockerError.responseDecodingFailed("Frame too large: \(length)")
         }
@@ -143,7 +166,9 @@ public enum IPCFramer {
 
     public static func read(from fd: Int32) throws -> Data {
         let header = try readExactly(4, from: fd)
-        let length = header.withUnsafeBytes { $0.load(as: UInt32.self) }.bigEndian
+        // Mirror Transport.IPCClient.readFrame's I2 fix : `loadUnaligned`
+        // is safer than `load` on Data-backed buffers.
+        let length = header.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.bigEndian
         guard length < 100 * 1024 * 1024 else {
             throw CockerError.responseDecodingFailed("Frame too large")
         }

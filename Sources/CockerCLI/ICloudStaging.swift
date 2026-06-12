@@ -62,8 +62,34 @@ struct ICloudStaging {
         // found in the project. Reduces iCloud read pressure by a
         // factor of 10x-100x for typical Node / Python projects.
         let excludeFile = stagingRoot.appendingPathComponent(".cocker-rsync-exclude").path
-        let excludePatterns = collectIgnorePatterns(projectDir: projectDir)
-        try excludePatterns.joined(separator: "\n").write(
+        var rules: [String] = []
+        // Files referenced by `env_file:` in docker-compose.yml /
+        // cocker-compose.yml MUST stay in the staged copy even when
+        // .dockerignore would otherwise exclude them — `.dockerignore`
+        // scopes a build context, not the runtime, but cocker uses one
+        // staging dir for both. Without these explicit `+ <path>`
+        // includes, replay/backend containers boot with no DB config
+        // and `getaddrinfo("localhost")` against their own VM.
+        //
+        // rsync `--filter=. <file>` syntax : every rule MUST be
+        // prefixed with `+ ` (include) or `- ` (exclude) — bare lines
+        // parse as a syntax error. Anchor the include with a leading
+        // `/` so the rule only matches the project-root copy (not e.g.
+        // a `tests/.env` fixture deeper in the tree). Include rules
+        // come first so they win when a later exclude rule would
+        // match the same path.
+        let runtimeKeeps = collectRuntimeKeepPaths(composePath: originalPath, projectDir: projectDir)
+        for keep in runtimeKeeps {
+            rules.append("+ /\(keep)")
+        }
+        for pat in collectIgnorePatterns(projectDir: projectDir) {
+            if pat.hasPrefix("+ ") || pat.hasPrefix("- ") {
+                rules.append(pat)
+            } else {
+                rules.append("- \(pat)")
+            }
+        }
+        try rules.joined(separator: "\n").write(
             toFile: excludeFile, atomically: true, encoding: .utf8)
 
         // `rsync -a --delete` makes the staged dir an incremental mirror
@@ -82,7 +108,12 @@ struct ICloudStaging {
         proc.arguments = [
             "-a", "--delete",
             "--exclude=.cocker-rsync-exclude",
-            "--exclude-from=\(excludeFile)",
+            // --filter=". <file>" reads <file> as a list of rsync filter
+            // rules. Unlike --exclude-from, this honors `+ pattern`
+            // (include / protect) entries alongside bare excludes —
+            // which is what lets us keep env_file: targets in the
+            // staged tree even when .dockerignore would exclude them.
+            "--filter=. \(excludeFile)",
             projectDir + "/", stagingRoot.path + "/",
         ]
         let errPipe = Pipe()
@@ -195,6 +226,83 @@ struct ICloudStaging {
     }
 
     // MARK: - Ignore patterns
+
+    /// Parse the compose file and return every `env_file:` target,
+    /// relative to projectDir. These paths get prepended as `+` filter
+    /// rules so they survive even when .dockerignore would otherwise
+    /// exclude them (most common case : `.env` listed in .dockerignore
+    /// to keep secrets out of the build context, but still needed at
+    /// runtime so the container can read DATABASE_URL etc).
+    ///
+    /// We deliberately do not bring in a YAML library here — the syntax
+    /// surface we support is small (single-string and array-of-strings
+    /// for env_file) and tracking yams as a CLI dependency would
+    /// disproportionately slow down compose start. Falls back to an
+    /// empty list on parse errors ; the staging will then look identical
+    /// to today's behavior (env_file silently missing).
+    private static func collectRuntimeKeepPaths(composePath: String, projectDir: String) -> [String] {
+        guard let yaml = try? String(contentsOfFile: composePath, encoding: .utf8) else {
+            return []
+        }
+        var keeps: Set<String> = []
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false)
+        var i = 0
+        while i < lines.count {
+            let line = String(lines[i])
+            // Lazy match : `env_file:` either with an inline value
+            // (`env_file: .env`) or a YAML array on the next lines.
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("env_file:") {
+                let rest = trimmed.dropFirst("env_file:".count).trimmingCharacters(in: .whitespaces)
+                if !rest.isEmpty {
+                    // Inline form. May be quoted ; strip the same way
+                    // parseEnvFile does.
+                    keeps.insert(stripYAMLValue(rest))
+                } else {
+                    // Block list — collect following lines starting with `-`.
+                    var j = i + 1
+                    while j < lines.count {
+                        let item = String(lines[j])
+                        let stripped = item.trimmingCharacters(in: .whitespaces)
+                        if stripped.hasPrefix("- ") {
+                            keeps.insert(stripYAMLValue(String(stripped.dropFirst(2)).trimmingCharacters(in: .whitespaces)))
+                            j += 1
+                        } else if stripped.hasPrefix("-") {
+                            keeps.insert(stripYAMLValue(String(stripped.dropFirst(1)).trimmingCharacters(in: .whitespaces)))
+                            j += 1
+                        } else if stripped.isEmpty {
+                            j += 1
+                        } else {
+                            break
+                        }
+                    }
+                    i = j
+                    continue
+                }
+            }
+            i += 1
+        }
+        // Filter to paths that actually exist under projectDir — if the
+        // user references a file outside the staged tree (e.g. an absolute
+        // path) there's nothing useful for us to include here.
+        let fm = FileManager.default
+        return keeps.compactMap { p in
+            let normalized = p.hasPrefix("./") ? String(p.dropFirst(2)) : p
+            // Skip absolute paths and anything escaping projectDir.
+            if normalized.hasPrefix("/") || normalized.contains("..") { return nil }
+            return fm.fileExists(atPath: projectDir + "/" + normalized) ? normalized : nil
+        }
+    }
+
+    private static func stripYAMLValue(_ s: String) -> String {
+        var v = s
+        if v.hasSuffix(",") { v = String(v.dropLast()) }
+        if v.count >= 2, let first = v.first, let last = v.last,
+           (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+            v = String(v.dropFirst().dropLast())
+        }
+        return v
+    }
 
     /// Combine hardcoded defaults with every `.dockerignore` /
     /// `.cockerignore` found in the tree, anchored to the dir that holds

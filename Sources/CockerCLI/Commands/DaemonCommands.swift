@@ -31,6 +31,9 @@ struct DaemonCommand: AsyncParsableCommand {
             DaemonClearLeasesCommand.self,
             DaemonHelperInstallCommand.self,
             DaemonTLSInitCommand.self,
+            DaemonResignCommand.self,
+            DaemonSetupCommand.self,
+            DaemonInitCommand.self,
         ]
     )
 }
@@ -307,6 +310,446 @@ struct DaemonTLSInitCommand: AsyncParsableCommand {
 /// 256 entries and new containers fail DHCP. The file is root-owned, so
 /// we shell out to `sudo` ; the user gets a password prompt unless they
 /// installed the LaunchDaemon helper (`cocker daemon helper-install`).
+/// `cocker daemon resign` — re-sign cockerd with the user's Apple
+/// Development certificate so it can launch VMs without ad-hoc
+/// fallback. Necessary after `brew install` because Homebrew's
+/// post_install runs inside a sandbox that denies access to
+/// `~/Library/Keychains/`, so `security find-identity` returns
+/// empty and the formula has to fall back to ad-hoc signing.
+/// Run from the user's shell (outside the sandbox), this command
+/// reads the real keychain and re-signs in place.
+struct DaemonResignCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "resign",
+        abstract: "Re-sign cockerd with your Apple Development cert (post-brew-install)",
+        discussion: """
+        Why this exists : `brew install cocker`'s post-install hook can't
+        read your login keychain — Homebrew sandboxes it away — so cockerd
+        ends up ad-hoc signed. That's fine for local boot, but the
+        TeamIdentifier is missing and the binary can't be moved between
+        machines. This command runs `security find-identity` outside the
+        sandbox, picks the first Apple Development (or Developer ID
+        Application) cert, and resigns the brew-installed cockerd with it.
+
+        Run it once after `brew install cocker` or `brew upgrade cocker`.
+
+        Override the cert by passing --identity "<full cert name>".
+        """
+    )
+
+    @Option(name: [.short, .customLong("identity")],
+            help: "Signing identity to use (defaults to the first Apple Development cert found).")
+    var identity: String?
+
+    @Option(name: .customLong("cockerd"),
+            help: "Path to the cockerd binary to resign (defaults to /opt/homebrew/opt/cocker/bin/cockerd).")
+    var cockerdPath: String = "/opt/homebrew/opt/cocker/bin/cockerd"
+
+    @Option(name: .customLong("entitlements"),
+            help: "Path to the entitlements plist (defaults to /opt/homebrew/share/cocker/cockerd.entitlements).")
+    var entitlementsPath: String = "/opt/homebrew/share/cocker/cockerd.entitlements"
+
+    mutating func run() async throws {
+        guard FileManager.default.isExecutableFile(atPath: cockerdPath) else {
+            fputs("Error: cockerd not found at \(cockerdPath)\n", stderr)
+            fputs("Pass --cockerd <path> if you installed it elsewhere.\n", stderr)
+            throw ExitCode.failure
+        }
+        guard FileManager.default.fileExists(atPath: entitlementsPath) else {
+            fputs("Error: entitlements not found at \(entitlementsPath)\n", stderr)
+            throw ExitCode.failure
+        }
+
+        // Resolve the signing identity.
+        let cert: String
+        if let explicit = identity {
+            cert = explicit
+        } else if let detected = try Self.detectIdentity() {
+            cert = detected
+        } else {
+            fputs("Error: no \"Apple Development\" or \"Developer ID Application\" cert in your keychain.\n", stderr)
+            fputs("Generate one in Xcode → Settings → Accounts → Manage Certificates → +.\n", stderr)
+            throw ExitCode.failure
+        }
+        print("Signing \(cockerdPath) with: \(cert)")
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        proc.arguments = [
+            "--force",
+            "--sign", cert,
+            "--entitlements", entitlementsPath,
+            cockerdPath,
+        ]
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        try proc.run()
+        proc.waitUntilExit()
+        let errData = (try? errPipe.fileHandleForReading.readToEnd()) ?? Data()
+        if !errData.isEmpty {
+            fputs(String(data: errData, encoding: .utf8) ?? "", stderr)
+        }
+        guard proc.terminationStatus == 0 else {
+            fputs("codesign failed (exit \(proc.terminationStatus)).\n", stderr)
+            throw ExitCode.failure
+        }
+        print("Signed. Restart the daemon to pick up the new signature:")
+        print("  brew services restart cocker")
+    }
+
+    /// Shells out to `/usr/bin/security find-identity -v -p codesigning`
+    /// and returns the first matching Apple Development / Developer ID
+    /// Application certificate, or nil if none found.
+    private static func detectIdentity() throws -> String? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        proc.arguments = ["find-identity", "-v", "-p", "codesigning"]
+        let outPipe = Pipe()
+        proc.standardOutput = outPipe
+        proc.standardError = Pipe()
+        try proc.run()
+        proc.waitUntilExit()
+        let outData = (try? outPipe.fileHandleForReading.readToEnd()) ?? Data()
+        let outStr = String(data: outData, encoding: .utf8) ?? ""
+
+        for kind in ["Apple Development", "Developer ID Application"] {
+            for line in outStr.split(separator: "\n") {
+                if line.contains(kind),
+                   let openIdx = line.firstIndex(of: "\""),
+                   let closeIdx = line.lastIndex(of: "\""),
+                   openIdx < closeIdx {
+                    return String(line[line.index(after: openIdx)..<closeIdx])
+                }
+            }
+        }
+        return nil
+    }
+}
+
+/// `cocker daemon setup` — refresh `~/.cocker/kernel/` from the user's
+/// shell (outside Homebrew's sandbox). Run after `brew install` or
+/// `brew upgrade cocker` if you saw the "post-install step did not
+/// complete successfully" warning, OR after installing apple/container
+/// to pick up the Linux kernel symlink.
+struct DaemonSetupCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "setup",
+        abstract: "Refresh ~/.cocker/kernel/ (symlink Apple kernel + copy initrd)",
+        discussion: """
+        Why this exists : `brew install cocker`'s post-install hook tries
+        to write to ~/.cocker/kernel/ but Homebrew's sandbox denies writes
+        outside its own dirs, so the warning "post-install step did not
+        complete successfully" surfaces even when cocker boots fine via
+        the existing symlinks. This command runs the same steps in your
+        shell context where the writes actually go through.
+
+        What it does :
+          1. Refresh ~/.cocker/kernel/vmlinuz → symlink to Apple's Linux
+             kernel at ~/Library/Application Support/com.apple.container/
+             kernels/default.kernel-arm64.
+          2. Refresh ~/.cocker/kernel/initrd.img → copy of the cocker-init
+             initrd shipped with the binary (<prefix>/share/cocker/initrd.img).
+        """
+    )
+
+    @Option(name: .customLong("share-prefix"),
+            help: "Prefix containing share/cocker (defaults to /opt/homebrew or /usr/local).")
+    var sharePrefix: String?
+
+    mutating func run() async throws {
+        let home = NSHomeDirectory()
+        let cockerRoot = home + "/.cocker"
+        let kernelDir = cockerRoot + "/kernel"
+        let fm = FileManager.default
+        try fm.createDirectory(atPath: kernelDir, withIntermediateDirectories: true)
+
+        // 1. Apple kernel symlink
+        let appleKernel = "\(home)/Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
+        if fm.fileExists(atPath: appleKernel) {
+            let resolved = URL(fileURLWithPath: appleKernel).resolvingSymlinksInPath().path
+            let vmlinuz = kernelDir + "/vmlinuz"
+            try? fm.removeItem(atPath: vmlinuz)
+            try fm.createSymbolicLink(atPath: vmlinuz, withDestinationPath: resolved)
+            print("✓ Linked kernel: \(vmlinuz) → \((resolved as NSString).lastPathComponent)")
+        } else {
+            print("⚠ Apple kernel not found at \(appleKernel)")
+            print("  Install Apple's container CLI: brew install container")
+        }
+
+        // 2. Initrd copy from share/cocker/
+        let prefix = sharePrefix ?? Self.detectSharePrefix()
+        let srcInitrd = prefix + "/share/cocker/initrd.img"
+        guard fm.fileExists(atPath: srcInitrd) else {
+            fputs("Error: initrd not found at \(srcInitrd)\n", stderr)
+            fputs("Pass --share-prefix <prefix> if cocker was installed elsewhere.\n", stderr)
+            throw ExitCode.failure
+        }
+        let target = kernelDir + "/initrd.img"
+        try? fm.removeItem(atPath: target)
+        try fm.copyItem(atPath: srcInitrd, toPath: target)
+        print("✓ Installed initrd: \(target)")
+    }
+
+    /// Pick the brew share prefix by file existence — Apple Silicon
+    /// default vs Intel/legacy. Falls back to /opt/homebrew when
+    /// neither exists ; that's the most common installs.
+    private static func detectSharePrefix() -> String {
+        for p in ["/opt/homebrew", "/usr/local"] {
+            if FileManager.default.fileExists(atPath: p + "/share/cocker/initrd.img") {
+                return p
+            }
+        }
+        return "/opt/homebrew"
+    }
+}
+
+/// `cocker daemon init` — single command that walks through every
+/// post-`brew install` step with a TUX-style checklist and fixes
+/// whatever needs fixing. Idempotent ; safe to re-run any time.
+struct DaemonInitCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "init",
+        abstract: "One-command post-install: resign + setup + start (TUX-style)",
+        discussion: """
+        Walks through every prerequisite cockerd needs and resolves them
+        in your shell context (outside Homebrew's seatbelt sandbox). Each
+        step is :
+          1. Apple Container Linux kernel installed ?
+          2. cockerd binary in place + properly signed ?
+          3. ~/.cocker/kernel/ has vmlinuz + initrd ?
+          4. Daemon running ?
+
+        Fixes anything that's not yet done, prints "(ok)" for steps that
+        are already good. Run after `brew install cocker` or any time
+        you want a sanity check.
+        """
+    )
+
+    @Flag(name: .customLong("dry-run"),
+          help: "Print what would be done without making changes.")
+    var dryRun: Bool = false
+
+    @Flag(name: .customLong("no-color"),
+          help: "Disable ANSI color codes in the output.")
+    var noColor: Bool = false
+
+    private struct Style {
+        let useColor: Bool
+        var ok:   String { useColor ? "\u{1B}[32m✓\u{1B}[0m" : "✓" }
+        var arrow:String { useColor ? "\u{1B}[36m→\u{1B}[0m" : "→" }
+        var warn: String { useColor ? "\u{1B}[33m⚠\u{1B}[0m" : "⚠" }
+        var dim:  String { useColor ? "\u{1B}[2m"  : "" }
+        var off:  String { useColor ? "\u{1B}[0m"  : "" }
+        var bold: String { useColor ? "\u{1B}[1m"  : "" }
+    }
+
+    mutating func run() async throws {
+        let s = Style(useColor: !noColor && isatty(STDOUT_FILENO) != 0)
+        print("\(s.bold)cocker daemon init\(s.off)")
+        print("")
+
+        // 1. Apple Container kernel
+        let home = NSHomeDirectory()
+        let appleKernel = "\(home)/Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
+        if FileManager.default.fileExists(atPath: appleKernel) {
+            print("\(s.ok) Apple Container Linux kernel found")
+        } else {
+            print("\(s.warn) Apple Container Linux kernel missing")
+            print("  \(s.dim)Install Apple's container CLI for the Linux kernel cocker boots VMs with:\(s.off)")
+            print("    brew install container")
+            print("  \(s.dim)Then re-run: cocker daemon init\(s.off)")
+            throw ExitCode.failure
+        }
+
+        // 2. cockerd binary + signature
+        let cockerd = Self.detectCockerd()
+        guard let cockerdPath = cockerd else {
+            print("\(s.warn) cockerd binary not found in standard locations")
+            print("  \(s.dim)Run `brew install cocker` or `./install.sh` first.\(s.off)")
+            throw ExitCode.failure
+        }
+        print("\(s.ok) binaries installed at \((cockerdPath as NSString).deletingLastPathComponent)")
+        let sigInfo = Self.codesignTeamID(of: cockerdPath)
+        if sigInfo.adhoc {
+            print("\(s.arrow) cockerd is ad-hoc signed — resigning with your Apple Development cert…")
+            if dryRun {
+                print("  \(s.dim)(dry-run: skipped)\(s.off)")
+            } else {
+                do {
+                    let cert = try Self.detectIdentity()
+                    let entitlements = (cockerdPath as NSString)
+                        .deletingLastPathComponent
+                        .replacingOccurrences(of: "/bin", with: "/share/cocker/cockerd.entitlements")
+                    try Self.codesign(path: cockerdPath, identity: cert, entitlements: entitlements)
+                    print("\(s.ok) signed: \(cert)")
+                } catch {
+                    print("\(s.warn) could not resign (\(error)) — ad-hoc signature kept.")
+                    print("  \(s.dim)cockerd still boots VMs on this machine, but the binary can't be copied across machines.\(s.off)")
+                }
+            }
+        } else if let teamID = sigInfo.teamID {
+            print("\(s.ok) cockerd signed with TeamIdentifier=\(teamID)")
+        } else {
+            print("\(s.ok) cockerd is signed")
+        }
+
+        // 3. ~/.cocker/kernel/ — symlink + initrd
+        let cockerRoot = home + "/.cocker"
+        let kernelDir  = cockerRoot + "/kernel"
+        let vmlinuz    = kernelDir + "/vmlinuz"
+        let initrd     = kernelDir + "/initrd.img"
+        var needRefresh = false
+        if !FileManager.default.fileExists(atPath: vmlinuz) { needRefresh = true }
+        if !FileManager.default.fileExists(atPath: initrd)  { needRefresh = true }
+
+        if needRefresh {
+            print("\(s.arrow) refreshing \(kernelDir) from \(DaemonSetupCommand.detectSharePrefixStatic())/share/cocker…")
+            if !dryRun {
+                var setup = DaemonSetupCommand()
+                try await setup.run()
+            } else {
+                print("  \(s.dim)(dry-run: skipped)\(s.off)")
+            }
+        } else {
+            print("\(s.ok) ~/.cocker/kernel/ already populated")
+        }
+
+        // 4. Start the daemon if not running
+        let socketPath = cockerRoot + "/cocker.sock"
+        if Self.isDaemonAlive(socketPath: socketPath) {
+            print("\(s.ok) cockerd already running")
+        } else {
+            print("\(s.arrow) starting daemon via launchd (brew services)…")
+            if !dryRun {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                p.arguments = ["brew", "services", "start", "cocker"]
+                p.standardOutput = Pipe()
+                p.standardError = Pipe()
+                try? p.run()
+                p.waitUntilExit()
+                if p.terminationStatus == 0 {
+                    print("\(s.ok) cockerd starting")
+                } else {
+                    print("\(s.warn) brew services start exited \(p.terminationStatus)")
+                    print("  \(s.dim)Try : cocker daemon start\(s.off)")
+                }
+            } else {
+                print("  \(s.dim)(dry-run: skipped)\(s.off)")
+            }
+        }
+
+        print("")
+        print("\(s.bold)cocker is ready.\(s.off) Try : \(s.dim)cocker run -it alpine sh\(s.off)")
+    }
+
+    // MARK: - helpers
+
+    private static func detectCockerd() -> String? {
+        for p in [
+            "/opt/homebrew/opt/cocker/bin/cockerd",
+            "/opt/homebrew/bin/cockerd",
+            "/usr/local/opt/cocker/bin/cockerd",
+            "/usr/local/bin/cockerd",
+        ] {
+            if FileManager.default.isExecutableFile(atPath: p) { return p }
+        }
+        return nil
+    }
+
+    private static func codesignTeamID(of path: String) -> (adhoc: Bool, teamID: String?) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        proc.arguments = ["-dv", path]
+        let pipe = Pipe()
+        proc.standardError = pipe
+        proc.standardOutput = Pipe()
+        try? proc.run()
+        proc.waitUntilExit()
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+        let str = String(data: data, encoding: .utf8) ?? ""
+        let adhoc = str.contains("Signature=adhoc") || str.contains("flags=0x2(adhoc)")
+        var teamID: String? = nil
+        for line in str.split(separator: "\n") where line.hasPrefix("TeamIdentifier=") {
+            let v = String(line.dropFirst("TeamIdentifier=".count))
+            if v != "not set" { teamID = v }
+        }
+        return (adhoc, teamID)
+    }
+
+    private static func detectIdentity() throws -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        proc.arguments = ["find-identity", "-v", "-p", "codesigning"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        try proc.run()
+        proc.waitUntilExit()
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+        let str = String(data: data, encoding: .utf8) ?? ""
+        for kind in ["Apple Development", "Developer ID Application"] {
+            for line in str.split(separator: "\n") where line.contains(kind) {
+                if let openIdx = line.firstIndex(of: "\""),
+                   let closeIdx = line.lastIndex(of: "\""),
+                   openIdx < closeIdx {
+                    return String(line[line.index(after: openIdx)..<closeIdx])
+                }
+            }
+        }
+        throw CockerError.requestFailed("no Apple Development cert in keychain")
+    }
+
+    private static func codesign(path: String, identity: String, entitlements: String) throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        proc.arguments = [
+            "--force",
+            "--sign", identity,
+            "--entitlements", entitlements,
+            path,
+        ]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        try proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else {
+            throw CockerError.requestFailed("codesign exit \(proc.terminationStatus)")
+        }
+    }
+
+    private static func isDaemonAlive(socketPath: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: socketPath) else { return false }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        defer { close(fd) }
+        guard fd >= 0 else { return false }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        _ = withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dst in
+                _ = socketPath.withCString { strncpy(dst, $0, 103) }
+            }
+        }
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return rc == 0
+    }
+}
+
+extension DaemonSetupCommand {
+    static func detectSharePrefixStatic() -> String {
+        for p in ["/opt/homebrew", "/usr/local"] {
+            if FileManager.default.fileExists(atPath: p + "/share/cocker/initrd.img") {
+                return p
+            }
+        }
+        return "/opt/homebrew"
+    }
+}
+
 struct DaemonClearLeasesCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "clear-leases",
@@ -636,7 +1079,7 @@ struct DaemonStartCommand: AsyncParsableCommand {
                                                contents: nil)
                 return FileHandle(forWritingAtPath: paths.logFile.path)!
             }()
-        try? log.seekToEnd()
+        _ = try? log.seekToEnd()
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: cockerd)

@@ -13,10 +13,12 @@
  */
 
 #include <errno.h>
+#include <signal.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <linux/vm_sockets.h>
@@ -107,10 +109,22 @@ pid_t dns_proxy_spawn(unsigned int vsock_port) {
         _exit(1);
     }
 
-    /* Iterative loop. DNS queries are tiny and sub-millisecond ; one in
-     * flight at a time is plenty for any reasonable workload. */
+    /* Auto-reap children. On Linux SIG_IGN on SIGCHLD makes terminated
+     * children disappear without leaving zombies, so the parent never
+     * needs to call wait(). */
+    signal(SIGCHLD, SIG_IGN);
+
+    /* Fork-per-query : the parent only does recvfrom + fork, the child
+     * handles the (potentially slow) vsock roundtrip and the reply
+     * sendto. Previously this was a single-threaded loop ; under
+     * parallel workloads like `uv pip install` (which fires N concurrent
+     * connections at startup, each doing A+AAAA lookups) queries piled
+     * up behind a single 2s vsock timeout, glibc's getaddrinfo retried
+     * three times, and the user got EAI_AGAIN / "Try again". Forking
+     * keeps the parent ready to receive the next datagram immediately ;
+     * fork itself is sub-millisecond on cocker-init (~1MB image), which
+     * is well within the DNS budget. */
     char query[65536];
-    char response[65536];
     for (;;) {
         struct sockaddr_in client;
         socklen_t cl = sizeof(client);
@@ -118,10 +132,29 @@ pid_t dns_proxy_spawn(unsigned int vsock_port) {
                              (struct sockaddr *)&client, &cl);
         if (n <= 0) continue;
 
-        int m = dns_vsock_forward(vsock_port, query, (size_t)n,
-                                  response, sizeof(response));
-        if (m <= 0) continue;  /* upstream silent — swallow, client times out */
-
-        sendto(listen_fd, response, m, 0, (struct sockaddr *)&client, cl);
+        pid_t child = fork();
+        if (child == 0) {
+            /* Child : forward + reply, exit. */
+            char response[65536];
+            int m = dns_vsock_forward(vsock_port, query, (size_t)n,
+                                      response, sizeof(response));
+            if (m > 0) {
+                sendto(listen_fd, response, m, 0,
+                       (struct sockaddr *)&client, cl);
+            }
+            _exit(0);
+        }
+        if (child < 0) {
+            /* Fork failed (OOM ?) — fall back to inline handling so we
+             * don't silently drop the query. Better one slow query
+             * than one EAI_AGAIN. */
+            char response[65536];
+            int m = dns_vsock_forward(vsock_port, query, (size_t)n,
+                                      response, sizeof(response));
+            if (m > 0) {
+                sendto(listen_fd, response, m, 0,
+                       (struct sockaddr *)&client, cl);
+            }
+        }
     }
 }

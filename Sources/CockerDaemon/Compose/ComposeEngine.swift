@@ -354,6 +354,19 @@ actor ComposeEngine {
                 composePath: request.composePath
             )
 
+            // Pre-emptively delete any existing container with the same
+            // name. docker compose's default behavior is to RECREATE
+            // services on `up` (unless --no-recreate is passed) ; cocker
+            // used to throw `Container name already in use` if the user
+            // ran `compose up` twice in a row without a clean `down`
+            // first, which made every iteration feel broken. Now we
+            // align with docker compose : an existing container with
+            // the project's service name is implicitly replaced.
+            let serviceContainerName = runConfig.name ?? "\(projectName)_\(serviceName)_1"
+            if await containerEngine.state.nameExists(serviceContainerName) {
+                _ = try? await containerEngine.remove(id: serviceContainerName, force: true)
+            }
+
             let id = try await containerEngine.run(config: runConfig)
             startedContainers[serviceName] = runConfig.name ?? id
             progressHandler(StreamEvent(stream: .stdout, data: " Container \(projectName)_\(serviceName)_1 Started (id: \(String(id.prefix(12))))\n"))
@@ -433,7 +446,6 @@ actor ComposeEngine {
 
     func pull(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
         let compose = try loadComposeFile(at: request.composePath)
-        let projectName = request.projectName ?? inferProjectName(from: request.composePath)
         let services = request.services.isEmpty ? Array(compose.services.keys) : request.services
 
         for serviceName in services {
@@ -504,12 +516,23 @@ actor ComposeEngine {
         // volumes (`external: true`) are left alone — the user opted into
         // managing them outside compose's lifecycle. Bind mounts are never
         // touched (they live on the host filesystem and aren't ours).
+        //
+        // force: true is critical here. Without it, `volumes.remove` checks
+        // every container in state.json for references and refuses if any
+        // exists ; stale records of just-removed containers can linger for
+        // a tick under load and silently fail the rm via try?. The result
+        // user sees : `compose up` later reuses the SAME data.img, postgres
+        // entrypoint says "Database directory appears to contain a
+        // database; Skipping initialization", POSTGRES_HOST_AUTH_METHOD
+        // never re-applies, every cnet client gets "no pg_hba.conf entry
+        // for host". By force-deleting here we always start from a fresh
+        // mkfs.ext4'd data.img on the next compose up.
         if request.removeVolumes, let volumes = compose.volumes {
             for (name, volSpec) in volumes {
                 let spec = volSpec ?? ComposeFile.ComposeVolumeSpec()
                 if spec.external == true { continue }
                 let fullName = "\(projectName)_\(name)"
-                try? await containerEngine.volumes.remove(fullName)
+                try? await containerEngine.volumes.remove(fullName, force: true)
             }
         }
     }

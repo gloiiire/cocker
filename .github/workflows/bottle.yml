@@ -38,6 +38,54 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
+      # Validate RELEASE_PUSH_TOKEN BEFORE we burn 5 min building bottles.
+      # Reports which capability failed so we can tell the difference
+      # between "token expired / missing", "wrong scope", and "no write
+      # to this repo".
+      - name: Validate RELEASE_PUSH_TOKEN
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN }}
+        run: |
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::RELEASE_PUSH_TOKEN secret is missing"
+            exit 1
+          fi
+          # 1. Token recognized at all ? /user is the cheapest authenticated endpoint.
+          HTTP_USER=$(curl -sS -o /tmp/user.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user)
+          echo "GET /user → HTTP $HTTP_USER"
+          if [ "$HTTP_USER" != "200" ]; then
+            echo "::error::Token failed /user check — token is invalid, expired, or revoked."
+            cat /tmp/user.json
+            exit 1
+          fi
+          LOGIN=$(jq -r '.login' /tmp/user.json)
+          echo "Authenticated as: $LOGIN"
+          # 2. Read access to repo ?
+          HTTP_REPO=$(curl -sS -o /tmp/repo.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}")
+          echo "GET /repos/${{ github.repository }} → HTTP $HTTP_REPO"
+          if [ "$HTTP_REPO" != "200" ]; then
+            echo "::error::Token can't read ${{ github.repository }} — repo not in PAT scope."
+            cat /tmp/repo.json
+            exit 1
+          fi
+          # 3. Write access ? Try a dry PUT (with a deliberately wrong file sha
+          # so it returns 409, NOT 200 — 401/403 means no write perm.
+          HTTP_PUT=$(curl -sS -o /tmp/put.json -w "%{http_code}" -X PUT \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/Formula/cocker.rb" \
+            -d '{"message":"preflight","content":"","sha":"0000000000000000000000000000000000000000","branch":"main"}')
+          echo "PUT /contents (dry) → HTTP $HTTP_PUT"
+          case "$HTTP_PUT" in
+            409|422) echo "Write capability confirmed (dry write rejected for content reason, not auth)." ;;
+            401)     echo "::error::PUT 401 — token does not have Contents: write on this repo."; cat /tmp/put.json; exit 1 ;;
+            403)     echo "::error::PUT 403 — write perm OK but blocked. Bypass actor / branch protection issue."; cat /tmp/put.json; exit 1 ;;
+            *)       echo "::warning::Unexpected PUT preflight HTTP $HTTP_PUT — investigate."; cat /tmp/put.json ;;
+          esac
+
       - name: Resolve release tag
         id: tag
         run: |
@@ -130,7 +178,13 @@ jobs:
           # built_on.os_version is informational, brew doesn't gate on
           # it. We pin macOS 14.0 (our minimum) so brew never refuses
           # a Sonoma user.
-          BUILT_TIME=$(date +%s)
+          # Reproducible bottle requires deterministic file content.
+          # `date +%s` baked the current epoch into INSTALL_RECEIPT.json
+          # at build time, so two Bottle runs of the same input produced
+          # DIFFERENT files (and sha256s), even with --sort + --mtime on
+          # tar. Pin the timestamp ; brew never gates on this field's
+          # value, it's purely informational.
+          BUILT_TIME=1735689600  # 2025-01-01 00:00:00 UTC
           cat > "$ROOT/INSTALL_RECEIPT.json" <<JSON
           {
             "homebrew_version": "4.0.0",
@@ -175,10 +229,26 @@ jobs:
           # ${TAG} → user got 404 because brew asked for
           # `cocker-0.5.14.3.arm64_tahoe.bottle.tar.gz` but we'd
           # uploaded `cocker-v0.5.14.3.arm64_tahoe.bottle.tar.gz`.
+          # Reproducible tarball : identical input bytes must produce
+          # identical sha256, otherwise a Bottle re-run (e.g. because
+          # the upstream Release retried) overwrites the released file
+          # with a NEW sha while the previous run's sha is already
+          # baked into Formula on main → brew gets a checksum
+          # mismatch at install time. Three pins :
+          #   --sort=name              deterministic entry order
+          #   --mtime, --owner, --group fixed values, not the runner's
+          #                            ctime / uid / gid
+          #   gzip -n                  strip the gzip mtime+filename
+          #                            header so the .gz envelope is
+          #                            also bit-identical.
           mkdir -p out
           for os in tahoe sequoia sonoma; do
             NAME="cocker-${VER}.arm64_${os}.bottle.tar.gz"
-            tar -C bottle-staging -czf "out/${NAME}" "cocker/${VER}"
+            tar -C bottle-staging --sort=name \
+                --mtime='2025-01-01 00:00:00 UTC' \
+                --owner=0 --group=0 --numeric-owner \
+                -cf - "cocker/${VER}" \
+              | gzip -9 -n > "out/${NAME}"
             SHA=$(sha256sum "out/${NAME}" | awk '{print $1}')
             echo "sha_${os}=${SHA}" >> "$GITHUB_OUTPUT"
             echo "Built ${NAME}"

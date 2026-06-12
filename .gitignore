@@ -20,10 +20,20 @@ DerivedData/
 
 # iCloud Drive conflict copies (files renamed "foo 2.ext" when the
 # daemon's sync sees two versions). They're identical to the originals
-# 99 % of the time but they break Swift builds (duplicate type decls).
+# 99 % of the time but they break Swift builds (duplicate type decls)
+# and pollute Tests/e2e/ with phantom test scripts.
 *\ 2.swift
 *\ 2.c
 *\ 2.rb
+*\ 2.sh
+*\ 2.md
+*\ 2.yml
+*\ 2.yaml
+*\ 2.json
+
+# Local release bundle staging — the only canonical artifacts ship
+# through gh release / homebrew tap.
+/dist/
 
 # Markdown — only README files travel in the repo. CHANGELOG, docs/,
 # CLAUDE.md, .roadmap.md, RELEASE.md, QUICKSTART.md and any iCloud

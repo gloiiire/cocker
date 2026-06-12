@@ -36,12 +36,20 @@ struct StateStoreContainersTests {
     }
 
     @Test func retrieveByPrefix() async throws {
+        // **B3** : prefix-id match now requires at least 12 characters —
+        // Docker's short-id minimum — so a 1- or 2-char lookup can't
+        // collide with whichever UUID happens to start the same way.
         let (s, dir) = try await makeStore()
         defer { try? FileManager.default.removeItem(at: dir) }
-        let c = sample(id: "abc123def456")
+        let c = sample(id: "abc123def456789")
         try await s.store(container: c)
-        let got = await s.container(id: "abc123")  // genuine prefix
+        // Full 12-char canonical short id resolves to the container.
+        let got = await s.container(id: "abc123def456")
         #expect(got != nil)
+        // 6-char prefix is no longer accepted — caller must use the full
+        // 12-char short id (or a unique container name).
+        let short = await s.container(id: "abc123")
+        #expect(short == nil)
     }
 
     @Test func retrieveByName() async throws {

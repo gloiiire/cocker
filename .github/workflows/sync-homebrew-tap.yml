@@ -71,14 +71,23 @@ jobs:
       - name: Resolve tag + tarball SHA256
         id: meta
         run: |
-          # workflow_run gives us the upstream's head_branch (the tag
-          # for tag-triggered runs); workflow_dispatch gives us the
-          # explicit input. GITHUB_REF_NAME would be 'main' here since
-          # workflow_run defaults to the default branch.
+          # Source of truth for the version is main's Formula/cocker.rb
+          # — Bottle just wrote the fresh sha256s + version line into
+          # it. We DON'T trust github.event.workflow_run.head_branch :
+          # for a chained workflow_run (Release → Bottle → us) the
+          # head_branch resolves to the default branch ("main"), not
+          # the original tag, and we end up fetching
+          # archive/refs/tags/main.tar.gz which 404s. workflow_dispatch
+          # still wins (manual override for re-runs on a specific tag).
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ github.event.inputs.tag }}"
           else
-            TAG="${{ github.event.workflow_run.head_branch }}"
+            VERSION=$(curl -fsSL \
+              "https://raw.githubusercontent.com/${{ github.repository }}/main/Formula/cocker.rb" \
+              | awk -F'"' '/^  version "/{print $2; exit}')
+            test -n "$VERSION" || { echo "Could not parse version from main's Formula/cocker.rb"; exit 1; }
+            TAG="v${VERSION}"
+            echo "Resolved tag from Formula: ${TAG}"
           fi
           VERSION="${TAG#v}"
           URL="https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"

@@ -309,7 +309,7 @@ final class ContainerEngine {
         // Drain the eth0 MAC VZ generated during createVM and persist it so
         // the IP-discovery task below can use it for /var/db/dhcpd_leases
         // fallback when the in-VM /cocker-ip write loses the race.
-        if let mac = await vmRuntime.takeNATMAC(forContainer: id) {
+        if let mac = vmRuntime.takeNATMAC(forContainer: id) {
             container.natMAC = mac
             try? await state.updateContainer(id: id) { c in c.natMAC = mac }
             fputs("[eng] nat MAC=\(mac)\n", stderr); fflush(stderr)
@@ -408,7 +408,7 @@ final class ContainerEngine {
         let taskID = UUID()
         let task = Task { [weak self] in
             await self?.watchContainer(id: id, rm: rm)
-            await self?.markWatcherFinished(id: id, taskID: taskID)
+            self?.markWatcherFinished(id: id, taskID: taskID)
         }
         watcherTasks[id] = TaskRecord(task: task, id: taskID, alive: true)
     }
@@ -440,7 +440,7 @@ final class ContainerEngine {
         let taskID = UUID()
         let task = Task { [weak self] in
             await self?.runHealthcheckLoop(containerID: id, spec: spec)
-            await self?.markHealthFinished(id: id, taskID: taskID)
+            self?.markHealthFinished(id: id, taskID: taskID)
         }
         healthTasks[id] = TaskRecord(task: task, id: taskID, alive: true)
     }
@@ -484,6 +484,17 @@ final class ContainerEngine {
     /// container is fully removed from the state store. While the container
     /// isn't `.running` the loop sleeps and resets its failure counter so
     /// the post-resume probes start from a clean slate.
+    /// Shared ISO-8601 formatter for the audit log + healthcheck logs. Used
+    /// to be created per event (audit log) or per replayed log line (the JSON
+    /// log reader) — each `ISO8601DateFormatter()` allocation costs hundreds
+    /// of microseconds, and a `cocker logs --tail 10000` call did 10 000 of
+    /// them. Cache once at the type level.
+    static let isoDateFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
     private func runHealthcheckLoop(containerID: String, spec: Healthcheck) async {
         try? await state.updateContainer(id: containerID) { c in c.healthStatus = .starting }
         var consecutiveFailures = 0
@@ -557,13 +568,20 @@ final class ContainerEngine {
                 nextProbeAllowedAt = Date().addingTimeInterval(restartGrace)
                 try? await state.updateContainer(id: containerID) { c in c.healthStatus = .starting }
             }
-            try? await Task.sleep(nanoseconds: UInt64(spec.interval * 1_000_000_000))
+            // **B11 fix** : earlier code unconditionally slept for `interval`
+            // then *also* skipped the probe when nextProbeAllowedAt hadn't
+            // elapsed — so a 30 s interval + 5 s restart-grace produced a
+            // first post-restart probe at 30 s instead of 5 s, breaking
+            // any tooling that expects healthy within the start period.
+            // We now sleep at most until whichever deadline is closer.
+            let now = Date()
+            let intervalDeadline = now.addingTimeInterval(spec.interval)
+            let nextDeadline = max(intervalDeadline, nextProbeAllowedAt)
+            let sleepFor = max(0, nextDeadline.timeIntervalSince(now))
+            try? await Task.sleep(nanoseconds: UInt64(sleepFor * 1_000_000_000))
             // Re-check status post-sleep : the sleep window is enough
             // for `cocker stop`/`pause` to land. Don't probe a dead VM.
             guard await state.container(id: containerID)?.status == .running else { continue }
-            // Skip until the post-restart warm-up has elapsed. Cheap : the
-            // outer interval sleep already paces the loop.
-            if Date() < nextProbeAllowedAt { continue }
             let probeStart = Date()
             let result = await runHealthcheckOnce(containerID: containerID,
                                                   argv: argv,
@@ -671,8 +689,10 @@ final class ContainerEngine {
             // that prints a binary blob would otherwise nil the String
             // init and we'd loop until daemon-side timeout, returning 124
             // for what was really a successful probe printing garbage.
-            let raw: String = String(data: data, encoding: .utf8)
-                           ?? String(decoding: data, as: UTF8.self)
+            // **I3** : `String(decoding:as:)` already replaces invalid
+            // sequences with U+FFFD ; the `?? String(data:encoding:.utf8)`
+            // fallback was redundant.
+            let raw = String(decoding: data, as: UTF8.self)
             // First line = decimal exit code, rest = captured output.
             guard let nl = raw.firstIndex(of: "\n") else { continue }
             let codeStr = String(raw[..<nl]).trimmingCharacters(in: .whitespaces)
@@ -848,14 +868,78 @@ final class ContainerEngine {
         guard let container = await state.container(id: id) else {
             throw CockerError.containerNotFound(id)
         }
-        try await vmRuntime.stop(containerID: container.id, timeout: 0)
+        // **S6 fix** : the signal name comes from a CLI client over the IPC
+        // socket, which then traverses the vsock boundary into the
+        // attacker-controllable container. Reject anything we can't map to
+        // a known POSIX signal here so a malformed payload never reaches
+        // exec_listener.c's parser.
+        guard ContainerEngine.numericSignal(signal) != nil else {
+            throw CockerError.internalError(
+                "unknown signal: \(signal). Accepted: SIGHUP, SIGINT, SIGQUIT, " +
+                "SIGKILL, SIGTERM, SIGUSR1, SIGUSR2, … (or 1–31)")
+        }
+        // Honour the requested signal : prior code dropped it on the floor and
+        // always hit the SIGKILL fallback path. With timeout=0 the stop loop
+        // still delivers phase-1 (in-VM signal relay over vsock) before the
+        // forced VZ stop kicks in, so `cocker kill -s SIGUSR1` actually fires
+        // SIGUSR1 at PID 1's main child.
+        let detected = try? await vmRuntime.stop(
+            containerID: container.id, timeout: 0, stopSignal: signal
+        )
         await portForwarder.stop(containerID: container.id)
+        // Docker maps a signal-terminated container to exit code 128 + signum.
+        // If we observed an explicit exit code on the wire prefer it, otherwise
+        // synthesize the conventional value from the signal name.
+        let synthesizedExit = ContainerEngine.exitCode(forSignal: signal)
+        let finalExit: Int32 = detected.flatMap { $0 } ?? synthesizedExit
         try await state.updateContainer(id: id) { c in
             c.status = .dead
             c.finishedAt = Date()
-            c.exitCode = -1
+            c.exitCode = finalExit
         }
         emitEvent("container", action: "kill", id: container.id)
+    }
+
+    /// Docker convention : a process killed by signal N exits with code 128+N.
+    /// We accept either the symbolic name (`"SIGKILL"`, `"KILL"`, `"15"`) or a
+    /// bare decimal. Falls back to 137 (SIGKILL) on anything we can't parse —
+    /// caller already validated the signal upstream via `sanitizedSignal`.
+    static func exitCode(forSignal signal: String) -> Int32 {
+        let n = numericSignal(signal) ?? 9   // default: SIGKILL
+        return 128 + Int32(n)
+    }
+
+    /// Map `SIGKILL` / `KILL` / `9` to the POSIX signal number, validating
+    /// against a fixed whitelist. nil means "unknown" — callers should refuse
+    /// the request rather than guess. Used both by `kill()` for the exit-code
+    /// translation and by `VMRuntime.sendStopSignal` to validate before the
+    /// JSON crosses the vsock boundary.
+    static func numericSignal(_ s: String) -> Int? {
+        let upper = s.uppercased()
+        switch upper {
+        case "SIGHUP", "HUP":       return 1
+        case "SIGINT", "INT":       return 2
+        case "SIGQUIT", "QUIT":     return 3
+        case "SIGILL", "ILL":       return 4
+        case "SIGABRT", "ABRT":     return 6
+        case "SIGBUS", "BUS":       return 7
+        case "SIGFPE", "FPE":       return 8
+        case "SIGKILL", "KILL":     return 9
+        case "SIGUSR1", "USR1":     return 10
+        case "SIGSEGV", "SEGV":     return 11
+        case "SIGUSR2", "USR2":     return 12
+        case "SIGPIPE", "PIPE":     return 13
+        case "SIGALRM", "ALRM":     return 14
+        case "SIGTERM", "TERM":     return 15
+        case "SIGSTOP", "STOP":     return 17
+        case "SIGTSTP", "TSTP":     return 18
+        case "SIGCONT", "CONT":     return 19
+        case "SIGCHLD", "CHLD":     return 20
+        case "SIGWINCH", "WINCH":   return 28
+        default:
+            if let raw = Int(s), raw > 0, raw < 32 { return raw }
+            return nil
+        }
     }
 
     func restart(id: String, timeout: TimeInterval = 10) async throws {
@@ -949,7 +1033,7 @@ final class ContainerEngine {
             throw CockerError.containerNotFound(id)
         }
 
-        let historical = await vmRuntime.logs(containerID: container.id, tail: request.tail)
+        let historical = vmRuntime.logs(containerID: container.id, tail: request.tail)
         let follow = request.follow
         let containerID = container.id
 
@@ -968,14 +1052,14 @@ final class ContainerEngine {
                 var lastCount = historical.count
                 while true {
                     try? await Task.sleep(nanoseconds: 100_000_000)
-                    let current = await self.vmRuntime.logs(containerID: containerID, tail: 0)
+                    let current = self.vmRuntime.logs(containerID: containerID, tail: 0)
                     if current.count > lastCount {
                         for event in current.dropFirst(lastCount) {
                             continuation.yield(event)
                         }
                         lastCount = current.count
                     }
-                    if !(await self.vmRuntime.isRunning(containerID: containerID)) {
+                    if !self.vmRuntime.isRunning(containerID: containerID) {
                         break
                     }
                 }
@@ -1086,13 +1170,18 @@ final class ContainerEngine {
 
     func eventStream() -> AsyncStream<StreamEvent> {
         let id = UUID()
+        // **B18 fix** : `eventStream()` is @MainActor-isolated (the whole
+        // class is), so the AsyncStream build closure runs on MainActor too —
+        // no Task hop needed for the insertion, which used to leave a small
+        // window where yields landed on a not-yet-registered continuation.
         return AsyncStream { continuation in
-            Task { @MainActor in
-                self.eventContinuations[id] = continuation
-                continuation.onTermination = { @Sendable _ in
-                    Task { @MainActor in
-                        self.eventContinuations.removeValue(forKey: id)
-                    }
+            self.eventContinuations[id] = continuation
+            continuation.onTermination = { @Sendable [weak self] _ in
+                // The termination callback runs from arbitrary context (the
+                // consumer's iterator going out of scope, a Task cancel) so
+                // we still need to hop to MainActor for the dict removal.
+                Task { @MainActor in
+                    self?.eventContinuations.removeValue(forKey: id)
                 }
             }
         }
@@ -1116,43 +1205,11 @@ final class ContainerEngine {
         Self.writeAuditLog(type: type, action: action, id: id)
     }
 
-    /// Append-only audit trail at `~/.cocker/audit.log`. One line per event,
-    /// JSON-encoded so downstream tooling (jq, vector, fluent-bit) can
-    /// ingest it without parsing. Bounded at 10 MB ; rotated to .1.gz …
-    /// .5.gz like cockerd.log.
+    /// Thin shim around `AuditLog.write` for legacy call sites. New code
+    /// should use `AuditLog` directly. The actual write+rotation+perms
+    /// logic now lives in `Engine/AuditLog.swift`.
     private static func writeAuditLog(type: String, action: String, id: String) {
-        let root = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".cocker")
-        let path = root.appendingPathComponent("audit.log")
-        let user = ProcessInfo.processInfo.environment["USER"] ?? "?"
-        let entry: [String: String] = [
-            "ts":     ISO8601DateFormatter().string(from: Date()),
-            "user":   user,
-            "type":   type,
-            "action": action,
-            "id":     id,
-        ]
-        guard let data = try? JSONSerialization.data(withJSONObject: entry),
-              let line = (String(data: data, encoding: .utf8).map { $0 + "\n" })?
-                            .data(using: .utf8)
-        else { return }
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        if let handle = try? FileHandle(forWritingTo: path) {
-            try? handle.seekToEnd()
-            try? handle.write(contentsOf: line)
-            try? handle.close()
-        } else {
-            // First write — create with 0o600 perms (audit logs can carry
-            // container labels / env hints that shouldn't leak to other
-            // local users).
-            FileManager.default.createFile(atPath: path.path, contents: line,
-                attributes: [.posixPermissions: 0o600])
-        }
-        // Cheap-ish rotation : check size occasionally and roll.
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
-           let size = attrs[.size] as? Int, size > 10 * 1024 * 1024 {
-            try? LogRotator.rotate(file: path, keep: 5)
-        }
+        AuditLog.write(type: type, action: action, id: id)
     }
 
     // MARK: - Container watcher
@@ -1179,7 +1236,7 @@ final class ContainerEngine {
             if await state.container(id: id)?.status == .paused {
                 continue
             }
-            if !(await vmRuntime.isRunning(containerID: id)) {
+            if !vmRuntime.isRunning(containerID: id) {
                 guard let container = await state.container(id: id) else { break }
 
                 // Give cocker-init's "exited with code N" line a moment to
@@ -1188,7 +1245,7 @@ final class ContainerEngine {
                 // up-to-date the instant VM state flips to stopped.
                 var parsedCode: Int32? = nil
                 for _ in 0..<10 {
-                    parsedCode = await vmRuntime.exitCode(forContainer: id)
+                    parsedCode = vmRuntime.exitCode(forContainer: id)
                     if parsedCode != nil { break }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
@@ -1320,118 +1377,35 @@ final class ContainerEngine {
         return pruned
     }
 
-    // MARK: - DHCP recovery helpers
+    // MARK: - DHCP recovery helpers (shims around LeasePoolMonitor)
 
-    /// Derive a stable, locally-administered MAC from a container ID. The
-    /// `02:cc:` prefix marks the address as locally-administered (the second
-    /// hex nibble bit 1 set, bit 0 clear) so vmnet treats it as unicast and
-    /// the host stack doesn't dedupe against any global allocation. The
-    /// remaining 4 bytes come from the first 8 hex chars of the container
-    /// id, which is already random enough (UUID prefix).
-    /// Runtime lease-pool guard. Called before each `container.run` :
-    /// if `/var/db/dhcpd_leases` is close to vmnet's ~256 ceiling AND
-    /// the LaunchDaemon helper is installed, touch the trigger file so
-    /// the helper truncates the pool in time for the new VM's DHCP
-    /// request. If the helper isn't installed, falls through to the
-    /// existing logged warning at daemon startup. Cheap : one stat +
-    /// one regex sweep on a typically <10 KB file.
+    /// **A1 refactor** : the underlying logic lives in
+    /// `LeasePoolMonitor` now. These static methods are kept as thin
+    /// shims so existing call sites (and tests) don't need to change.
+    /// New code should call `LeasePoolMonitor` directly.
+
     static func maybeTriggerLeasePoolClear() {
-        guard let leases = try? String(contentsOfFile: "/var/db/dhcpd_leases", encoding: .utf8) else { return }
-        let count = leases.components(separatedBy: "ip_address=").count - 1
-        guard count > 200 else { return }
-        let helperInstalled = FileManager.default.fileExists(
-            atPath: "/Library/LaunchDaemons/com.cocker.leases-helper.plist")
-        guard helperInstalled else { return }
-        let trigger = URL(fileURLWithPath: "/var/run/cocker-clear-leases")
-        // Skip if a previous trigger is still pending — the helper polls
-        // every 1 s so the worst-case latency is <2 s.
-        guard !FileManager.default.fileExists(atPath: trigger.path) else { return }
-        _ = try? Data().write(to: trigger)
-        fputs("[lease-gc] pool at \(count) — touched helper trigger\n", stderr); fflush(stderr)
+        LeasePoolMonitor.maybeTriggerClear()
     }
 
-    /// Helpers exposed so other parts of the engine + the CLI's
-    /// `cocker daemon status` can report state without re-implementing
-    /// the file parsing.
-
     static func leasePoolCount() -> Int {
-        guard let s = try? String(contentsOfFile: "/var/db/dhcpd_leases", encoding: .utf8) else { return 0 }
-        return s.components(separatedBy: "ip_address=").count - 1
+        LeasePoolMonitor.count()
     }
 
     static func leasePoolHelperInstalled() -> Bool {
-        FileManager.default.fileExists(
-            atPath: "/Library/LaunchDaemons/com.cocker.leases-helper.plist")
+        LeasePoolMonitor.helperInstalled()
     }
 
-    /// Hard pre-flight gate. Called from `run()` before any VM resource
-    /// is allocated. We refuse to start when the pool is at the edge
-    /// AND the user has no auto-clear path — booting the VM there would
-    /// burn the rootfs cloneon-disk and end with a port-forward stuck
-    /// on `127.0.0.1`, which is the single most confusing failure mode
-    /// in cocker today. Erroring early with the exact fix command in
-    /// the message turns a 30 min debugging session into a 10 s
-    /// helper-install. The threshold (252) leaves a 4-lease cushion
-    /// for whatever else macOS hands out while we're checking.
     static func preflightLeasePoolOrThrow() throws {
-        let count = leasePoolCount()
-        guard count >= 252 else { return }
-        if leasePoolHelperInstalled() {
-            // Helper present : the watchdog / runPreflight path will
-            // touch the trigger and clear it in <2 s. Don't block.
-            return
-        }
-        throw CockerError.internalError(
-            "macOS DHCP pool saturated (\(count)/256). New containers can't get an IP. " +
-            "Fix once and forever : `cocker daemon helper-install` (one sudo prompt, then forget). " +
-            "Or one-shot : `cocker daemon clear-leases`."
-        )
+        try LeasePoolMonitor.preflightOrThrow()
     }
 
     static func deriveNATMAC(from containerID: String) -> String {
-        var hex = containerID.filter { $0.isHexDigit }
-        while hex.count < 8 { hex += "0" }
-        let bytes = Array(hex.prefix(8))
-        return "02:cc:" + stride(from: 0, to: 8, by: 2).map { i in
-            String(bytes[i...i+1])
-        }.joined(separator: ":")
+        LeasePoolMonitor.deriveNATMAC(from: containerID)
     }
 
-    /// Look up `mac` in macOS's vmnet bootp lease file. Returns the most
-    /// recent IPv4 address handed out to that MAC, or nil if no entry
-    /// matches. Used as a fallback when `/cocker-ip` polling times out
-    /// because udhcpc inside the container raced and lost.
     static func lookupLeasedIP(forMAC mac: String) -> String? {
-        // /var/db/dhcpd_leases is the canonical lease file vmnet/bootpd
-        // writes for shared/NAT networks. macOS keys entries by
-        // `hw_address=1,xx:xx:xx:xx:xx:xx` (the "1" is the ethernet type).
-        guard let text = try? String(contentsOfFile: "/var/db/dhcpd_leases", encoding: .utf8) else {
-            return nil
-        }
-        // Normalize MACs : drop leading zeros per octet so "02:cc:01:02:03:04"
-        // matches "2:cc:1:2:3:4" (vmnet writes the short form).
-        func normalize(_ s: String) -> String {
-            s.split(separator: ":").map { String(Int($0, radix: 16) ?? 0, radix: 16) }
-             .joined(separator: ":")
-        }
-        let target = normalize(mac).lowercased()
-        var currentIP: String? = nil
-        var matchedIP: String? = nil
-        for line in text.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("ip_address=") {
-                currentIP = String(trimmed.dropFirst("ip_address=".count))
-            } else if trimmed.hasPrefix("hw_address=") {
-                let val = trimmed.dropFirst("hw_address=".count)
-                // Strip the "1," ethernet-type prefix.
-                let macPart = val.split(separator: ",").last.map(String.init) ?? String(val)
-                if normalize(macPart).lowercased() == target {
-                    matchedIP = currentIP
-                    // Don't break — last entry wins (newest lease).
-                }
-            }
-        }
-        return matchedIP
+        LeasePoolMonitor.lookupLeasedIP(forMAC: mac)
     }
 }
 

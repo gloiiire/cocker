@@ -76,13 +76,39 @@ is a `vmnet` design choice, not a cocker bug.
 
 ```bash
 brew tap gloiiire/cocker
-brew install cocker
-brew services start cocker
+brew install cocker          # pours the pre-built bottle in ~5 s
+cocker daemon init           # one-command setup : signs, refreshes kernel, starts daemon
 ```
 
-The formula builds from source and, in `post_install`, auto-detects your **Apple Development** certificate to sign `cockerd` with the Virtualization entitlement. If no cert is found, it tells you exactly how to create one (Xcode → Settings → Accounts → Manage Certificates → +) and then run `brew postinstall cocker`.
+`cocker daemon init` is the single command you want to run after install. It walks through every prerequisite with a TUX-style checklist and fixes whatever needs fixing :
 
-Why a cert is required: `cockerd` calls `Virtualization.framework`, and macOS only grants the `com.apple.security.virtualization` entitlement to binaries signed by a real Apple developer certificate — not an ad-hoc signature. The cert is free; only an Apple ID is needed.
+```
+$ cocker daemon init
+✓ binaries installed at /opt/homebrew/opt/cocker/bin
+✓ Apple Container kernel found
+→ cockerd is ad-hoc signed — resigning with your Apple Development cert…
+✓ signed: Apple Development: you@icloud.com (XXXXXXXXXX)
+→ refreshing ~/.cocker/kernel/ from /opt/homebrew/share/cocker…
+✓ initrd installed, vmlinuz linked
+→ starting daemon…
+✓ cockerd running (pid 12345)
+
+cocker is ready. Try : cocker run -it alpine sh
+```
+
+It's idempotent — run it again any time after `brew upgrade cocker`, or whenever a `cocker pull` complains about a missing kernel.
+
+**Why the manual step ?** `brew install` runs its `post_install` hook inside a Homebrew seatbelt sandbox that denies writes to `~/.cocker/` and reads to `~/Library/Keychains/`. So the formula always ad-hoc signs cockerd and leaves the rest to `cocker daemon init`, which runs in your shell and can do everything cleanly. Splitting the work this way means `brew install cocker` never breaks with an "ad-hoc fallback" warning that looks like a failure.
+
+If you prefer to run the steps individually :
+
+```bash
+cocker daemon resign         # resign cockerd with your real Apple Dev cert
+cocker daemon setup          # refresh ~/.cocker/kernel/ from <prefix>/share/cocker/
+brew services start cocker   # start the launchd-managed daemon
+```
+
+Why a real cert is preferable to ad-hoc : the ad-hoc signature is honored by macOS *on the machine that produced it* (you can still launch VMs), but you lose the `TeamIdentifier` field, so you can't copy the binary across machines without re-signing.
 
 See the [`gloiiire/homebrew-cocker`](https://github.com/gloiiire/homebrew-cocker) tap for full details.
 

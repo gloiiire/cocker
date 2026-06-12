@@ -3,10 +3,10 @@ require "etc"
 class Cocker < Formula
   desc "Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework"
   homepage "https://github.com/gloiiire/cocker"
-  version "0.5.15"
+  version "0.5.15.12"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
   # Placeholder — replace with `shasum -a 256` of the actual release tarball.
-  sha256 "26cacd744a1df63e712d70f73590de82c322823f9b2ea49ccf3a56a0414a4c38"
+  sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
   license "MIT"
   head "https://github.com/gloiiire/cocker.git", branch: "main"
 
@@ -27,10 +27,10 @@ class Cocker < Formula
   # both `version "..."` AND this `vX.Y.Z` substring on every release
   # tag so they stay in lock-step.
   bottle do
-    root_url "https://github.com/gloiiire/cocker/releases/download/v0.5.15"
-    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "7200b3ec7f7f2ba94dd665c77fd127f4a1175c5879638ee5c7c48d51d19e13cb"
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "7200b3ec7f7f2ba94dd665c77fd127f4a1175c5879638ee5c7c48d51d19e13cb"
-    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "7200b3ec7f7f2ba94dd665c77fd127f4a1175c5879638ee5c7c48d51d19e13cb"
+    root_url "https://github.com/gloiiire/cocker/releases/download/v0.5.15.12"
+    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "REPLACE_BOTTLE_SHA256_TAHOE"
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "REPLACE_BOTTLE_SHA256_SEQUOIA"
+    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "REPLACE_BOTTLE_SHA256_SONOMA"
   end
 
   depends_on arch: :arm64
@@ -110,79 +110,112 @@ class Cocker < Formula
   end
 
   def post_install
-    # --- 1. Sign cockerd with the user's Apple Development certificate ---
-    cert = Utils.safe_popen_read(
-      "security", "find-identity", "-v", "-p", "codesigning"
-    ).lines.grep(/Apple Development/).first&.match(/"([^"]+)"/)&.[](1)
-
-    if cert.nil?
-      opoo <<~EOS
-        No "Apple Development" signing certificate found in your Keychain.
-
-        Falling back to ad-hoc signing with the virtualization entitlement.
-        macOS still honours that entitlement for binaries compiled on the
-        same machine (the local-development case Homebrew is doing here),
-        so cockerd will be able to boot VMs. Upgrade to a real Apple
-        Development cert if you want to copy the binary across machines :
-
-          1. Open Xcode → Settings → Accounts
-          2. Sign in with your Apple ID (free)
-          3. Click "Manage Certificates" → "+" → "Apple Development"
-          4. Then: brew postinstall cocker
-      EOS
-      ohai "Ad-hoc signing cockerd with virtualization entitlement"
-      system "codesign", "--force", "--sign", "-",
-             "--entitlements", share/"cocker/cockerd.entitlements",
-             bin/"cockerd"
-    else
-      ohai "Signing cockerd with: #{cert}"
-      system "codesign", "--force", "--sign", cert,
-             "--entitlements", share/"cocker/cockerd.entitlements",
-             bin/"cockerd"
+    # --- 1. Ad-hoc sign cockerd with the virtualization entitlement ---
+    #
+    # Homebrew runs post_install inside a seatbelt sandbox that denies
+    # filesystem access to ~/Library/Keychains/. Inside that sandbox,
+    # `security find-identity` returns an empty list even when the
+    # user has a perfectly good Apple Development cert installed —
+    # `security` succeeds, the keychain file read silently fails. So
+    # we don't try to detect a real cert here ; we always ad-hoc sign,
+    # which works inside the sandbox AND lets cockerd boot VMs on the
+    # same machine it was signed on (macOS honors the virtualization
+    # entitlement for ad-hoc signatures of locally-built binaries).
+    #
+    # Users who want a TeamIdentifier-bearing signature (required to
+    # copy the binary across machines, or to satisfy stricter signing
+    # policies) should run :
+    #
+    #     cocker daemon resign
+    #
+    # which runs in the user's shell context, reads the keychain
+    # normally, and re-signs cockerd in place.
+    require "open3"
+    ohai "Ad-hoc signing cockerd with virtualization entitlement"
+    cs_out, cs_err, cs_status = Open3.capture3(
+      "/usr/bin/codesign", "--force",
+      "--sign", "-",
+      "--entitlements", (share/"cocker/cockerd.entitlements").to_s,
+      (bin/"cockerd").to_s
+    )
+    unless cs_status.success?
+      opoo "codesign failed (exit #{cs_status.exitstatus}): #{cs_err.strip}"
+      opoo "cockerd may not be able to launch VMs until re-signed manually."
     end
+    # codesign prints "replacing existing signature" to stderr on every
+    # upgrade — informational, not a failure. ohai (not opoo) keeps
+    # it in the calm-log lane.
+    ohai "codesign: #{cs_err.strip}" unless cs_err.empty?
+    ohai cs_out.strip unless cs_out.empty?
+
+    # Tell the user how to get a real cert signature without making
+    # the install feel broken.
+    opoo <<~EOS
+      cockerd was ad-hoc signed (Homebrew's sandbox denies keychain access,
+      so we can't read your Apple Development cert from inside the install).
+
+      To resign with your real cert (TeamIdentifier-bearing, portable across
+      machines) :
+
+        cocker daemon resign
+
+      Re-run after every `brew upgrade cocker`.
+    EOS
 
     # --- 2. Provision ~/.cocker/kernel/ (kernel symlink + initrd copy) ---
-    # IMPORTANT : `Dir.home` returns Homebrew's fake-home sandbox in the
-    # postinstall context (something like /private/tmp/cocker-postinstall-XXXX/),
-    # so writing relative to it lands files in a tmpdir that vanishes when
-    # the install ends — exactly the bug we shipped through v0.5.4 where
-    # the initrd was being "installed" to /private/tmp/.../.cocker/kernel/
-    # instead of the user's real ~/.cocker/kernel/.
-    # `Etc.getpwuid(Process.uid).dir` always returns the real home of the
-    # user running brew, regardless of any HOME env override.
-    real_home   = Pathname.new(Etc.getpwuid(Process.uid).dir)
-    cocker_root = real_home/".cocker"
-    kernel_dir  = cocker_root/"kernel"
-    kernel_dir.mkpath
+    #
+    # Brew's post_install runs inside a seatbelt sandbox that denies
+    # writes to ~/. The Pathname / FileUtils.cp calls below RAISE
+    # SystemCallError when the sandbox denies them, which historically
+    # surfaced as "Warning: The post-install step did not complete
+    # successfully" — alarming, but actually harmless because cocker's
+    # `~/.cocker/kernel/initrd.img` was created as a SYMLINK to
+    # `<prefix>/share/cocker/initrd.img` on the very first install,
+    # and brew updates the file in <prefix>/share/ normally, so the
+    # user keeps getting the freshest initrd through the symlink.
+    #
+    # Wrap the whole block in rescue so a sandbox-denied write doesn't
+    # blow up the install. If anything failed, point the user at
+    # `cocker daemon setup` which runs the same steps from their
+    # shell (outside the sandbox) and can actually write to ~/.cocker/.
+    setup_ok = true
+    begin
+      # `Dir.home` returns Homebrew's fake-home sandbox in the
+      # postinstall context (something like /private/tmp/cocker-postinstall-XXXX/).
+      # `Etc.getpwuid(Process.uid).dir` returns the real home regardless.
+      real_home   = Pathname.new(Etc.getpwuid(Process.uid).dir)
+      cocker_root = real_home/".cocker"
+      kernel_dir  = cocker_root/"kernel"
+      kernel_dir.mkpath
 
-    apple_kernel = real_home/"Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
-    if apple_kernel.exist?
-      vmlinuz = kernel_dir/"vmlinuz"
-      vmlinuz.unlink if vmlinuz.symlink? || vmlinuz.exist?
-      vmlinuz.make_symlink(apple_kernel.realpath)
-      ohai "Linked kernel: #{vmlinuz} → #{apple_kernel.realpath.basename}"
-    else
+      apple_kernel = real_home/"Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
+      if apple_kernel.exist?
+        vmlinuz = kernel_dir/"vmlinuz"
+        vmlinuz.unlink if vmlinuz.symlink? || vmlinuz.exist?
+        vmlinuz.make_symlink(apple_kernel.realpath)
+        ohai "Linked kernel: #{vmlinuz} → #{apple_kernel.realpath.basename}"
+      end
+
+      # Earlier formulas (≤ v0.5.5) symlinked kernel_dir/"initrd.img" to
+      # share/cocker/initrd.img. FileUtils.cp refuses to copy a file over
+      # a symlink resolving to itself ("same file" ArgumentError) so we
+      # unlink first.
+      target = kernel_dir/"initrd.img"
+      target.unlink if target.symlink? || target.exist?
+      cp share/"cocker/initrd.img", target
+      ohai "Installed initrd: #{target}"
+    rescue StandardError => e
+      setup_ok = false
       opoo <<~EOS
-        Apple Container Linux kernel not found at:
-          #{apple_kernel}
+        Could not refresh ~/.cocker/kernel/ from inside the Homebrew sandbox
+        (#{e.class}: #{e.message.split("\n").first}). cocker still works via
+        the existing symlinks. To do a clean refresh, run :
 
-        Install Apple's container CLI to provision it:
-          brew install container
+          cocker daemon setup
 
-        Then finish setup by running:
-          brew postinstall cocker
+        from your shell at any time after install.
       EOS
     end
-
-    # Earlier formulas (≤ v0.5.5) symlinked kernel_dir/"initrd.img" to
-    # share/cocker/initrd.img instead of copying it. FileUtils.cp refuses
-    # to copy a file over a symlink that resolves to itself ("same file"
-    # ArgumentError), which silently broke every subsequent upgrade's
-    # post_install. Unlink first so we always end up with a real file.
-    target = kernel_dir/"initrd.img"
-    target.unlink if target.symlink? || target.exist?
-    cp share/"cocker/initrd.img", target
-    ohai "Installed initrd: #{target}"
 
     # --- 3. Lease-pool helper LaunchDaemon (one-time root install) ---
     # macOS vmnet's bootpd saturates around 256 DHCP leases ; without
