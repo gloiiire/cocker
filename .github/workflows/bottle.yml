@@ -178,7 +178,13 @@ jobs:
           # built_on.os_version is informational, brew doesn't gate on
           # it. We pin macOS 14.0 (our minimum) so brew never refuses
           # a Sonoma user.
-          BUILT_TIME=$(date +%s)
+          # Reproducible bottle requires deterministic file content.
+          # `date +%s` baked the current epoch into INSTALL_RECEIPT.json
+          # at build time, so two Bottle runs of the same input produced
+          # DIFFERENT files (and sha256s), even with --sort + --mtime on
+          # tar. Pin the timestamp ; brew never gates on this field's
+          # value, it's purely informational.
+          BUILT_TIME=1735689600  # 2025-01-01 00:00:00 UTC
           cat > "$ROOT/INSTALL_RECEIPT.json" <<JSON
           {
             "homebrew_version": "4.0.0",
