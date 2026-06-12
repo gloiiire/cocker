@@ -129,7 +129,7 @@ jobs:
         # dans les VMs container. Inclut l'exec listener (vsock) et la
         # gestion des capabilities ajoutées en Sprint 2/3.
         working-directory: cocker-init
-        run: zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init init.c cmdline.c net.c dns_proxy.c spec.c qemu.c exec_listener.c caps.c health_poll.c etc_overlay.c
+        run: zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init init.c cmdline.c net.c dns_proxy.c spec.c qemu.c exec_listener.c caps.c health_poll.c etc_overlay.c dhcp_min.c
       - name: Verify ELF
         working-directory: cocker-init
         run: |
