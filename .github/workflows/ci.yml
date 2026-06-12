@@ -305,6 +305,14 @@ jobs:
         # cockerd setup symlinks into ~/.cocker/kernel/.
         run: brew install apple/container/container || true
       - name: cockerd setup (kernel/initrd symlinks)
+        id: kernel
+        # Sets `available=true|false` so the smoke step below can skip
+        # cleanly instead of failing. Before this gate, the missing-kernel
+        # case ended THIS step with exit 0 but the smoke step still ran,
+        # failed on "Linux kernel not found", and painted a permanent
+        # red X on every PR even though the job is best-effort
+        # (continue-on-error only protects the workflow conclusion, not
+        # the check's displayed status).
         run: |
           mkdir -p ~/.cocker/kernel
           # Symlink Apple's kernel.
@@ -313,14 +321,22 @@ jobs:
             ln -sf "$KERNEL" ~/.cocker/kernel/vmlinuz
             ln -sf "$(pwd)/cocker-init/initrd.img" ~/.cocker/kernel/initrd.img
             ls -la ~/.cocker/kernel/
+            echo "available=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Apple container kernel not found — smoke can't boot a VM"
-            exit 0
+            echo "::warning::Apple container kernel not found — smoke can't boot a VM (expected on hosted runners)"
+            echo "available=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Smoke — run alpine echo
+        if: steps.kernel.outputs.available == 'true'
         timeout-minutes: 3
         run: |
           ./.build/release/cocker daemon start
           sleep 2
           ./.build/release/cocker run --rm alpine echo "ci-smoke-ok"
           ./.build/release/cocker daemon stop
+      - name: Smoke skipped (no kernel on runner)
+        if: steps.kernel.outputs.available != 'true'
+        run: |
+          echo "VM smoke skipped : no Apple container kernel available on this runner."
+          echo "Build + sign + initrd packing above all succeeded — that's the"
+          echo "portion of the e2e path a hosted runner can validate."
