@@ -28,9 +28,9 @@ class Cocker < Formula
   # tag so they stay in lock-step.
   bottle do
     root_url "https://github.com/gloiiire/cocker/releases/download/v0.5.15.11"
-    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "REPLACE_BOTTLE_SHA256_TAHOE"
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "REPLACE_BOTTLE_SHA256_SEQUOIA"
-    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "REPLACE_BOTTLE_SHA256_SONOMA"
+    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "604d68a5b180eddb59e76ebd709f8133518d75c65050c27a092549afcb36886e"
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "604d68a5b180eddb59e76ebd709f8133518d75c65050c27a092549afcb36886e"
+    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "604d68a5b180eddb59e76ebd709f8133518d75c65050c27a092549afcb36886e"
   end
 
   depends_on arch: :arm64
