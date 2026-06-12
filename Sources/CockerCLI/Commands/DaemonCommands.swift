@@ -33,6 +33,7 @@ struct DaemonCommand: AsyncParsableCommand {
             DaemonTLSInitCommand.self,
             DaemonResignCommand.self,
             DaemonSetupCommand.self,
+            DaemonInitCommand.self,
         ]
     )
 }
@@ -493,6 +494,253 @@ struct DaemonSetupCommand: AsyncParsableCommand {
     /// default vs Intel/legacy. Falls back to /opt/homebrew when
     /// neither exists ; that's the most common installs.
     private static func detectSharePrefix() -> String {
+        for p in ["/opt/homebrew", "/usr/local"] {
+            if FileManager.default.fileExists(atPath: p + "/share/cocker/initrd.img") {
+                return p
+            }
+        }
+        return "/opt/homebrew"
+    }
+}
+
+/// `cocker daemon init` — single command that walks through every
+/// post-`brew install` step with a TUX-style checklist and fixes
+/// whatever needs fixing. Idempotent ; safe to re-run any time.
+struct DaemonInitCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "init",
+        abstract: "One-command post-install: resign + setup + start (TUX-style)",
+        discussion: """
+        Walks through every prerequisite cockerd needs and resolves them
+        in your shell context (outside Homebrew's seatbelt sandbox). Each
+        step is :
+          1. Apple Container Linux kernel installed ?
+          2. cockerd binary in place + properly signed ?
+          3. ~/.cocker/kernel/ has vmlinuz + initrd ?
+          4. Daemon running ?
+
+        Fixes anything that's not yet done, prints "(ok)" for steps that
+        are already good. Run after `brew install cocker` or any time
+        you want a sanity check.
+        """
+    )
+
+    @Flag(name: .customLong("dry-run"),
+          help: "Print what would be done without making changes.")
+    var dryRun: Bool = false
+
+    @Flag(name: .customLong("no-color"),
+          help: "Disable ANSI color codes in the output.")
+    var noColor: Bool = false
+
+    private struct Style {
+        let useColor: Bool
+        var ok:   String { useColor ? "\u{1B}[32m✓\u{1B}[0m" : "✓" }
+        var arrow:String { useColor ? "\u{1B}[36m→\u{1B}[0m" : "→" }
+        var warn: String { useColor ? "\u{1B}[33m⚠\u{1B}[0m" : "⚠" }
+        var dim:  String { useColor ? "\u{1B}[2m"  : "" }
+        var off:  String { useColor ? "\u{1B}[0m"  : "" }
+        var bold: String { useColor ? "\u{1B}[1m"  : "" }
+    }
+
+    mutating func run() async throws {
+        let s = Style(useColor: !noColor && isatty(STDOUT_FILENO) != 0)
+        print("\(s.bold)cocker daemon init\(s.off)")
+        print("")
+
+        // 1. Apple Container kernel
+        let home = NSHomeDirectory()
+        let appleKernel = "\(home)/Library/Application Support/com.apple.container/kernels/default.kernel-arm64"
+        if FileManager.default.fileExists(atPath: appleKernel) {
+            print("\(s.ok) Apple Container Linux kernel found")
+        } else {
+            print("\(s.warn) Apple Container Linux kernel missing")
+            print("  \(s.dim)Install Apple's container CLI for the Linux kernel cocker boots VMs with:\(s.off)")
+            print("    brew install container")
+            print("  \(s.dim)Then re-run: cocker daemon init\(s.off)")
+            throw ExitCode.failure
+        }
+
+        // 2. cockerd binary + signature
+        let cockerd = Self.detectCockerd()
+        guard let cockerdPath = cockerd else {
+            print("\(s.warn) cockerd binary not found in standard locations")
+            print("  \(s.dim)Run `brew install cocker` or `./install.sh` first.\(s.off)")
+            throw ExitCode.failure
+        }
+        print("\(s.ok) binaries installed at \((cockerdPath as NSString).deletingLastPathComponent)")
+        let sigInfo = Self.codesignTeamID(of: cockerdPath)
+        if sigInfo.adhoc {
+            print("\(s.arrow) cockerd is ad-hoc signed — resigning with your Apple Development cert…")
+            if dryRun {
+                print("  \(s.dim)(dry-run: skipped)\(s.off)")
+            } else {
+                do {
+                    let cert = try Self.detectIdentity()
+                    let entitlements = (cockerdPath as NSString)
+                        .deletingLastPathComponent
+                        .replacingOccurrences(of: "/bin", with: "/share/cocker/cockerd.entitlements")
+                    try Self.codesign(path: cockerdPath, identity: cert, entitlements: entitlements)
+                    print("\(s.ok) signed: \(cert)")
+                } catch {
+                    print("\(s.warn) could not resign (\(error)) — ad-hoc signature kept.")
+                    print("  \(s.dim)cockerd still boots VMs on this machine, but the binary can't be copied across machines.\(s.off)")
+                }
+            }
+        } else if let teamID = sigInfo.teamID {
+            print("\(s.ok) cockerd signed with TeamIdentifier=\(teamID)")
+        } else {
+            print("\(s.ok) cockerd is signed")
+        }
+
+        // 3. ~/.cocker/kernel/ — symlink + initrd
+        let cockerRoot = home + "/.cocker"
+        let kernelDir  = cockerRoot + "/kernel"
+        let vmlinuz    = kernelDir + "/vmlinuz"
+        let initrd     = kernelDir + "/initrd.img"
+        var needRefresh = false
+        if !FileManager.default.fileExists(atPath: vmlinuz) { needRefresh = true }
+        if !FileManager.default.fileExists(atPath: initrd)  { needRefresh = true }
+
+        if needRefresh {
+            print("\(s.arrow) refreshing \(kernelDir) from \(DaemonSetupCommand.detectSharePrefixStatic())/share/cocker…")
+            if !dryRun {
+                var setup = DaemonSetupCommand()
+                try await setup.run()
+            } else {
+                print("  \(s.dim)(dry-run: skipped)\(s.off)")
+            }
+        } else {
+            print("\(s.ok) ~/.cocker/kernel/ already populated")
+        }
+
+        // 4. Start the daemon if not running
+        let socketPath = cockerRoot + "/cocker.sock"
+        if Self.isDaemonAlive(socketPath: socketPath) {
+            print("\(s.ok) cockerd already running")
+        } else {
+            print("\(s.arrow) starting daemon via launchd (brew services)…")
+            if !dryRun {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                p.arguments = ["brew", "services", "start", "cocker"]
+                p.standardOutput = Pipe()
+                p.standardError = Pipe()
+                try? p.run()
+                p.waitUntilExit()
+                if p.terminationStatus == 0 {
+                    print("\(s.ok) cockerd starting")
+                } else {
+                    print("\(s.warn) brew services start exited \(p.terminationStatus)")
+                    print("  \(s.dim)Try : cocker daemon start\(s.off)")
+                }
+            } else {
+                print("  \(s.dim)(dry-run: skipped)\(s.off)")
+            }
+        }
+
+        print("")
+        print("\(s.bold)cocker is ready.\(s.off) Try : \(s.dim)cocker run -it alpine sh\(s.off)")
+    }
+
+    // MARK: - helpers
+
+    private static func detectCockerd() -> String? {
+        for p in [
+            "/opt/homebrew/opt/cocker/bin/cockerd",
+            "/opt/homebrew/bin/cockerd",
+            "/usr/local/opt/cocker/bin/cockerd",
+            "/usr/local/bin/cockerd",
+        ] {
+            if FileManager.default.isExecutableFile(atPath: p) { return p }
+        }
+        return nil
+    }
+
+    private static func codesignTeamID(of path: String) -> (adhoc: Bool, teamID: String?) {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        proc.arguments = ["-dv", path]
+        let pipe = Pipe()
+        proc.standardError = pipe
+        proc.standardOutput = Pipe()
+        try? proc.run()
+        proc.waitUntilExit()
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+        let str = String(data: data, encoding: .utf8) ?? ""
+        let adhoc = str.contains("Signature=adhoc") || str.contains("flags=0x2(adhoc)")
+        var teamID: String? = nil
+        for line in str.split(separator: "\n") where line.hasPrefix("TeamIdentifier=") {
+            let v = String(line.dropFirst("TeamIdentifier=".count))
+            if v != "not set" { teamID = v }
+        }
+        return (adhoc, teamID)
+    }
+
+    private static func detectIdentity() throws -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        proc.arguments = ["find-identity", "-v", "-p", "codesigning"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        try proc.run()
+        proc.waitUntilExit()
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+        let str = String(data: data, encoding: .utf8) ?? ""
+        for kind in ["Apple Development", "Developer ID Application"] {
+            for line in str.split(separator: "\n") where line.contains(kind) {
+                if let openIdx = line.firstIndex(of: "\""),
+                   let closeIdx = line.lastIndex(of: "\""),
+                   openIdx < closeIdx {
+                    return String(line[line.index(after: openIdx)..<closeIdx])
+                }
+            }
+        }
+        throw CockerError.requestFailed("no Apple Development cert in keychain")
+    }
+
+    private static func codesign(path: String, identity: String, entitlements: String) throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        proc.arguments = [
+            "--force",
+            "--sign", identity,
+            "--entitlements", entitlements,
+            path,
+        ]
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        try proc.run()
+        proc.waitUntilExit()
+        guard proc.terminationStatus == 0 else {
+            throw CockerError.requestFailed("codesign exit \(proc.terminationStatus)")
+        }
+    }
+
+    private static func isDaemonAlive(socketPath: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: socketPath) else { return false }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        defer { close(fd) }
+        guard fd >= 0 else { return false }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        _ = withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dst in
+                _ = socketPath.withCString { strncpy(dst, $0, 103) }
+            }
+        }
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return rc == 0
+    }
+}
+
+extension DaemonSetupCommand {
+    static func detectSharePrefixStatic() -> String {
         for p in ["/opt/homebrew", "/usr/local"] {
             if FileManager.default.fileExists(atPath: p + "/share/cocker/initrd.img") {
                 return p
