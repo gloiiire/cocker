@@ -3,6 +3,35 @@ import Foundation
 import Darwin
 #endif
 
+/// **I8 helper** : every socket call in cocker performs the same
+/// `withUnsafePointer(to:) → withMemoryRebound(to: sockaddr.self)` dance
+/// to satisfy POSIX's `bind/connect/sendto` signatures. The pattern is
+/// safe but extremely verbose ; this helper encapsulates the
+/// pointer-massaging so new socket code reads like a straight call.
+///
+/// Existing call sites still use the inline pattern — migrating them is
+/// mechanical but risks regression in code paths we don't have full
+/// integration coverage for, so we add the helper now and let new code
+/// adopt it. Audit task I8 deliverable.
+///
+/// Usage :
+///   var addr = sockaddr_in(...)
+///   let rc = withSockaddr(&addr) { sa, len in
+///       Darwin.bind(fd, sa, len)
+///   }
+@inlinable
+public func withSockaddr<T, R>(
+    _ addr: inout T,
+    _ body: (UnsafePointer<sockaddr>, socklen_t) -> R
+) -> R {
+    let size = socklen_t(MemoryLayout<T>.size)
+    return withUnsafePointer(to: &addr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+            body(sa, size)
+        }
+    }
+}
+
 /// Retourne l'adresse IPv4 du host accessible depuis les interfaces réseau actives.
 /// Cherche en priorité les interfaces en* (Wi-Fi / Ethernet) non-loopback.
 public func localHostIP() -> String {

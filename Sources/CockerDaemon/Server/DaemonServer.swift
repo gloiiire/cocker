@@ -8,8 +8,14 @@ final class DaemonServer {
     private let socketPath: String
     private let engine: ContainerEngine
     private let compose: ComposeEngine
-    private var serverFD: Int32 = -1
-    private var isRunning = false
+    // `serverFD` and `isRunning` are touched from the nonisolated accept
+    // loop ; `nonisolated(unsafe)` lets us read them without an `await`
+    // hop. Writes happen only at start/stop, the accept syscall observes
+    // any stale value within one iteration (the next accept after
+    // serverFD is closed returns -1 and the loop drops out), so a benign
+    // data race is acceptable here.
+    private nonisolated(unsafe) var serverFD: Int32 = -1
+    private nonisolated(unsafe) var isRunning = false
 
     init(socketPath: String, engine: ContainerEngine) {
         self.socketPath = socketPath
@@ -69,10 +75,13 @@ final class DaemonServer {
         await acceptLoop()
     }
 
-    private func acceptLoop() async {
+    private nonisolated func acceptLoop() async {
         while isRunning {
-            // Accept is blocking — run off main actor
-            let clientFD = await Task.detached(priority: .userInitiated) { [fd = serverFD] in
+            // accept(2) blocks until a client connects ; we already run it
+            // off the main actor via Task.detached so the daemon's other
+            // background tasks (watchers, healthchecks, signal sources) can
+            // make progress while we wait.
+            let clientFD = await Task.detached(priority: .userInitiated) { [fd = self.serverFD] in
                 accept(fd, nil, nil)
             }.value
 
@@ -81,9 +90,14 @@ final class DaemonServer {
                 continue
             }
 
-            // Handle each connection in its own task
-            Task { [clientFD] in
-                await self.handleConnection(fd: clientFD)
+            // **B4 fix** : `Task { ... }` would inherit @MainActor isolation
+            // and pin the per-connection read loop to the main actor — a
+            // single slow client could then freeze every other command,
+            // every watcher and every healthcheck. `Task.detached` cuts
+            // the isolation so each connection gets its own cooperative
+            // pool slot for the blocking `read()`s.
+            Task.detached { [weak self, clientFD] in
+                await self?.handleConnection(fd: clientFD)
                 close(clientFD)
             }
         }
@@ -98,20 +112,43 @@ final class DaemonServer {
 
     // MARK: - Connection handler
 
-    private func handleConnection(fd: Int32) async {
+    /// Per-connection read loop. `nonisolated` so the blocking POSIX read
+    /// runs off the main actor — only the JSON dispatch hops back into
+    /// MainActor via the `await` on `handleRequest`. Without this every
+    /// client kept the daemon's main actor parked inside `read()` between
+    /// frames, blocking every watcher / healthcheck / other command.
+    private nonisolated func handleConnection(fd: Int32) async {
         do {
             while true {
                 let data = try IPCFramer.read(from: fd)
+                // Decode off-actor too — IPCRequest is Sendable so this is
+                // safe. Only the engine call below requires MainActor.
                 let request = try JSONDecoder().decode(IPCRequest.self, from: data)
                 try await handleRequest(request, fd: fd)
-                // For non-streaming, loop for next request (connection reuse)
             }
         } catch {
-            // Connection closed or error — normal lifecycle
+            // EOF / framing error / shutdown — normal lifecycle for a CLI
+            // client that issued one command and disconnected. We swallow
+            // the error here ; sendErrorResponse-worthy failures already
+            // emitted their reply earlier in the dispatch.
         }
     }
 
     private func handleRequest(_ request: IPCRequest, fd: Int32) async throws {
+        // **A10 — protocol version gate**. A CLI claiming a version newer
+        // than this daemon knows about is rejected with an actionable error.
+        // Missing field == legacy (pre-0.6) client, allowed for compat.
+        if let clientVersion = request.protocolVersion,
+           clientVersion > CockerVersion.ipcProtocolVersion {
+            sendErrorResponse(
+                requestId: request.id,
+                error:
+                "cocker CLI is newer than cockerd (client IPC v\(clientVersion), " +
+                "daemon v\(CockerVersion.ipcProtocolVersion)). " +
+                "Upgrade cockerd to match the CLI : `brew upgrade gloiiire/cocker/cocker`.",
+                to: fd)
+            return
+        }
         do {
             switch request.type {
             case .ping:
@@ -299,19 +336,7 @@ final class DaemonServer {
 
             case .attach:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
-                guard let container = await engine.state.container(id: req.id) else {
-                    throw CockerError.containerNotFound(req.id)
-                }
-                // Stream the container's recent logs and ongoing output as an attach simulation
-                let historical = engine.vmRuntime.logs(containerID: container.id, tail: 20)
-                let containerID = container.id
-                try await sendStreamingOperation(requestId: request.id, to: fd) { [self] send in
-                    for event in historical { send(event) }
-                    // Stream until container stops
-                    while self.engine.vmRuntime.isRunning(containerID: containerID) {
-                        try? await Task.sleep(nanoseconds: 200_000_000)
-                    }
-                }
+                try await handleAttach(req, requestId: request.id, to: fd)
 
             case .diff:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
@@ -330,26 +355,7 @@ final class DaemonServer {
 
             case .imageHistory:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
-                let img = try await engine.images.find(req.id)
-                var entries: [ImageHistoryEntry] = []
-                for (i, layer) in img.layers.enumerated() {
-                    entries.append(ImageHistoryEntry(
-                        id: String(layer.prefix(19)),
-                        createdAt: img.createdAt.addingTimeInterval(TimeInterval(-i * 60)),
-                        createdBy: i == 0 ? "/bin/sh -c #(nop) FROM \(img.repository):\(img.tag)" : "/bin/sh -c layer \(i)",
-                        size: img.size / UInt64(max(1, img.layers.count)),
-                        comment: ""
-                    ))
-                }
-                if entries.isEmpty {
-                    entries.append(ImageHistoryEntry(
-                        id: String(img.id.prefix(19)),
-                        createdAt: img.createdAt,
-                        createdBy: "/bin/sh -c #(nop) ADD \(img.repository):\(img.tag)",
-                        size: img.size,
-                        comment: ""
-                    ))
-                }
+                let entries = try await handleImageHistory(req.id)
                 try sendResponse(requestId: request.id, payload: ImageHistoryResponse(entries: entries), to: fd)
 
             case .imagePrune:
@@ -376,52 +382,7 @@ final class DaemonServer {
 
             case .composeLogs:
                 let req = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
-                let pName = req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent
-                let filter = ["label": "com.cocker.project=\(pName)"]
-                var containers = await engine.list(all: true, filter: filter)
-                // Optional `services` filter narrows down inside the project
-                // (e.g. `cocker compose logs backend frontend`).
-                if !req.services.isEmpty {
-                    let pin = Set(req.services)
-                    containers = containers.filter { c in
-                        if let svc = c.labels["com.cocker.service"], pin.contains(svc) { return true }
-                        return pin.contains(c.name) || pin.contains(where: { c.name.hasSuffix("_\($0)_1") })
-                    }
-                }
-                try await sendStreamingOperation(requestId: request.id, to: fd) { send in
-                    // Always emit the tail backlog first so the user sees
-                    // context even when nothing new is being printed.
-                    for container in containers {
-                        let backlog = self.engine.vmRuntime.logs(containerID: container.id, tail: req.tail)
-                        for event in backlog {
-                            send(StreamEvent(stream: event.stream, data: "[\(container.name)] \(event.data)"))
-                        }
-                    }
-                    if !req.follow { return }
-                    // Follow mode : open a per-container streaming task
-                    // and multiplex their output. Each `engine.logs` already
-                    // yields lines as they appear ; we just relay with a
-                    // `[container.name]` prefix. The group lives until all
-                    // containers exit or the client disconnects.
-                    await withTaskGroup(of: Void.self) { group in
-                        for container in containers {
-                            let name = container.name
-                            let id = container.id
-                            group.addTask {
-                                let logsReq = LogsRequest(id: id, follow: true, tail: 0)
-                                do {
-                                    let stream = try await self.engine.logs(id: id, request: logsReq)
-                                    for try await event in stream {
-                                        send(StreamEvent(stream: event.stream, data: "[\(name)] \(event.data)"))
-                                    }
-                                } catch {
-                                    send(StreamEvent(stream: .stderr, data: "[\(name)] log stream error: \(error)\n"))
-                                }
-                            }
-                        }
-                        await group.waitForAll()
-                    }
-                }
+                try await handleComposeLogs(req, requestId: request.id, to: fd)
 
             case .composePs:
                 let req = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
@@ -450,17 +411,7 @@ final class DaemonServer {
 
             case .composeRestart:
                 let req = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
-                let pName = req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent
-                let filter = ["label": "com.cocker.project=\(pName)"]
-                var containers = await engine.list(all: false, filter: filter)
-                if !req.services.isEmpty {
-                    containers = containers.filter { c in
-                        req.services.contains(c.labels["com.cocker.service"] ?? "")
-                    }
-                }
-                for c in containers {
-                    try? await engine.restart(id: c.id)
-                }
+                try await handleComposeRestart(req)
                 try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
 
             case .info:
@@ -558,29 +509,71 @@ final class DaemonServer {
         //   string using the detected encoding."
         // because what reaches JSONDecoder is half-frames glued together.
         let writer = FrameWriteSerializer()
-        try await operation { event in
-            let response = try? IPCResponse(requestId: requestId, payload: event, isStreaming: true, isLast: false)
-            if let data = try? JSONEncoder().encode(response) {
-                writer.write(data, to: fd)
+        // **B20 fix** : wrap the operation in a child Task so we can
+        // cancel it when the writer detects EPIPE / EBADF. A monitor
+        // task polls writer.isAlive ; once it flips we cancel the
+        // operation, which cooperatively cancels the per-container
+        // log tasks inside compose-logs. Without this the children
+        // would happily keep streaming bytes into a closed pipe and
+        // leak Tasks until the followed containers exited.
+        let operationTask = Task {
+            try await operation { event in
+                guard writer.isAlive else { return }
+                let response = try? IPCResponse(requestId: requestId, payload: event, isStreaming: true, isLast: false)
+                if let data = try? JSONEncoder().encode(response) {
+                    writer.write(data, to: fd)
+                }
             }
         }
-        // Operation has completed → all per-container Tasks have exited
-        // → no more concurrent writers. Final marker is safe to write
-        // directly without going through the serializer.
+        let monitorTask = Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                if !writer.isAlive {
+                    operationTask.cancel()
+                    return
+                }
+            }
+        }
+        defer { monitorTask.cancel() }
+        do {
+            try await operationTask.value
+        } catch {
+            // Propagate non-cancellation errors. A cancellation from the
+            // monitor is normal end-of-stream and shouldn't bubble.
+            if !(error is CancellationError) { throw error }
+        }
+        // Skip the final marker when the connection is already gone — the
+        // write would just fail. When healthy, emit the canonical
+        // end-of-stream sentinel.
+        guard writer.isAlive else { return }
         let done = try IPCResponse(requestId: requestId, payload: StreamEvent(stream: .status, data: ""), isStreaming: true, isLast: true)
         let doneData = try JSONEncoder().encode(done)
-        try IPCFramer.write(doneData, to: fd)
+        try? IPCFramer.write(doneData, to: fd)
     }
 
     /// Wraps IPCFramer.write in an NSLock so concurrent callers can't
     /// interleave the framer's two-step length-then-payload pattern.
-    /// The class is `@unchecked Sendable` because NSLock is sound under
-    /// concurrent access ; we just need to convince Swift 6's checker.
+    /// Tracks an `alive` flag : on any IPCFramer.write throw (most often
+    /// EPIPE / EBADF after the client closed), every subsequent write is
+    /// dropped AND `isAlive` returns false so the streaming wrapper can
+    /// cancel its children. The class is `@unchecked Sendable` because
+    /// NSLock is sound under concurrent access ; we just need to
+    /// convince Swift 6's checker.
     private final class FrameWriteSerializer: @unchecked Sendable {
         private let lock = NSLock()
+        private var alive = true
         func write(_ data: Data, to fd: Int32) {
             lock.lock(); defer { lock.unlock() }
-            try? IPCFramer.write(data, to: fd)
+            guard alive else { return }
+            do {
+                try IPCFramer.write(data, to: fd)
+            } catch {
+                alive = false
+            }
+        }
+        var isAlive: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return alive
         }
     }
 
@@ -604,21 +597,27 @@ final class DaemonServer {
         }
 
         let fm = FileManager.default
-        let containerFull = rootfsDir.appendingPathComponent(
-            req.containerPath.hasPrefix("/") ? String(req.containerPath.dropFirst()) : req.containerPath
-        )
 
         if req.toContainer {
-            // host → container
+            // host → container. Lexical confinement is enough on the write
+            // side : the daemon never reads through a malicious symlink
+            // because the destination doesn't exist yet (or we're replacing
+            // it). We DO follow symlinks on the **source** because a regular
+            // user is allowed to copy files they own from anywhere on the
+            // host into a container they control.
             let src = URL(fileURLWithPath: req.hostPath)
-            let dst = containerFull
+            let dst = try PathConfinement.confine(req.containerPath, to: rootfsDir)
             let parent = dst.deletingLastPathComponent()
             try fm.createDirectory(at: parent, withIntermediateDirectories: true)
             if fm.fileExists(atPath: dst.path) { try fm.removeItem(at: dst) }
             try fm.copyItem(at: src, to: dst)
         } else {
-            // container → host
-            let src = containerFull
+            // container → host. The container rootfs is attacker-controlled
+            // (the container image author + the running container's processes
+            // both can plant arbitrary symlinks under rootfsDir). Use the
+            // read flavour that walks symlinks and refuses any final target
+            // that escapes the confined root.
+            let src = try PathConfinement.confineRead(req.containerPath, to: rootfsDir)
             let dst = URL(fileURLWithPath: req.hostPath)
             let parent = dst.deletingLastPathComponent()
             try fm.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -899,6 +898,110 @@ final class DaemonServer {
         }
     }
 
+    // MARK: - Attach / history / compose helpers (A2)
+
+    private func handleAttach(_ req: ContainerIDRequest, requestId: String, to fd: Int32) async throws {
+        guard let container = await engine.state.container(id: req.id) else {
+            throw CockerError.containerNotFound(req.id)
+        }
+        let historical = engine.vmRuntime.logs(containerID: container.id, tail: 20)
+        let containerID = container.id
+        try await sendStreamingOperation(requestId: requestId, to: fd) { [self] send in
+            for event in historical { send(event) }
+            while self.engine.vmRuntime.isRunning(containerID: containerID) {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+        }
+    }
+
+    /// `docker history` synthesises a fake history record per stored layer
+    /// plus a final FROM line. We don't track layer-build metadata so this
+    /// is approximative — the entries Docker tools display match the ones a
+    /// fresh-built Docker image of the same layer count would have produced.
+    private func handleImageHistory(_ reference: String) async throws -> [ImageHistoryEntry] {
+        let img = try await engine.images.find(reference)
+        var entries: [ImageHistoryEntry] = []
+        for (i, layer) in img.layers.enumerated() {
+            entries.append(ImageHistoryEntry(
+                id: String(layer.prefix(19)),
+                createdAt: img.createdAt.addingTimeInterval(TimeInterval(-i * 60)),
+                createdBy: i == 0 ? "/bin/sh -c #(nop) FROM \(img.repository):\(img.tag)" : "/bin/sh -c layer \(i)",
+                size: img.size / UInt64(max(1, img.layers.count)),
+                comment: ""
+            ))
+        }
+        if entries.isEmpty {
+            entries.append(ImageHistoryEntry(
+                id: String(img.id.prefix(19)),
+                createdAt: img.createdAt,
+                createdBy: "/bin/sh -c #(nop) ADD \(img.repository):\(img.tag)",
+                size: img.size,
+                comment: ""
+            ))
+        }
+        return entries
+    }
+
+    private func handleComposeLogs(_ req: ComposeRequest, requestId: String, to fd: Int32) async throws {
+        let pName = req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent
+        let filter = ["label": "com.cocker.project=\(pName)"]
+        var containers = await engine.list(all: true, filter: filter)
+        if !req.services.isEmpty {
+            let pin = Set(req.services)
+            containers = containers.filter { c in
+                if let svc = c.labels["com.cocker.service"], pin.contains(svc) { return true }
+                return pin.contains(c.name) || pin.contains(where: { c.name.hasSuffix("_\($0)_1") })
+            }
+        }
+        try await sendStreamingOperation(requestId: requestId, to: fd) { send in
+            // Always emit the tail backlog first so the user sees context
+            // even when nothing new is being printed.
+            for container in containers {
+                let backlog = self.engine.vmRuntime.logs(containerID: container.id, tail: req.tail)
+                for event in backlog {
+                    send(StreamEvent(stream: event.stream, data: "[\(container.name)] \(event.data)"))
+                }
+            }
+            if !req.follow { return }
+            // Follow : open one child task per container, multiplex output
+            // through `send` until every child stream ends (or the parent
+            // task gets cancelled — see B20 fix in sendStreamingOperation).
+            await withTaskGroup(of: Void.self) { group in
+                for container in containers {
+                    let name = container.name
+                    let id = container.id
+                    group.addTask {
+                        let logsReq = LogsRequest(id: id, follow: true, tail: 0)
+                        do {
+                            let stream = try await self.engine.logs(id: id, request: logsReq)
+                            for try await event in stream {
+                                if Task.isCancelled { return }
+                                send(StreamEvent(stream: event.stream, data: "[\(name)] \(event.data)"))
+                            }
+                        } catch {
+                            send(StreamEvent(stream: .stderr, data: "[\(name)] log stream error: \(error)\n"))
+                        }
+                    }
+                }
+                await group.waitForAll()
+            }
+        }
+    }
+
+    private func handleComposeRestart(_ req: ComposeRequest) async throws {
+        let pName = req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent
+        let filter = ["label": "com.cocker.project=\(pName)"]
+        var containers = await engine.list(all: false, filter: filter)
+        if !req.services.isEmpty {
+            containers = containers.filter { c in
+                req.services.contains(c.labels["com.cocker.service"] ?? "")
+            }
+        }
+        for c in containers {
+            try? await engine.restart(id: c.id)
+        }
+    }
+
     // MARK: - Setup
 
     private func performSetup(requestId: String, to fd: Int32) async throws {
@@ -920,6 +1023,9 @@ final class DaemonServer {
         send("To complete setup, provide a Linux kernel and initrd:")
         send("  1. Download Alpine Linux kernel:")
         send("     https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/")
+        send("     Verify the download with the published SHA-256 checksums:")
+        send("       shasum -a 256 vmlinuz")
+        send("     and the Alpine signing key — see https://www.alpinelinux.org/keys/")
         send("  2. Place vmlinuz at: \(kernelDir.path)/vmlinuz")
         send("  3. Place initrd.img at: \(kernelDir.path)/initrd.img")
         send("")

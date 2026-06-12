@@ -135,6 +135,35 @@ jobs:
         run: |
           file cocker-init | grep -q "ELF 64-bit.*ARM aarch64" || { echo "❌ wrong arch"; exit 1; }
           echo "✅ cocker-init cross-compiled for Linux ARM64"
+      - name: Build fuzz harness (ASAN sanity)
+        # P5 — build the standalone exec_listener fuzz target with
+        # ASAN enabled. This is a build-time sanity check ; the actual
+        # fuzz campaign runs locally (libFuzzer + a corpus). Catching
+        # compile-time regressions here keeps the harness usable.
+        working-directory: cocker-init
+        run: |
+          clang -g -O1 -fsanitize=address -Wall -Werror \
+            tests/fuzz_exec_parser.c -o /tmp/fuzz_exec_parser_sanity
+          echo "✅ fuzz harness builds clean with ASAN"
+
+  e2e-lint:
+    name: e2e scripts syntax check
+    # A9 — full e2e suite requires a real Mac with Virtualization.framework
+    # which GitHub's macos-15 runners can't provide. The closest CI-safe
+    # signal is a syntax check : catches broken shell long before a
+    # maintainer ships a regression that quietly fails at run time.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Lint shell scripts
+        working-directory: Tests/e2e
+        run: |
+          set -e
+          for s in *.sh; do
+            echo "  → bash -n $s"
+            bash -n "$s"
+          done
+          echo "✅ all e2e scripts parse"
 
   audit:
     name: SwiftPM dependency audit

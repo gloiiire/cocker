@@ -28,6 +28,16 @@ actor L2Switch: L2Switching {
     static let mtu = 1500
     private static let maxFrame = 1518  // MTU + 14-byte Ethernet header + 4-byte FCS slack
 
+    /// Shared, **concurrent** GCD queue that drives every port's DispatchSource.
+    /// We don't park a cooperative-pool slot per port — that's exactly what the
+    /// previous `Task.detached { ... blocking read ... }` design did, and with
+    /// ~8 ports it was enough to deadlock the entire daemon because every
+    /// background async (watcher, healthcheck, signal source) shares the same
+    /// pool. GCD's worker threads scale automatically with load, decoupled
+    /// from the Swift Concurrency runtime.
+    private static let readQueue = DispatchQueue(
+        label: "cocker.l2switch.read", qos: .userInitiated, attributes: .concurrent)
+
     private struct Port: Sendable {
         let containerID: String
         let switchFD: Int32    // our end of the socketpair
@@ -36,6 +46,7 @@ actor L2Switch: L2Switching {
 
     private var ports: [String: Port] = [:]
     private var macTable: [UInt64: String] = [:]  // MAC → containerID
+    private var readSources: [String: DispatchSourceRead] = [:]
 
     private var verboseLogging: Bool = false
 
@@ -82,40 +93,51 @@ actor L2Switch: L2Switching {
 
         log("addPort: \(containerID) MAC=\(staticMAC) switchFD=\(switchFD) vzFD=\(vzFD)")
 
-        // Spawn a blocking reader task for this port.
-        Task.detached { [weak self] in
-            await self?.readLoop(fd: switchFD, containerID: containerID)
-        }
+        // DispatchSourceRead drains frames as they arrive without parking a
+        // pool thread on a blocking read(). On EOF / error / port removal,
+        // the source cancels and its buffer is deallocated.
+        attachReadSource(fd: switchFD, containerID: containerID)
 
         return FileHandle(fileDescriptor: vzFD, closeOnDealloc: true)
     }
 
-    /// Remove the port and clean up MAC table entries pointing to it. Closes
-    /// our side of the socketpair, which causes the read loop to exit.
+    /// Remove the port and clean up MAC table entries pointing to it. Cancels
+    /// our DispatchSource (which deallocates its buffer in setCancelHandler)
+    /// and closes our side of the socketpair.
     func removePort(containerID: String) {
         guard let port = ports.removeValue(forKey: containerID) else { return }
         macTable = macTable.filter { $0.value != containerID }
-        close(port.switchFD)  // triggers EOF on the read loop
+        if let source = readSources.removeValue(forKey: containerID) {
+            source.cancel()
+        }
+        close(port.switchFD)
         log("removePort: \(containerID) (switchFD \(port.switchFD) closed)")
     }
 
-    // MARK: - Read loop
+    // MARK: - Read source
 
-    private nonisolated func readLoop(fd: Int32, containerID: String) async {
-        // Allocate the buffer once and reuse it for the lifetime of this port.
+    private func attachReadSource(fd: Int32, containerID: String) {
         let bufPtr = UnsafeMutableRawPointer.allocate(byteCount: Self.maxFrame, alignment: 1)
-        defer { bufPtr.deallocate() }
-
-        while true {
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: Self.readQueue)
+        source.setEventHandler { [weak self] in
             let n = read(fd, bufPtr, Self.maxFrame)
             if n <= 0 {
-                // 0 = peer closed; -1 = socket closed (EBADF) or error
-                if n < 0 && errno == EINTR { continue }
-                break
+                if n < 0 && errno == EINTR { return }
+                source.cancel()
+                return
             }
             let frame = Data(bytes: bufPtr, count: n)
-            await self.forward(frame: frame, from: containerID)
+            // Hop into the actor to update the MAC table and route the frame.
+            // The actor's serial executor is independent of the GCD queue so
+            // there's no deadlock risk.
+            guard let self else { source.cancel(); return }
+            Task { await self.forward(frame: frame, from: containerID) }
         }
+        source.setCancelHandler {
+            bufPtr.deallocate()
+        }
+        source.resume()
+        readSources[containerID] = source
     }
 
     private func forward(frame: Data, from sourceContainerID: String) {

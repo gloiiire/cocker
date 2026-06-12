@@ -30,9 +30,19 @@ final class VMRuntime: NSObject {
         let existing = (try? FileManager.default.contentsOfDirectory(atPath: volumeDir.path)) ?? []
         if !existing.isEmpty { return }
 
-        let imageContentPath = imageRootfs.appendingPathComponent(
-            destination.hasPrefix("/") ? String(destination.dropFirst()) : destination
-        )
+        // S5 fix : the `destination` string comes from the OCI image config.
+        // A malicious image can declare a volume on `/../../../host_secret`
+        // and (without this guard) we'd happily `cp -Rp imageRootfs/host_secret`
+        // into the volume — which then becomes mountable by other containers.
+        // PathConfinement.confine refuses any `..` that escapes imageRootfs.
+        let imageContentPath: URL
+        do {
+            imageContentPath = try PathConfinement.confine(destination, to: imageRootfs)
+        } catch {
+            fputs("[vm] refuse to seed volume from path that escapes image rootfs: \(destination)\n", stderr)
+            fflush(stderr)
+            return
+        }
         var srcIsDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: imageContentPath.path, isDirectory: &srcIsDir),
               srcIsDir.boolValue else { return }
@@ -40,29 +50,78 @@ final class VMRuntime: NSObject {
         // `cp -Rp src/. dst` copies the CONTENTS into dst rather than
         // nesting src under dst. Use a subprocess so symlinks / mode
         // bits / mtimes survive correctly — Foundation's copy APIs
-        // mangle some of these on macOS.
+        // mangle some of these on macOS. A pathological image with
+        // gigabytes baked under `destination` could otherwise stall
+        // container boot indefinitely ; we cap the wait at 60 s and
+        // log a warning so the user can spot the problem.
         let cp = Process()
         cp.executableURL = URL(fileURLWithPath: "/bin/cp")
         cp.arguments = ["-Rp", imageContentPath.path + "/.", volumeDir.path]
-        cp.standardOutput = Pipe()
-        cp.standardError = Pipe()
-        try? cp.run()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        cp.standardOutput = outPipe
+        cp.standardError = errPipe
+        do {
+            try cp.run()
+        } catch {
+            fputs("[vm] cp failed to launch for volume seeding: \(error)\n", stderr); fflush(stderr)
+            return
+        }
+        // Daemon-side budget : 60 s is generous for a typical
+        // node_modules / venv ; anything past that and we abandon
+        // (the half-seeded volume will still be writable from the
+        // container, just not pre-populated).
+        let deadline = Date().addingTimeInterval(60)
+        while cp.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if cp.isRunning {
+            cp.terminate()
+            cp.waitUntilExit()
+            fputs("[vm] WARN: volume seed from \(destination) exceeded 60 s — abandoned\n", stderr)
+            fflush(stderr)
+            return
+        }
         cp.waitUntilExit()
+        if cp.terminationStatus != 0 {
+            let errOut = errPipe.fileHandleForReading.availableData
+            let msg = String(data: errOut, encoding: .utf8) ?? ""
+            fputs("[vm] WARN: cp -Rp for \(destination) exited \(cp.terminationStatus): \(msg.prefix(200))\n", stderr)
+            fflush(stderr)
+        }
     }
 
-    struct RunningVM {
+    /// **A8 fix** : RunningVM used to be a `struct` stored by value in
+    /// `runningVMs: [String: RunningVM]`. Mutating `logBuffer` then required
+    /// the copy-mutate-write-back dance everywhere
+    /// (`var running = runningVMs[id]; running.logBuffer.append(...);
+    /// runningVMs[id] = running`) and relied on `NSLock` (a class) being
+    /// shared by reference across copies for thread-safety. That worked
+    /// "by accident" : every mutation site already lives on `@MainActor`
+    /// so concurrency was never really a worry, and the lock was vestigial.
+    /// Promoting to a final class kills the write-back step, lets us drop
+    /// the lock, and produces straightforward in-place mutation.
+    final class RunningVM {
         let vm: VZVirtualMachine
         let containerID: String
         let stdoutPipe: Pipe
         let stderrPipe: Pipe
         var logBuffer: [StreamEvent] = []
-        let logBufferLock = NSLock()
         /// Where the virtiofs root is mounted from on the host. Carried
         /// here so `stop()` can read `/cocker-exit-code` from the
         /// container's rootfs after the VM is gone — the console-pipe
         /// path drops the "exited with code N" line if the kernel
         /// powers off before stdio drains.
         let rootfsPath: URL?
+
+        init(vm: VZVirtualMachine, containerID: String,
+             stdoutPipe: Pipe, stderrPipe: Pipe, rootfsPath: URL?) {
+            self.vm = vm
+            self.containerID = containerID
+            self.stdoutPipe = stdoutPipe
+            self.stderrPipe = stderrPipe
+            self.rootfsPath = rootfsPath
+        }
     }
 
     private var runningVMs: [String: RunningVM] = [:]
@@ -495,7 +554,14 @@ final class VMRuntime: NSObject {
             }
         }
 
+        // **B13 fix** : the readabilityHandler closure runs on a GCD queue
+        // that's not synchronized with our actor. Detach + close both ends
+        // explicitly so the next `cocker build` step doesn't race against a
+        // residual append into `outputBuffer` (and so the FDs are freed
+        // immediately instead of waiting for ARC + Pipe.deinit).
         pipe.fileHandleForReading.readabilityHandler = nil
+        try? pipe.fileHandleForReading.close()
+        try? pipe.fileHandleForWriting.close()
 
         // Parse l'exit code dans la sortie de cocker-init :
         //   "[cocker-init] container exited with code N"
@@ -525,8 +591,14 @@ final class VMRuntime: NSObject {
     }
 
     private func parseExitCode(from log: String) -> Int32? {
-        // Cherche "exited with code N"
-        guard let range = log.range(of: "exited with code ") else { return nil }
+        // Search backwards : a container that prints a literal "exited with
+        // code 0" mid-run and crashes later with exit 1 used to surface as
+        // exit 0 because we matched the first occurrence. The kernel /
+        // cocker-init "exited with code N" line is the very last marker
+        // written to the console buffer before VZ flips the VM state, so
+        // last-wins is the correct rule for our log shape.
+        guard let range = log.range(of: "exited with code ", options: .backwards)
+        else { return nil }
         let after = log[range.upperBound...]
         let codeStr = after.prefix { $0.isNumber }
         return Int32(codeStr)
@@ -538,8 +610,9 @@ final class VMRuntime: NSObject {
     /// decide whether to honour on-failure restart policy.
     func exitCode(forContainer containerID: String) -> Int32? {
         guard let running = runningVMs[containerID] else { return nil }
-        running.logBufferLock.lock()
-        defer { running.logBufferLock.unlock() }
+        // No lock — VMRuntime is @MainActor so every read/write of
+        // logBuffer is already serialized. RunningVM is now a class so
+        // the read sees the live buffer without a copy.
         let combined = running.logBuffer.map { $0.data }.joined()
         return parseExitCode(from: combined)
     }
@@ -803,8 +876,6 @@ final class VMRuntime: NSObject {
     func logs(containerID: String, tail: Int) -> [StreamEvent] {
         // Fast path : container still running, serve from in-memory ring.
         if let running = runningVMs[containerID] {
-            running.logBufferLock.lock()
-            defer { running.logBufferLock.unlock() }
             let all = running.logBuffer
             if tail <= 0 { return all }
             return Array(all.suffix(tail))
@@ -823,13 +894,23 @@ final class VMRuntime: NSObject {
     /// StreamEvent so the streaming layer doesn't need to know which
     /// source served the bytes. Used as the cold-path fallback in
     /// `logs(containerID:tail:)`.
+    /// Shared formatter for both json-file log writes and replay reads. Used
+    /// to be created per call : `cocker logs --tail 10000` triggered ~10 000
+    /// `ISO8601DateFormatter()` allocations in a tight loop. One per type is
+    /// plenty and the formatter is documented thread-safe.
+    private static let jsonLogFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
     private static func readJSONLog(containerID: String, tail: Int) -> [StreamEvent] {
         let path = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent(".cocker/containers/\(containerID)/\(containerID)-json.log")
         guard let raw = try? String(contentsOf: path, encoding: .utf8) else { return [] }
         let lines = raw.split(separator: "\n", omittingEmptySubsequences: true)
         let scope = (tail <= 0) ? Array(lines) : Array(lines.suffix(tail))
-        let iso = ISO8601DateFormatter()
+        let iso = Self.jsonLogFormatter
         var out: [StreamEvent] = []
         out.reserveCapacity(scope.count)
         for line in scope {
@@ -846,16 +927,12 @@ final class VMRuntime: NSObject {
     }
 
     func appendLog(containerID: String, event: StreamEvent) {
-        guard var running = runningVMs[containerID] else { return }
-        running.logBufferLock.lock()
-        defer { running.logBufferLock.unlock() }
+        guard let running = runningVMs[containerID] else { return }
         running.logBuffer.append(event)
         // Cap buffer at 10k lines
         if running.logBuffer.count > 10000 {
             running.logBuffer.removeFirst(running.logBuffer.count - 10000)
         }
-        runningVMs[containerID] = running
-
         // json-file driver : mirror the event to disk in Docker's exact
         // shape so `docker logs <id>` against the json-file path works
         // for anyone who shells in. Rotation at 10 MB keeps the file from
@@ -882,7 +959,7 @@ final class VMRuntime: NSObject {
         let entry: [String: Any] = [
             "log": event.data,
             "stream": streamName,
-            "time": ISO8601DateFormatter().string(from: event.timestamp),
+            "time": Self.jsonLogFormatter.string(from: event.timestamp),
         ]
         guard let line = try? JSONSerialization.data(withJSONObject: entry),
               let withNL = (String(data: line, encoding: .utf8).map { $0 + "\n" })?.data(using: .utf8)
