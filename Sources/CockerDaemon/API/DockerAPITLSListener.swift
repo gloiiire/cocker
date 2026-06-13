@@ -226,6 +226,15 @@ final class DockerAPITLSListener {
         l.start(queue: .main)
     }
 
+    /// Cancel the NWListener so the OS port is released and in-flight
+    /// connection handlers stop accepting new work. Called from main's
+    /// graceful-shutdown path before the daemon exits.
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        CockerLog.shared.info("docker-api-tls", "TLS listener stopped")
+    }
+
     /// Bridge an accepted TLS NWConnection into the Docker API HTTP
     /// handler.
     ///

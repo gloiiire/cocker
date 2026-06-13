@@ -44,11 +44,32 @@ public struct IPCRequest: Codable, Sendable {
     public let id: String
     public let type: IPCRequestType
     public let payload: Data
+    /// **A10 — protocol versioning**. Bumped when the IPC contract gains
+    /// a breaking change (a payload field becomes mandatory, an enum
+    /// variant changes meaning, etc.). Older CLIs that predate this field
+    /// won't send it ; the daemon treats `nil` as "legacy v0" and only
+    /// rejects when the client's announced version exceeds what the
+    /// daemon implements — newer-daemon-older-client is always safe.
+    public let protocolVersion: Int?
 
     public init<T: Encodable & Sendable>(type: IPCRequestType, payload: T) throws {
         self.id = UUID().uuidString
         self.type = type
         self.payload = try JSONEncoder().encode(payload)
+        self.protocolVersion = CockerVersion.ipcProtocolVersion
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, type, payload, protocolVersion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.type = try c.decode(IPCRequestType.self, forKey: .type)
+        self.payload = try c.decode(Data.self, forKey: .payload)
+        // Optional : older CLIs (pre-0.6) don't send the field.
+        self.protocolVersion = try c.decodeIfPresent(Int.self, forKey: .protocolVersion)
     }
 }
 
@@ -454,8 +475,78 @@ public struct UpdateRequest: Codable, Sendable {
 public enum CockerVersion {
     // Bumped manually with each tag. TODO : drive from a Version.generated.swift
     // produced by the release workflow so this can't drift again.
-    public static let version = "0.5.15.12"
+    public static let version = "0.6.0"
     public static let apiVersion = "1.0"
-    public static let buildTime = "2026-06-10"
+    public static let buildTime = "2026-06-13"
     public static let minAPIVersion = "1.0"
+
+    /// **A10 — IPC protocol version**. v1 = post-audit shape (the
+    /// `protocolVersion` field exists on `IPCRequest`, kill / inspect
+    /// surfaces honour the post-audit invariants). v0 = pre-0.6.0 daemons
+    /// that don't send the field. The daemon rejects any client claiming
+    /// a version higher than what it implements.
+    public static let ipcProtocolVersion: Int = 1
+}
+
+/// **C3 — InspectResponse**. The legacy `case .inspect` path returns a
+/// raw `Container` which carries every internal field (natMAC, restartCount,
+/// healthLog history). Operators inspecting their containers from automated
+/// tooling get exposed to all of it. This DTO is the post-audit shape :
+/// it deliberately omits low-level networking details unless the caller
+/// asks for them, and it routes env through `SecretRedactor` so secrets
+/// don't leave the daemon in cleartext unless explicitly requested.
+///
+/// The legacy `.inspect → Container` flow remains for CLI compat ; new
+/// callers should prefer `.inspectV2 → InspectResponse` once that endpoint
+/// lands. The shape is published now so external automation can adopt it.
+public struct InspectResponse: Codable, Sendable {
+    public let id: String
+    public let name: String
+    public let image: String
+    public let status: ContainerStatus
+    public let command: [String]
+    public let createdAt: Date
+    public let startedAt: Date?
+    public let finishedAt: Date?
+    public let exitCode: Int32?
+    public let ports: [PortMapping]
+    public let volumes: [VolumeMount]
+    public let env: [String: String]
+    public let labels: [String: String]
+    public let networkMode: NetworkMode
+    public let networkName: String?
+    public let ip: String?
+    public let ipv6: String?
+    public let hostname: String
+    public let restartPolicy: RestartPolicy
+    public let restartCount: Int
+    public let healthStatus: HealthStatus
+    public let healthFailingStreak: Int
+
+    public init(from container: Container, redactSecrets: Bool = true) {
+        self.id = container.id
+        self.name = container.name
+        self.image = container.image
+        self.status = container.status
+        self.command = container.command
+        self.createdAt = container.createdAt
+        self.startedAt = container.startedAt
+        self.finishedAt = container.finishedAt
+        self.exitCode = container.exitCode
+        self.ports = container.ports
+        self.volumes = container.volumes
+        self.env = redactSecrets
+            ? SecretRedactor.redact(container.env)
+            : container.env
+        self.labels = container.labels
+        self.networkMode = container.networkMode
+        self.networkName = container.networkName
+        self.ip = container.ip
+        self.ipv6 = container.ipv6
+        self.hostname = container.hostname
+        self.restartPolicy = container.restartPolicy
+        self.restartCount = container.restartCount
+        self.healthStatus = container.healthStatus
+        self.healthFailingStreak = container.healthFailingStreak
+    }
 }

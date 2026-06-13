@@ -63,7 +63,12 @@ jobs:
           # tested in-process without elaborate FS / subprocess mocks ;
           # real coverage comes from integration smoke runs (compose up
           # on a known iCloud project).
-          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift)'
+          # 0.6.0 audit additions :
+          #   - LeasePoolMonitor : reads /var/db/dhcpd_leases + touches a
+          #     /var/run trigger ; not exercisable inside swift test.
+          #   - AuditLog : writes ~/.cocker/audit.log with rotation ; the
+          #     real coverage comes from the smoke runs.
+          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift)'
 
           xcrun llvm-cov report "$BIN" -instr-profile="$PROF" \
             -ignore-filename-regex="$IGNORE" \
@@ -135,6 +140,35 @@ jobs:
         run: |
           file cocker-init | grep -q "ELF 64-bit.*ARM aarch64" || { echo "❌ wrong arch"; exit 1; }
           echo "✅ cocker-init cross-compiled for Linux ARM64"
+      - name: Build fuzz harness (ASAN sanity)
+        # P5 — build the standalone exec_listener fuzz target with
+        # ASAN enabled. This is a build-time sanity check ; the actual
+        # fuzz campaign runs locally (libFuzzer + a corpus). Catching
+        # compile-time regressions here keeps the harness usable.
+        working-directory: cocker-init
+        run: |
+          clang -g -O1 -fsanitize=address -Wall -Werror \
+            tests/fuzz_exec_parser.c -o /tmp/fuzz_exec_parser_sanity
+          echo "✅ fuzz harness builds clean with ASAN"
+
+  e2e-lint:
+    name: e2e scripts syntax check
+    # A9 — full e2e suite requires a real Mac with Virtualization.framework
+    # which GitHub's macos-15 runners can't provide. The closest CI-safe
+    # signal is a syntax check : catches broken shell long before a
+    # maintainer ships a regression that quietly fails at run time.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Lint shell scripts
+        working-directory: Tests/e2e
+        run: |
+          set -e
+          for s in *.sh; do
+            echo "  → bash -n $s"
+            bash -n "$s"
+          done
+          echo "✅ all e2e scripts parse"
 
   audit:
     name: SwiftPM dependency audit
@@ -258,7 +292,7 @@ jobs:
           swift build -c release
           cd cocker-init
           zig cc -target aarch64-linux-musl -static -O2 -Wall \
-            -o cocker-init init.c cmdline.c net.c dns_proxy.c qemu.c spec.c exec_listener.c caps.c health_poll.c etc_overlay.c
+            -o cocker-init init.c cmdline.c net.c dns_proxy.c qemu.c spec.c exec_listener.c caps.c health_poll.c etc_overlay.c dhcp_min.c
           cp cocker-init initrd-staging/init
           (cd initrd-staging && find . | cpio -o -H newc 2>/dev/null) | gzip -9 > ../initrd.img
       - name: Sign cockerd with entitlements
@@ -271,6 +305,14 @@ jobs:
         # cockerd setup symlinks into ~/.cocker/kernel/.
         run: brew install apple/container/container || true
       - name: cockerd setup (kernel/initrd symlinks)
+        id: kernel
+        # Sets `available=true|false` so the smoke step below can skip
+        # cleanly instead of failing. Before this gate, the missing-kernel
+        # case ended THIS step with exit 0 but the smoke step still ran,
+        # failed on "Linux kernel not found", and painted a permanent
+        # red X on every PR even though the job is best-effort
+        # (continue-on-error only protects the workflow conclusion, not
+        # the check's displayed status).
         run: |
           mkdir -p ~/.cocker/kernel
           # Symlink Apple's kernel.
@@ -279,14 +321,22 @@ jobs:
             ln -sf "$KERNEL" ~/.cocker/kernel/vmlinuz
             ln -sf "$(pwd)/cocker-init/initrd.img" ~/.cocker/kernel/initrd.img
             ls -la ~/.cocker/kernel/
+            echo "available=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::Apple container kernel not found — smoke can't boot a VM"
-            exit 0
+            echo "::warning::Apple container kernel not found — smoke can't boot a VM (expected on hosted runners)"
+            echo "available=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Smoke — run alpine echo
+        if: steps.kernel.outputs.available == 'true'
         timeout-minutes: 3
         run: |
           ./.build/release/cocker daemon start
           sleep 2
           ./.build/release/cocker run --rm alpine echo "ci-smoke-ok"
           ./.build/release/cocker daemon stop
+      - name: Smoke skipped (no kernel on runner)
+        if: steps.kernel.outputs.available != 'true'
+        run: |
+          echo "VM smoke skipped : no Apple container kernel available on this runner."
+          echo "Build + sign + initrd packing above all succeeded — that's the"
+          echo "portion of the e2e path a hosted runner can validate."
