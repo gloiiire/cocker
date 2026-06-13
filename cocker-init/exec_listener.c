@@ -40,6 +40,15 @@
 #define EXEC_BUF_SIZE   (256 * 1024)
 #define MAX_ARGV        128
 #define MAX_ENV         128
+/* **B17 mitigation** : cap concurrent exec workers so a flood of
+ * `cocker exec` calls can't fork-bomb the VM (typical container has 512 MB
+ * of RAM and each worker eats 1 to 2 MB of resident set ; ~256 concurrent
+ * workers would OOM-kill the listener itself, which then takes the whole
+ * vsock channel down). The reaper installed in exec_listener_spawn keeps
+ * `worker_count` accurate as children exit. */
+#define MAX_CONCURRENT_WORKERS 32
+
+static volatile sig_atomic_t worker_count = 0;
 
 /* Very small in-place JSON scanner — handles the two specific shapes
  * cockerd sends (`{"cmd":[...],"env":{...}}`). Not a general decoder.
@@ -54,11 +63,22 @@ static int parse_exec_request(char *buf, size_t buf_len,
     if (buf_len >= EXEC_BUF_SIZE) buf_len = EXEC_BUF_SIZE - 1;
     buf[buf_len] = '\0';
 
-    /* --- argv --- */
+    /* --- argv ---
+     * Locate the colon that terminates the `"cmd"` key, then the *next*
+     * non-whitespace char must be a `[`. The pre-fix code used
+     * `strchr(p, '[')` which would also accept `"cmd":"[hack]"`, parsing
+     * it as an empty argv array (the next char after `[` is a `"` which
+     * we treat as the start of an item, then we read `hack]` and fail) —
+     * a harmless failure mode in practice but it ate the request buffer
+     * pointer for the env scan below. Constraining the scan to a literal
+     * `: WS* [` makes the parser closer to a real JSON peek. */
     char *p = strstr(buf, "\"cmd\"");
     if (!p) return 0;
-    p = strchr(p, '[');
+    p = strchr(p, ':');
     if (!p) return 0;
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '[') return 0;
     p++;
     int argc = 0;
     while (*p && argc < argv_max - 1) {
@@ -87,6 +107,12 @@ static int parse_exec_request(char *buf, size_t buf_len,
         p++;  /* closing quote */
     }
     argv[argc] = NULL;
+
+    /* B16 hardening : reject the request if argv[0] is empty or absent.
+     * execvp("", ...) returns ENOENT immediately ; sending an empty argv
+     * deeper into the listener would just waste a fork and write an
+     * unhelpful 127. */
+    if (argc == 0 || argv[0] == NULL || argv[0][0] == '\0') return 0;
 
     /* --- tty --- search from the start of the buffer so we don't depend
      * on field order in the JSON (Swift's JSONEncoder doesn't guarantee
@@ -377,6 +403,20 @@ static void handle_one(int client_fd) {
     for (int i = 0; env_out[i]; i++) free(env_out[i]);
 }
 
+/* B17 reaper : keep `worker_count` accurate as children exit. We can't use
+ * SIG_IGN (the pre-fix behaviour) and still track active workers — the
+ * kernel discards SIGCHLD without giving us a hook. Installing an explicit
+ * handler that drains all pending exits via WNOHANG gives us both : no
+ * zombie accumulation AND an accurate gauge for admission control. */
+static void exec_listener_reaper(int sig) {
+    (void)sig;
+    int saved = errno;
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+        if (worker_count > 0) worker_count--;
+    }
+    errno = saved;
+}
+
 /* Background listener loop. Forks a separate process so a crash here doesn't
  * take down PID 1. */
 pid_t exec_listener_spawn(void) {
@@ -390,10 +430,14 @@ pid_t exec_listener_spawn(void) {
         return pid;
     }
 
-    /* Child : the listener itself. Ignore SIGCHLD so dead workers don't
-     * accumulate as zombies (we accept the small race of a worker dying
-     * before we read its exit). */
-    signal(SIGCHLD, SIG_IGN);
+    /* Child : the listener itself. The reaper above replaces SIG_IGN so
+     * we can keep `worker_count` accurate without leaking zombies. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = exec_listener_reaper;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_NOCLDSTOP | SA_RESTART;
+    sigaction(SIGCHLD, &sa, NULL);
 
     int sfd = socket(AF_VSOCK, SOCK_STREAM, 0);
     if (sfd < 0) {
@@ -425,6 +469,18 @@ pid_t exec_listener_spawn(void) {
             continue;
         }
         info("exec-listener: accepted connection (cfd=%d)", cfd);
+        /* Admission control : the parent tracks active worker count via the
+         * SIGCHLD reaper above. Past MAX_CONCURRENT_WORKERS we tell the
+         * client to back off rather than forking unbounded children that
+         * collectively OOM-kill the listener. */
+        if (worker_count >= MAX_CONCURRENT_WORKERS) {
+            const char *busy =
+                "exec listener at capacity, try again shortly\n"
+                "__COCKER_EXIT__16\n";
+            write(cfd, busy, strlen(busy));
+            close(cfd);
+            continue;
+        }
         /* Each request handled in a fresh child so parallel execs don't
          * block each other. */
         pid_t wpid = fork();
@@ -433,6 +489,7 @@ pid_t exec_listener_spawn(void) {
             handle_one(cfd);
             _exit(0);
         }
+        if (wpid > 0) worker_count++;
         close(cfd);
     }
 }
