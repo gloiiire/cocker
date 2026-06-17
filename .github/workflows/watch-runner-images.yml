@@ -27,6 +27,32 @@ jobs:
       - name: Detect missing macOS bottle targets
         env:
           GH_TOKEN: ${{ github.token }}
+          # Issue-body template. We carry this here instead of building it
+          # inline via `cat <<EOF` inside the `run: |` block — heredoc bodies
+          # need their closing `EOF` at column 0, which dedents below the
+          # YAML block scalar's minimum indent and breaks the workflow file
+          # at parse time (startup_failure). Using an env var with bash
+          # substitution keeps everything inside the YAML block while still
+          # producing a multi-line markdown body.
+          # Placeholders : `__V__` (macOS version), `__DATE__` (today UTC).
+          BODY_TEMPLATE: |
+            GitHub-hosted runner image `macos-__V__` is now available
+            (https://github.com/actions/runner-images/blob/main/images/macos/).
+
+            Action items to ship a bottle for it :
+
+            1. `.github/workflows/bottle.yml` — add a matrix entry :
+                - runner: macos-__V__
+                  macos: <codename>   # check Apple's release name
+            2. `Formula/cocker.rb` — add a sha256 placeholder line in the
+            `bottle do` block (between sequoia and tahoe to keep order roughly
+            chronological) :
+                sha256 cellar: :any_skip_relocation, arm64_<codename>: "REPLACE_BOTTLE_SHA256_<CODENAME>"
+            3. `.github/workflows/bottle.yml` → `update-formula` job — extract
+            the `arm64_<codename>` sha256 and sed it in.
+
+            Triggered by `.github/workflows/watch-runner-images.yml` cron run on
+            __DATE__.
         run: |
           set -euo pipefail
 
@@ -59,6 +85,7 @@ jobs:
             exit 0
           fi
 
+          TODAY=$(date -u +%Y-%m-%d)
           for v in $MISSING; do
             TITLE="Runner macos-$v is now available — extend Bottle matrix"
 
@@ -71,30 +98,8 @@ jobs:
               continue
             fi
 
-            BODY=$(cat <<EOF
-GitHub-hosted runner image \`macos-$v\` is now available
-(https://github.com/actions/runner-images/blob/main/images/macos/).
-
-Action items to ship a bottle for it :
-
-1. \`.github/workflows/bottle.yml\` — add a matrix entry :
-\`\`\`yaml
-- runner: macos-$v
-  macos: <codename>   # check Apple's release name
-\`\`\`
-2. \`Formula/cocker.rb\` — add a sha256 placeholder line in the
-\`bottle do\` block (between sequoia and tahoe to keep order roughly
-chronological) :
-\`\`\`ruby
-sha256 cellar: :any_skip_relocation, arm64_<codename>: "REPLACE_BOTTLE_SHA256_<CODENAME>"
-\`\`\`
-3. \`.github/workflows/bottle.yml\` → \`update-formula\` job — extract
-the \`arm64_<codename>\` sha256 and sed it in.
-
-Triggered by \`.github/workflows/watch-runner-images.yml\` cron run on
-$(date -u +%Y-%m-%d).
-EOF
-)
+            BODY="${BODY_TEMPLATE//__V__/$v}"
+            BODY="${BODY//__DATE__/$TODAY}"
             gh issue create --title "$TITLE" --body "$BODY"
             echo "Opened issue for macos-$v."
           done
