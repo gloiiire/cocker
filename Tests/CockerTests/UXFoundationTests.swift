@@ -313,6 +313,34 @@ final class UXFoundationTests: XCTestCase {
 
     // MARK: - ActionLine helpers (the convenience constructors)
 
+    func testResultLineTTYBranchProducesActionLine() {
+        UX.TTY.set(.init(isInteractive: true, colorEnabled: false, animationEnabled: false))
+        let line = UX.resultLine(.container, "web_1", verb: .stop, elapsed: 1.5)
+        XCTAssertTrue(line.contains("Stopped"))
+        XCTAssertTrue(line.contains("web_1"))
+        XCTAssertTrue(line.contains("1.5s"))
+    }
+
+    func testResultLineScriptBranchEmitsBareName() {
+        UX.TTY.set(.init(isInteractive: false, colorEnabled: false, animationEnabled: false))
+        let line = UX.resultLine(.container, "web_1", verb: .stop, elapsed: 1.5)
+        XCTAssertEqual(line, "web_1",
+            "non-TTY callers (pipe to xargs etc.) must get the bare name for script compat")
+    }
+
+    func testCreatedLineTTYBranchProducesActionLine() {
+        UX.TTY.set(.init(isInteractive: true, colorEnabled: false, animationEnabled: false))
+        let line = UX.createdLine(.network, "myapp_default", elapsed: 0.1)
+        XCTAssertTrue(line.contains("Created"))
+        XCTAssertTrue(line.contains("myapp_default"))
+    }
+
+    func testCreatedLineScriptBranchEmitsBareName() {
+        UX.TTY.set(.init(isInteractive: false, colorEnabled: false, animationEnabled: false))
+        let line = UX.createdLine(.network, "myapp_default")
+        XCTAssertEqual(line, "myapp_default")
+    }
+
     func testActionLineConvenienceHelpers() {
         // Don't assert byte-exact ; assert each helper produces the expected
         // verb-form so the right past/present came out of the verb table.

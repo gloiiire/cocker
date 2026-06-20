@@ -1230,15 +1230,27 @@ struct DaemonStatusCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let paths = defaultPaths()
+
+        // Charter §13.4 — single action line for the daemon's state, then
+        // a tree of dim sub-lines (launchd plist, log path, socket, leases,
+        // helper). The user sees the headline in 3 chars (icon + verb) and
+        // can dig into details below.
+
         guard let pid = readPID(paths.pidFile) else {
-            print("● cockerd is not running")
-            print("  → cocker daemon start")
+            print(UX.ActionLine(
+                icon: .item, type: .daemon, name: "cockerd",
+                status: "Not running"
+            ).render())
+            print("   " + UX.TTY.paint("hint    :", .dim) + " cocker daemon start")
             return
         }
         if !isAlive(pid) {
-            print("✗ cockerd is not running (stale pid file)")
+            UX.Failure.emit(
+                headline: "Daemon cockerd is not running",
+                reason: "stale pid file at \(paths.pidFile.path)",
+                hint: "run `cocker daemon start` to bring it back up"
+            )
             try? FileManager.default.removeItem(at: paths.pidFile)
-            print("  → cocker daemon start")
             return
         }
 
@@ -1247,45 +1259,51 @@ struct DaemonStatusCommand: AsyncParsableCommand {
         // proxy.
         let mtime = (try? FileManager.default.attributesOfItem(atPath: paths.pidFile.path)[.modificationDate]) as? Date
         let uptime = mtime.map { Date().timeIntervalSince($0) }
-
-        print("✓ cockerd is running")
-        print("  pid     \(pid)")
-        if let u = uptime {
+        let uptimeStr: String = {
+            guard let u = uptime else { return "" }
             let h = Int(u) / 3600, m = (Int(u) % 3600) / 60, s = Int(u) % 60
-            print("  uptime  \(String(format: "%02d:%02d:%02d", h, m, s))")
-        }
-        print("  log     \(paths.logFile.path)")
-        print("  ipc     \(paths.ipcSock.path)")
+            return ", uptime \(String(format: "%02d:%02d:%02d", h, m, s))"
+        }()
 
-        // Try a ping over the IPC socket to confirm it's accepting requests.
-        if FileManager.default.fileExists(atPath: paths.ipcSock.path) {
-            print("  socket  reachable")
-        } else {
-            print("  socket  MISSING — daemon may still be booting")
-        }
+        let trailing = "pid \(pid)\(uptimeStr)"
+        print(UX.ActionLine(
+            icon: .success, type: .daemon, name: "cockerd",
+            status: "Running", trailing: trailing
+        ).render())
 
-        // Lease pool + helper status. macOS's bootpd caps at ~256 ;
-        // we show the live count so the operator can spot saturation
-        // without having to `tail -f` the daemon log for the 30 s
-        // watchdog warnings. The helper line tells them which
-        // remediation command applies (one-shot vs. install-and-forget).
+        // Sub-lines — dim labels for "log", "ipc", "leases", "helper".
+        // Charter §12 names macOS daemons (launchd, bootpd) explicitly.
+        let plist = launchdPlistPath(for: paths.root)
+        if FileManager.default.fileExists(atPath: plist.path) {
+            print("   " + UX.TTY.paint("launchd :", .dim) + " " + plist.path)
+        }
+        print("   " + UX.TTY.paint("log     :", .dim) + " " + paths.logFile.path)
+        let socketState = FileManager.default.fileExists(atPath: paths.ipcSock.path)
+            ? UX.TTY.paint("reachable", .success)
+            : UX.TTY.paint("MISSING (daemon may still be booting)", .warn)
+        print("   " + UX.TTY.paint("ipc     :", .dim) + " " + paths.ipcSock.path + " — " + socketState)
+
+        // Lease pool + helper status (vmnet bootpd caps at ~256). Operator
+        // spots saturation without having to tail the daemon log.
         let leaseFile = "/var/db/dhcpd_leases"
         if let leases = try? String(contentsOfFile: leaseFile, encoding: .utf8) {
             let count = leases.components(separatedBy: "ip_address=").count - 1
+            let leaseColor: UX.Color
             let marker: String
             switch count {
-            case 0..<200:  marker = "OK"
-            case 200..<240: marker = "elevated"
-            case 240..<252: marker = "WARNING"
-            default:       marker = "SATURATED"
+            case 0..<200:   leaseColor = .success; marker = "OK"
+            case 200..<240: leaseColor = .warn;    marker = "elevated"
+            case 240..<252: leaseColor = .warn;    marker = "WARNING"
+            default:        leaseColor = .failure; marker = "SATURATED"
             }
-            print("  leases  \(count)/256 (\(marker))")
+            let body = "\(count)/256 (" + UX.TTY.paint(marker, leaseColor) + ")"
+            print("   " + UX.TTY.paint("leases  :", .dim) + " " + body)
         }
         let helperPath = "/Library/LaunchDaemons/com.cocker.leases-helper.plist"
         if FileManager.default.fileExists(atPath: helperPath) {
-            print("  helper  installed (auto-clears at >200 leases)")
+            print("   " + UX.TTY.paint("helper  :", .dim) + " " + UX.TTY.paint("installed", .success) + " (auto-clears at >200 leases)")
         } else {
-            print("  helper  not installed — `cocker daemon helper-install` to fix forever")
+            print("   " + UX.TTY.paint("helper  :", .dim) + " " + UX.TTY.paint("not installed", .dim) + " — `cocker daemon helper-install` to fix forever")
         }
     }
 }
@@ -1401,16 +1419,16 @@ struct LogColorizer {
         // accidentally mangling something we can't classify.
         guard let leveled = splitLevel(line) else { return line }
 
-        let timestamp = ANSI.colored(leveled.timestamp, ANSI.dim)
-        let levelColor: String
+        let timestamp = UX.TTY.paint(leveled.timestamp, .dim)
+        let levelColor: UX.Color
         switch leveled.level {
-        case "INFO":  levelColor = ANSI.green
-        case "WARN", "WARNING": levelColor = ANSI.yellow
-        case "ERROR", "FATAL":  levelColor = ANSI.red
-        case "DEBUG", "TRACE":  levelColor = ANSI.dim
-        default: levelColor = ANSI.reset
+        case "INFO":            levelColor = .success
+        case "WARN", "WARNING": levelColor = .warn
+        case "ERROR", "FATAL":  levelColor = .failure
+        case "DEBUG", "TRACE":  levelColor = .dim
+        default:                levelColor = .default
         }
-        let level = ANSI.colored(leveled.level.padding(toLength: 5, withPad: " ", startingAt: 0), levelColor)
+        let level = UX.TTY.paint(leveled.level.padding(toLength: 5, withPad: " ", startingAt: 0), levelColor)
         let rest = colorizeModule(in: leveled.rest)
         return "\(timestamp)  \(level)  \(rest)"
     }
@@ -1449,6 +1467,6 @@ struct LogColorizer {
         }
         let module = String(body[body.startIndex...close])
         let tail = String(body[body.index(after: close)...])
-        return ANSI.colored(module, ANSI.cyan) + tail
+        return UX.TTY.paint(module, .progress) + tail
     }
 }
