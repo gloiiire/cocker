@@ -1208,14 +1208,16 @@ extension VMRuntime {
     /// elapse, and tears down the connection unconditionally. Returns the
     /// child's exit code, or 1 on any transport/timeout failure.
     ///
-    /// **Known limitation** : Apple's VZVirtioSocketDevice.connect()
-    /// callback fails to fire when called repeatedly from a background
-    /// async context (the manual-exec path works because the AsyncStream's
-    /// iteration happens to keep the right queue alive). The probe will
-    /// reliably hit its `timeout` and the container's healthStatus flips
-    /// to `.unhealthy`. We keep the loop wired so future Apple updates
-    /// (or a workaround using a dedicated process-per-probe) drop in
-    /// cleanly without touching ContainerEngine.
+    /// **Known limitation** (Apple Virtualization.framework bug) :
+    /// VZVirtioSocketDevice.connect() callback fails to fire when called
+    /// repeatedly from a background async context. The probe will reliably
+    /// hit its `timeout` and the container's healthStatus flips to
+    /// `.unhealthy`. Healthchecks therefore go through the virtiofs file
+    /// protocol in ContainerEngine.runHealthcheckOnce (slower but reliable).
+    ///
+    /// Full bug report + repro + tracking : `docs/APPLE-FEEDBACK-VSOCK-CALLBACK.md`.
+    /// Once Apple ships a fix, drop the virtiofs `health_poll` worker and
+    /// wire ContainerEngine to call this function instead.
     func execProbe(containerID: String,
                    argv: [String],
                    timeout: TimeInterval) async -> Int32 {
