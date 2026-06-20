@@ -80,6 +80,35 @@ public extension UX {
         ActionLine(icon: .failure, type: type, name: name, status: status)
     }
 
+    // Build the string used by printResult — pretty action line on TTY,
+    // bare name otherwise. Public so tests can verify both branches
+    // without having to capture stdout.
+    static func resultLine(
+        _ type: ObjectType,
+        _ name: String,
+        verb: Verb,
+        elapsed: TimeInterval? = nil
+    ) -> String {
+        if UX.TTY.current.isInteractive {
+            return actionDone(type, name, verb: verb, elapsed: elapsed).render()
+        } else {
+            return name
+        }
+    }
+
+    // Counterpart for newly-created resources (`docker network create`).
+    static func createdLine(
+        _ type: ObjectType,
+        _ name: String,
+        elapsed: TimeInterval? = nil
+    ) -> String {
+        if UX.TTY.current.isInteractive {
+            return actionCreated(type, name, elapsed: elapsed).render()
+        } else {
+            return name
+        }
+    }
+
     // Print an "action complete" result. Pretty action line in a TTY, bare
     // name on stdout when piped — preserves Docker-style script composability
     // (`cocker stop x | xargs ...`) while giving humans the polished view.
@@ -89,11 +118,7 @@ public extension UX {
         verb: Verb,
         elapsed: TimeInterval? = nil
     ) {
-        if UX.TTY.current.isInteractive {
-            print(actionDone(type, name, verb: verb, elapsed: elapsed).render())
-        } else {
-            print(name)
-        }
+        print(resultLine(type, name, verb: verb, elapsed: elapsed))
     }
 
     // Same shape for a CREATED resource (returns id/name on creation, like
@@ -103,11 +128,7 @@ public extension UX {
         _ name: String,
         elapsed: TimeInterval? = nil
     ) {
-        if UX.TTY.current.isInteractive {
-            print(actionCreated(type, name, elapsed: elapsed).render())
-        } else {
-            print(name)
-        }
+        print(createdLine(type, name, elapsed: elapsed))
     }
 
     // "1.8s", "120ms", "1m 12s" — charter convention.
