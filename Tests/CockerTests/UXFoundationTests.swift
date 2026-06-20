@@ -272,4 +272,122 @@ final class UXFoundationTests: XCTestCase {
         XCTAssertEqual(UX.formatBytes(2048), "2.0 KB")
         XCTAssertEqual(UX.formatBytes(1024 * 1024 * 5), "5.0 MB")
     }
+
+    func testProgressBarFull() {
+        UX.TTY.set(.init(isInteractive: false, colorEnabled: false, animationEnabled: false))
+        let s = UX.ProgressBar.full(current: 5 * 1024 * 1024, total: 10 * 1024 * 1024)
+        XCTAssertTrue(s.contains("5.0 MB"))
+        XCTAssertTrue(s.contains("10.0 MB"))
+        XCTAssertTrue(s.contains("50%"))
+
+        let zero = UX.ProgressBar.full(current: 0, total: 0)
+        XCTAssertTrue(zero.contains("0 B"))
+    }
+
+    func testProgressBarBytesFormat() {
+        XCTAssertEqual(UX.ProgressBar.bytes(current: 1024, total: 2048), "1.0 KB / 2.0 KB")
+    }
+
+    // MARK: - LayerTracker
+
+    func testLayerTrackerPreservesInsertionOrder() {
+        let t = UX.LayerTracker()
+        t.update(layerID: "aaa", status: "Downloading", current: 50, total: 100)
+        t.update(layerID: "bbb", status: "Extracting", current: 100, total: 100)
+        t.update(layerID: "ccc", status: "Pulling")
+        let lines = t.render()
+        XCTAssertEqual(lines.count, 3)
+        // First line corresponds to the first inserted layer.
+        XCTAssertTrue(lines[0].contains("aaa"))
+        XCTAssertTrue(lines[1].contains("bbb"))
+        XCTAssertTrue(lines[2].contains("ccc"))
+    }
+
+    func testLayerTrackerUpdateInPlace() {
+        let t = UX.LayerTracker()
+        t.update(layerID: "abc", status: "Downloading", current: 10, total: 100)
+        t.update(layerID: "abc", status: "Downloading", current: 90, total: 100)
+        let lines = t.render()
+        XCTAssertEqual(lines.count, 1, "second update must not append a new line")
+    }
+
+    // MARK: - ActionLine helpers (the convenience constructors)
+
+    func testActionLineConvenienceHelpers() {
+        // Don't assert byte-exact ; assert each helper produces the expected
+        // verb-form so the right past/present came out of the verb table.
+        XCTAssertTrue(UX.actionStarted(.container, "x", elapsed: 1.0).render().contains("Started"))
+        XCTAssertTrue(UX.actionCreated(.network, "x").render().contains("Created"))
+        XCTAssertTrue(UX.actionRemoved(.volume, "x").render().contains("Removed"))
+        XCTAssertTrue(UX.actionRunning(.image, "x", verb: .pull).render().contains("Pulling"))
+        XCTAssertTrue(UX.actionDone(.image, "x", verb: .pull, elapsed: 2.5).render().contains("Pulled"))
+        XCTAssertTrue(UX.actionFailed(.container, "x", status: "Remove failed").render().contains("Remove failed"))
+    }
+
+    func testActionLineWithoutTypeStillRenders() {
+        let line = UX.ActionLine(icon: .item, name: "no_type", status: "ok").render()
+        XCTAssertTrue(line.contains("no_type"))
+        XCTAssertTrue(line.contains("ok"))
+    }
+
+    func testActionLineStatusColorOverride() {
+        UX.TTY.set(.init(isInteractive: true, colorEnabled: true, animationEnabled: true))
+        let line = UX.ActionLine(
+            icon: .success, type: .container, name: "x", status: "Running",
+            statusColor: .warn
+        ).render()
+        XCTAssertTrue(line.contains("\u{001B}[33m"), "explicit warn color override should produce yellow ANSI")
+    }
+
+    // MARK: - Modifier ANSI codes
+
+    func testModifierAnsiCodesPresent() {
+        XCTAssertEqual(UX.Modifier.bold.ansi, "\u{001B}[1m")
+        XCTAssertEqual(UX.Modifier.dim.ansi, "\u{001B}[2m")
+        XCTAssertEqual(UX.Modifier.italic.ansi, "\u{001B}[3m")
+        XCTAssertEqual(UX.Modifier.underline.ansi, "\u{001B}[4m")
+    }
+
+    func testIconColorPairings() {
+        // Spot-check that each icon maps to a sane color.
+        XCTAssertEqual(UX.Icon.success.color, .success)
+        XCTAssertEqual(UX.Icon.failure.color, .failure)
+        XCTAssertEqual(UX.Icon.warn.color, .warn)
+        XCTAssertEqual(UX.Icon.restart.color, .restart)
+        XCTAssertEqual(UX.Icon.action.color, .progress)
+    }
+
+    // MARK: - Warning emitter
+
+    func testWarningRender() {
+        UX.TTY.set(.init(isInteractive: false, colorEnabled: false, animationEnabled: false))
+        let out = UX.Warning.render("deprecated flag", note: "use --new instead")
+        XCTAssertTrue(out.contains("⚠"))
+        XCTAssertTrue(out.contains("deprecated flag"))
+        XCTAssertTrue(out.contains("use --new instead"))
+        XCTAssertEqual(out.split(separator: "\n").count, 2)
+
+        let bare = UX.Warning.render("just a warning")
+        XCTAssertEqual(bare.split(separator: "\n").count, 1)
+    }
+
+    // MARK: - Stream paint
+
+    func testStreamPaintStdoutUnchanged() {
+        UX.TTY.set(.init(isInteractive: true, colorEnabled: true, animationEnabled: true))
+        XCTAssertEqual(UX.Stream.paint("hello", stream: .stdout), "hello")
+    }
+
+    func testServicePaletteColorRotationCoversAllSlots() {
+        // Hit every palette slot by manufacturing inputs ; verifies the
+        // modulo wrap is functional and no slot is dead.
+        var seen = Set<UX.Color>()
+        for i in 0..<256 {
+            let c = UX.Stream.serviceColor(for: "svc_\(i)")
+            seen.insert(c)
+            if seen.count == UX.Stream.servicePalette.count { break }
+        }
+        XCTAssertEqual(seen.count, UX.Stream.servicePalette.count,
+                       "256 names should be enough to touch every palette slot")
+    }
 }
