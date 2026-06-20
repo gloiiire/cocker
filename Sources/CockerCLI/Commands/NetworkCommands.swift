@@ -73,10 +73,28 @@ struct NetworkCreateCommand: AsyncParsableCommand {
         let driver = NetworkDriver(rawValue: self.driver) ?? .bridge
         let payload = NetworkCreateRequest(name: name, driver: driver, subnet: subnet, gateway: gateway)
         let client = IPCClient()
-        let request = try IPCRequest(type: .networkCreate, payload: payload)
-        let response = try await client.send(request)
-        let network = try response.decode(NetworkInfo.self)
-        print(network.id)
+        let start = Date()
+        do {
+            let request = try IPCRequest(type: .networkCreate, payload: payload)
+            let response = try await client.send(request)
+            let network = try response.decode(NetworkInfo.self)
+            if UX.TTY.current.isInteractive {
+                let trailing = UX.TTY.paint(String(network.id.prefix(12)), .accent) + " · " + UX.formatElapsed(Date().timeIntervalSince(start))
+                print(UX.ActionLine(
+                    icon: .success, type: .network, name: network.name,
+                    status: "Created", trailing: trailing
+                ).render())
+            } else {
+                print(network.id)
+            }
+        } catch let error as CockerError {
+            UX.Failure.emit(
+                headline: "Cannot create network \(name)",
+                reason: error.description,
+                hint: "another network may already be named `\(name)` — `cocker network ls`"
+            )
+            throw ExitCode.failure
+        }
     }
 }
 
@@ -89,13 +107,17 @@ struct NetworkRmCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let client = IPCClient()
         for name in networks {
-            let payload = ContainerIDRequest(id: name)
-            let request = try IPCRequest(type: .networkRm, payload: payload)
+            let start = Date()
             do {
+                let request = try IPCRequest(type: .networkRm, payload: ContainerIDRequest(id: name))
                 _ = try await client.send(request)
-                print(name)
+                UX.printResult(.network, name, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                fputs("Error: \(error.description)\n", stderr)
+                UX.Failure.emit(
+                    headline: "Cannot remove network \(name)",
+                    reason: error.description,
+                    hint: "disconnect attached containers first — `cocker network inspect \(name)`"
+                )
             }
         }
     }
@@ -135,8 +157,24 @@ struct NetworkConnectCommand: AsyncParsableCommand {
     mutating func run() async throws {
         struct Payload: Codable, Sendable { let network, container: String }
         let client = IPCClient()
-        let request = try IPCRequest(type: .networkConnect, payload: Payload(network: network, container: container))
-        _ = try await client.send(request)
+        let start = Date()
+        do {
+            let request = try IPCRequest(type: .networkConnect, payload: Payload(network: network, container: container))
+            _ = try await client.send(request)
+            if UX.TTY.current.isInteractive {
+                let trailing = "→ " + UX.TTY.paint(network, .accent) + " · " + UX.formatElapsed(Date().timeIntervalSince(start))
+                print(UX.ActionLine(
+                    icon: .success, type: .container, name: container,
+                    status: "Connected", trailing: trailing
+                ).render())
+            }
+        } catch let error as CockerError {
+            UX.Failure.emit(
+                headline: "Cannot connect \(container) to \(network)",
+                reason: error.description
+            )
+            throw ExitCode.failure
+        }
     }
 }
 
@@ -155,7 +193,24 @@ struct NetworkDisconnectCommand: AsyncParsableCommand {
     mutating func run() async throws {
         struct Payload: Codable, Sendable { let network, container: String }
         let client = IPCClient()
-        let request = try IPCRequest(type: .networkDisconnect, payload: Payload(network: network, container: container))
-        _ = try await client.send(request)
+        let start = Date()
+        do {
+            let request = try IPCRequest(type: .networkDisconnect, payload: Payload(network: network, container: container))
+            _ = try await client.send(request)
+            if UX.TTY.current.isInteractive {
+                let trailing = "from " + UX.TTY.paint(network, .accent) + " · " + UX.formatElapsed(Date().timeIntervalSince(start))
+                print(UX.ActionLine(
+                    icon: .success, type: .container, name: container,
+                    status: "Disconnected", trailing: trailing
+                ).render())
+            }
+        } catch let error as CockerError {
+            UX.Failure.emit(
+                headline: "Cannot disconnect \(container) from \(network)",
+                reason: error.description,
+                hint: force ? nil : "use `--force` (-f) if the container is unresponsive"
+            )
+            throw ExitCode.failure
+        }
     }
 }

@@ -28,7 +28,7 @@ struct LoginCommand: AsyncParsableCommand {
             print("Username: ", terminator: "")
             fflush(stdout)
             guard let u = readLine()?.trimmingCharacters(in: .whitespaces), !u.isEmpty else {
-                fputs("Error: username cannot be empty\n", stderr)
+                UX.Failure.emit(headline: "Login failed", reason: "username cannot be empty")
                 throw ExitCode.failure
             }
             user = u
@@ -37,7 +37,7 @@ struct LoginCommand: AsyncParsableCommand {
         let pass: String
         if passwordStdin {
             guard let p = readLine()?.trimmingCharacters(in: .newlines), !p.isEmpty else {
-                fputs("Error: password cannot be empty\n", stderr)
+                UX.Failure.emit(headline: "Login failed", reason: "password cannot be empty")
                 throw ExitCode.failure
             }
             pass = p
@@ -58,7 +58,7 @@ struct LoginCommand: AsyncParsableCommand {
             try? sttyOn.run(); sttyOn.waitUntilExit()
             print("")
             guard !p.isEmpty else {
-                fputs("Error: password cannot be empty\n", stderr)
+                UX.Failure.emit(headline: "Login failed", reason: "password cannot be empty")
                 throw ExitCode.failure
             }
             pass = p
@@ -68,7 +68,14 @@ struct LoginCommand: AsyncParsableCommand {
         store.credentials[server] = CredentialStore.Credential(username: user, password: pass)
         try store.save()
 
-        print("Login Succeeded — credentials saved for \(server)")
+        if UX.TTY.current.isInteractive {
+            print(UX.ActionLine(
+                icon: .success, name: server,
+                status: "Logged in", trailing: "user " + UX.TTY.paint(user, .accent)
+            ).render())
+        } else {
+            print(server)
+        }
     }
 }
 
@@ -85,9 +92,15 @@ struct LogoutCommand: AsyncParsableCommand {
         var store = CredentialStore.load()
         if store.credentials.removeValue(forKey: server) != nil {
             try store.save()
-            print("Removed login credentials for \(server)")
+            if UX.TTY.current.isInteractive {
+                print(UX.ActionLine(
+                    icon: .success, name: server, status: "Logged out"
+                ).render())
+            } else {
+                print(server)
+            }
         } else {
-            print("Not logged in to \(server)")
+            UX.Warning.emit("Not logged in to \(server)", note: "no credentials to remove")
         }
     }
 }

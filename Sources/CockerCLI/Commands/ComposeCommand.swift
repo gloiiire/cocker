@@ -70,7 +70,9 @@ struct ComposeUpCommand: AsyncParsableCommand {
         // for the lifetime of the container — that's why the staging
         // dir is persistent, not /tmp ephemeral.
         let stage = try await ICloudStaging.stageIfNeeded(originalPath: originalPath) { msg in
-            print(ANSI.colored(msg, ANSI.cyan))
+            // Charter §12 — name the macOS daemon (bird) explicitly so the
+            // operator understands what's delaying their first compose up.
+            print(" " + UX.TTY.paint("→ bird (iCloud) " + msg, .progress))
         }
 
         // If we staged to /tmp, ComposeEngine would infer the project name
@@ -126,8 +128,8 @@ private func renderComposeEvent(_ event: StreamEvent) {
     switch event.stream {
     case .stdout: print(event.data, terminator: "")
     case .stderr: fputs(event.data, stderr)
-    case .status: print(ANSI.colored(event.data, ANSI.cyan))
-    case .error: fputs("Error: \(event.data)\n", stderr)
+    case .status: print(UX.TTY.paint(event.data, .progress))
+    case .error:  UX.Failure.emit(headline: event.data)
     }
 }
 
@@ -181,16 +183,25 @@ struct ComposeLsCommand: AsyncParsableCommand {
             return
         }
 
-        let columns: [TableFormatter.Column] = [
-            .init("NAME", min: 20),
-            .init("STATUS", min: 12),
-            .init("CONFIG FILES", min: 30),
-            .init("SERVICES", min: 10),
-        ]
-        let rows = result.projects.map { p -> [String] in [
-            p.name, p.status, p.configFiles, "\(p.servicesCount)"
-        ]}
-        print(TableFormatter.format(columns: columns, rows: rows))
+        let rows: [UX.Table.Row] = result.projects.map { p in
+            .init([
+                .init(p.name),
+                .init(p.status, color: p.status.lowercased().contains("run") ? .success : .dim),
+                .init(p.configFiles, color: .dim),
+                .init("\(p.servicesCount)", color: .accent),
+            ])
+        }
+        let table = UX.Table(
+            columns: [
+                .init("NAME"),
+                .init("STATUS"),
+                .init("CONFIG FILES"),
+                .init("SERVICES", align: .right),
+            ],
+            rows: rows,
+            emptyMessage: "no compose projects — run `cocker compose up` to start one"
+        )
+        print(table.render())
     }
 }
 
@@ -323,7 +334,11 @@ struct ComposeExecCommand: AsyncParsableCommand {
         let containers = try psResponse.decode(PSResponse.self).containers
 
         guard let container = containers.first else {
-            fputs("Error: No container found for service '\(service)' in project '\(pName)'\n", stderr)
+            UX.Failure.emit(
+                headline: "Cannot exec into service \(service)",
+                reason: "no container found for project '\(pName)'",
+                hint: "run `cocker compose ps` to see live services"
+            )
             throw ExitCode.failure
         }
 
@@ -373,8 +388,8 @@ struct ComposeRunCommand: AsyncParsableCommand {
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: fputs(event.data, stderr)
-            case .status: print(ANSI.colored(event.data, ANSI.cyan))
-            case .error: fputs("Error: \(event.data)\n", stderr)
+            case .status: print(UX.TTY.paint(event.data, .progress))
+            case .error:  UX.Failure.emit(headline: event.data)
             }
         }
     }
@@ -405,8 +420,8 @@ struct ComposeBuildCommand: AsyncParsableCommand {
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: fputs(event.data, stderr)
-            case .status: print(ANSI.colored(event.data, ANSI.cyan))
-            case .error: fputs("Error: \(event.data)\n", stderr)
+            case .status: print(UX.TTY.paint(event.data, .progress))
+            case .error:  UX.Failure.emit(headline: event.data)
             }
         }
     }
@@ -434,8 +449,8 @@ struct ComposePullCommand: AsyncParsableCommand {
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: fputs(event.data, stderr)
-            case .status: print(ANSI.colored(event.data, ANSI.cyan))
-            case .error: fputs("Error: \(event.data)\n", stderr)
+            case .status: print(UX.TTY.paint(event.data, .progress))
+            case .error:  UX.Failure.emit(headline: event.data)
             }
         }
     }
@@ -551,7 +566,11 @@ struct ComposeConfigCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let composePath = resolvePath(file)
         guard FileManager.default.fileExists(atPath: composePath) else {
-            fputs("Error: compose file not found: \(composePath)\n", stderr)
+            UX.Failure.emit(
+                headline: "Compose file not found",
+                reason: "no file at \(composePath)",
+                hint: "pass `-f <path>` or run from a directory containing cocker-compose.yml"
+            )
             throw ExitCode.failure
         }
         let content = try String(contentsOfFile: composePath, encoding: .utf8)
@@ -672,19 +691,30 @@ struct ComposePortCommand: AsyncParsableCommand {
         let allContainers = try psResp.decode(PSResponse.self).containers
 
         guard let container = allContainers.first(where: { $0.labels["com.cocker.service"] == service }) else {
-            fputs("Error: no running container for service '\(service)' in project '\(pName)'\n", stderr)
+            UX.Failure.emit(
+                headline: "Cannot resolve port for service \(service)",
+                reason: "no running container in project '\(pName)'",
+                hint: "run `cocker compose ps` to see live services"
+            )
             throw ExitCode.failure
         }
 
         guard let port = UInt16(privatePort) else {
-            fputs("Error: invalid port: \(privatePort)\n", stderr)
+            UX.Failure.emit(
+                headline: "Invalid port: \(privatePort)",
+                reason: "must be a TCP/UDP port number between 1 and 65535"
+            )
             throw ExitCode.failure
         }
 
         if let mapping = container.ports.first(where: { $0.containerPort == port && $0.proto.rawValue == proto }) {
             print("0.0.0.0:\(mapping.hostPort)")
         } else {
-            fputs("Error: port \(privatePort)/\(proto) not published for service '\(service)'\n", stderr)
+            UX.Failure.emit(
+                headline: "Port \(privatePort)/\(proto) not published for service \(service)",
+                reason: "this container has no host-side mapping for that port",
+                hint: "check the service's `ports:` block in your compose file"
+            )
             throw ExitCode.failure
         }
     }

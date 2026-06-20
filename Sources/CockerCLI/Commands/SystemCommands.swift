@@ -64,10 +64,10 @@ struct VersionCommand: AsyncParsableCommand {
             print("  Built:       \(s.buildTime)")
             print("  Engine:      Apple Virtualization.framework")
             if s.version != CockerVersion.version {
-                fputs(ANSI.colored(
-                    "\nWarning: client \(CockerVersion.version) ≠ daemon \(s.version). " +
-                    "Some commands may behave unexpectedly until both halves are upgraded.\n",
-                    ANSI.yellow), stderr)
+                UX.Warning.emit(
+                    "client \(CockerVersion.version) ≠ daemon \(s.version)",
+                    note: "some commands may behave unexpectedly until both halves are upgraded"
+                )
             }
         } else {
             print("Server:        not reachable (cockerd not running ?)")
@@ -123,34 +123,26 @@ struct SystemPruneCommand: AsyncParsableCommand {
     var volumes = false
 
     mutating func run() async throws {
-        if !force {
-            print("WARNING! This will remove:")
-            print("  - all stopped containers")
-            print("  - all dangling images")
-            if volumes { print("  - all volumes not used by at least one container") }
-            print("Are you sure you want to continue? [y/N] ", terminator: "")
-            let answer = readLine()?.lowercased() ?? "n"
-            guard answer == "y" || answer == "yes" else { return }
-        }
+        let summary = volumes
+            ? "This will remove all stopped containers, dangling images, AND unreferenced volumes."
+            : "This will remove all stopped containers and dangling images."
+        guard UX.Confirm.ask(summary: summary, force: force) else { return }
 
         let client = IPCClient()
         let request = try IPCRequest(type: .prune, payload: PruneRequest(volumes: volumes))
         let response = try await client.send(request)
         let result = try response.decode(PruneResponse.self)
 
-        if !result.containersDeleted.isEmpty {
-            print("Deleted containers:")
-            result.containersDeleted.forEach { print("  \($0)") }
+        for c in result.containersDeleted { UX.printResult(.container, c, verb: .remove) }
+        for i in result.imagesDeleted     { UX.printResult(.image, i, verb: .remove) }
+        for v in result.volumesDeleted    { UX.printResult(.volume, v, verb: .remove) }
+
+        let nothing = result.containersDeleted.isEmpty && result.imagesDeleted.isEmpty && result.volumesDeleted.isEmpty
+        if nothing {
+            print(" " + UX.TTY.paint("nothing to prune — 0 B reclaimed", .dim, [.italic]))
+        } else {
+            print(" " + UX.TTY.paint("reclaimed \(UX.formatBytes(Int64(result.spaceReclaimed)))", .dim))
         }
-        if !result.imagesDeleted.isEmpty {
-            print("Deleted images:")
-            result.imagesDeleted.forEach { print("  \($0)") }
-        }
-        if !result.volumesDeleted.isEmpty {
-            print("Deleted volumes:")
-            result.volumesDeleted.forEach { print("  \($0)") }
-        }
-        print("Total reclaimed space: \(formatBytes(result.spaceReclaimed))")
     }
 }
 

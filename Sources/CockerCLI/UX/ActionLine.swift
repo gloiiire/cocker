@@ -80,6 +80,36 @@ public extension UX {
         ActionLine(icon: .failure, type: type, name: name, status: status)
     }
 
+    // Print an "action complete" result. Pretty action line in a TTY, bare
+    // name on stdout when piped — preserves Docker-style script composability
+    // (`cocker stop x | xargs ...`) while giving humans the polished view.
+    static func printResult(
+        _ type: ObjectType,
+        _ name: String,
+        verb: Verb,
+        elapsed: TimeInterval? = nil
+    ) {
+        if UX.TTY.current.isInteractive {
+            print(actionDone(type, name, verb: verb, elapsed: elapsed).render())
+        } else {
+            print(name)
+        }
+    }
+
+    // Same shape for a CREATED resource (returns id/name on creation, like
+    // `docker network create`). The non-TTY branch prints the bare id.
+    static func printCreated(
+        _ type: ObjectType,
+        _ name: String,
+        elapsed: TimeInterval? = nil
+    ) {
+        if UX.TTY.current.isInteractive {
+            print(actionCreated(type, name, elapsed: elapsed).render())
+        } else {
+            print(name)
+        }
+    }
+
     // "1.8s", "120ms", "1m 12s" — charter convention.
     static func formatElapsed(_ d: TimeInterval) -> String {
         if d < 1.0 { return String(format: "%dms", Int(d * 1000)) }

@@ -73,7 +73,8 @@ public extension UX {
     enum Verb: Sendable, CaseIterable {
         case start, stop, build, pull, push, remove, create, connect,
              disconnect, restart, pause, unpause, commit, export, importTar,
-             rebuild, tag, save, load, inspect
+             rebuild, tag, save, load, inspect, rename, kill, copy, prune,
+             login, logout, enable, disable, install, update, deploy, scale
 
         public var present: String {
             switch self {
@@ -97,6 +98,18 @@ public extension UX {
             case .save:       return "Saving"
             case .load:       return "Loading"
             case .inspect:    return "Inspecting"
+            case .rename:     return "Renaming"
+            case .kill:       return "Killing"
+            case .copy:       return "Copying"
+            case .prune:      return "Pruning"
+            case .login:      return "Logging in"
+            case .logout:     return "Logging out"
+            case .enable:     return "Enabling"
+            case .disable:    return "Disabling"
+            case .install:    return "Installing"
+            case .update:     return "Updating"
+            case .deploy:     return "Deploying"
+            case .scale:      return "Scaling"
             }
         }
 
@@ -122,6 +135,18 @@ public extension UX {
             case .save:       return "Saved"
             case .load:       return "Loaded"
             case .inspect:    return "Inspected"
+            case .rename:     return "Renamed"
+            case .kill:       return "Killed"
+            case .copy:       return "Copied"
+            case .prune:      return "Pruned"
+            case .login:      return "Logged in"
+            case .logout:     return "Logged out"
+            case .enable:     return "Enabled"
+            case .disable:    return "Disabled"
+            case .install:    return "Installed"
+            case .update:     return "Updated"
+            case .deploy:     return "Deployed"
+            case .scale:      return "Scaled"
             }
         }
     }

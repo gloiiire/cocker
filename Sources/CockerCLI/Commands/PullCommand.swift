@@ -15,9 +15,10 @@ struct PullCommand: AsyncParsableCommand {
     var image: String
 
     mutating func run() async throws {
-        print("Pulling \(ANSI.colored(image, ANSI.cyan)) from registry...")
+        print(" " + UX.TTY.paint("→ Pulling", .progress) + " " + UX.TTY.paint(image, .accent) + " " + UX.TTY.paint("from registry", .dim))
 
         let client = IPCClient()
+        let start = Date()
         let payload = PullRequest(reference: image, platform: platform)
         let request = try IPCRequest(type: .pull, payload: payload)
 
@@ -45,12 +46,12 @@ struct PullCommand: AsyncParsableCommand {
                     reporter.update(buf.states)
                 }
             } else if event.stream == .error {
-                fputs("\nError: \(event.data)\n", stderr)
+                UX.Failure.emit(headline: event.data)
             }
         }
 
         reporter.done()
-        print("\nStatus: Image is up to date for \(ANSI.colored(image, ANSI.cyan))")
+        UX.printResult(.image, image, verb: .pull, elapsed: Date().timeIntervalSince(start))
     }
 }
 
@@ -64,18 +65,19 @@ struct PushCommand: AsyncParsableCommand {
     var image: String
 
     mutating func run() async throws {
-        print("Pushing \(ANSI.colored(image, ANSI.cyan))...")
+        print(" " + UX.TTY.paint("→ Pushing", .progress) + " " + UX.TTY.paint(image, .accent))
         let client = IPCClient()
+        let start = Date()
         let payload = PullRequest(reference: image)
         let request = try IPCRequest(type: .push, payload: payload)
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: fputs(event.data, stderr)
-            case .status: print(ANSI.colored(event.data, ANSI.cyan))
-            case .error: fputs("Error: \(event.data)\n", stderr)
+            case .status: print(UX.TTY.paint(event.data, .progress))
+            case .error:  UX.Failure.emit(headline: event.data)
             }
         }
-        print("Successfully pushed \(image)")
+        UX.printResult(.image, image, verb: .push, elapsed: Date().timeIntervalSince(start))
     }
 }

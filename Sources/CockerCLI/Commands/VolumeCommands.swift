@@ -64,10 +64,20 @@ struct VolumeCreateCommand: AsyncParsableCommand {
         let volumeName = name ?? UUID().uuidString.prefix(12).lowercased()
         let payload = VolumeCreateRequest(name: String(volumeName), driver: driver)
         let client = IPCClient()
-        let request = try IPCRequest(type: .volumeCreate, payload: payload)
-        let response = try await client.send(request)
-        let vol = try response.decode(VolumeInfo.self)
-        print(vol.name)
+        let start = Date()
+        do {
+            let request = try IPCRequest(type: .volumeCreate, payload: payload)
+            let response = try await client.send(request)
+            let vol = try response.decode(VolumeInfo.self)
+            UX.printCreated(.volume, vol.name, elapsed: Date().timeIntervalSince(start))
+        } catch let error as CockerError {
+            UX.Failure.emit(
+                headline: "Cannot create volume",
+                reason: error.description,
+                hint: "another volume may already be named `\(volumeName)` — `cocker volume ls`"
+            )
+            throw ExitCode.failure
+        }
     }
 }
 
@@ -83,13 +93,17 @@ struct VolumeRmCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let client = IPCClient()
         for name in volumes {
-            let payload = ContainerIDRequest(id: name)
-            let request = try IPCRequest(type: .volumeRm, payload: payload)
+            let start = Date()
             do {
+                let request = try IPCRequest(type: .volumeRm, payload: ContainerIDRequest(id: name))
                 _ = try await client.send(request)
-                print(name)
+                UX.printResult(.volume, name, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                fputs("Error: \(error.description)\n", stderr)
+                UX.Failure.emit(
+                    headline: "Cannot remove volume \(name)",
+                    reason: error.description,
+                    hint: "the volume may be in use — `cocker volume inspect \(name)`"
+                )
                 if !force { throw error }
             }
         }
@@ -125,12 +139,10 @@ struct VolumePruneCommand: AsyncParsableCommand {
     var force = false
 
     mutating func run() async throws {
-        if !force {
-            print("WARNING! This will remove all volumes not used by at least one container.")
-            print("Are you sure you want to continue? [y/N] ", terminator: "")
-            let answer = readLine()?.lowercased() ?? "n"
-            guard answer == "y" || answer == "yes" else { return }
-        }
+        guard UX.Confirm.ask(
+            summary: "This will remove all volumes not used by at least one container.",
+            force: force
+        ) else { return }
 
         let client = IPCClient()
         let payload = PruneRequest(volumes: true)
@@ -139,10 +151,12 @@ struct VolumePruneCommand: AsyncParsableCommand {
         let result = try response.decode(PruneResponse.self)
 
         if result.volumesDeleted.isEmpty {
-            print("Total reclaimed space: 0 B")
+            print(" " + UX.TTY.paint("nothing to prune — 0 B reclaimed", .dim, [.italic]))
         } else {
-            result.volumesDeleted.forEach { print("Deleted volumes: \($0)") }
-            print("Total reclaimed space: \(formatBytes(result.spaceReclaimed))")
+            for v in result.volumesDeleted {
+                UX.printResult(.volume, v, verb: .remove)
+            }
+            print(" " + UX.TTY.paint("reclaimed \(UX.formatBytes(Int64(result.spaceReclaimed)))", .dim))
         }
     }
 }
