@@ -173,20 +173,33 @@ struct BuildCommand: AsyncParsableCommand {
         config.target = target
         config.platform = platform
 
-        // Full sticky BuildKit-style UI is PR #3 ; for PR #2 we just clean up
-        // the inline ANSI codes and route status through the UX gate.
-        print(" " + UX.TTY.paint("→ Building", .progress) + " " + UX.TTY.paint(config.tag, .accent) + " " + UX.TTY.paint("from \(absContext)/\(file)", .dim))
-
         let client = IPCClient()
         let payload = BuildRequest(config: config)
         let request = try IPCRequest(type: .build, payload: payload)
 
-        try await client.sendStreaming(request) { event in
-            switch event.stream {
-            case .stdout: print(event.data, terminator: "")
-            case .stderr: fputs(event.data, stderr)
-            case .status: print(UX.TTY.paint(event.data, .progress))
-            case .error:  UX.Failure.emit(headline: event.data)
+        // Charter §13.3 — when stdout is a TTY, route every event through
+        // a BuildView that maintains a redraw-in-place table (one row per
+        // Dockerfile step, CACHED marker, per-step timer, final summary).
+        // Outside a TTY (CI, file redirect, pipe) fall back to plain
+        // chronological prints so logs and grep tooling stay clean.
+        if UX.TTY.current.animationEnabled {
+            let view = UX.BuildView()
+            // Pre-header so users see "what is being built" before the
+            // first Step event arrives from the daemon.
+            print(" " + UX.TTY.paint("→ Building", .progress) + " " + UX.TTY.paint(config.tag, .accent) + " " + UX.TTY.paint("from \(absContext)/\(file)", .dim))
+            try await client.sendStreaming(request) { event in
+                view.ingest(stream: event.stream, line: event.data)
+            }
+            view.finalize()
+        } else {
+            print(" → Building \(config.tag) from \(absContext)/\(file)")
+            try await client.sendStreaming(request) { event in
+                switch event.stream {
+                case .stdout: print(event.data, terminator: "")
+                case .stderr: fputs(event.data, stderr)
+                case .status: print(event.data, terminator: event.data.hasSuffix("\n") ? "" : "\n")
+                case .error:  UX.Failure.emit(headline: event.data)
+                }
             }
         }
     }

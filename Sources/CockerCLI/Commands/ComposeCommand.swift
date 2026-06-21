@@ -88,13 +88,23 @@ struct ComposeUpCommand: AsyncParsableCommand {
         let payload = ComposeRequest(composePath: stage.path, projectName: effectiveProjectName, services: services, detach: detach)
         let request = try IPCRequest(type: .composeUp, payload: payload)
 
+        // Charter §13.1 — sticky multi-line table in TTY mode (one row per
+        // network/volume/container with live status + per-resource timer),
+        // chronological passthrough otherwise (CI, pipes, logs).
+        let view: UX.ComposeUpView? = UX.TTY.current.animationEnabled ? UX.ComposeUpView() : nil
+
         // `-d` short-circuits the interactive footer : the user explicitly
         // asked for background mode, so we just stream the build / start
         // progress and exit when the daemon says it's done.
         if detach {
             try await client.sendStreaming(request) { event in
-                renderComposeEvent(event)
+                if let view {
+                    view.ingest(stream: event.stream, line: event.data)
+                } else {
+                    renderComposeEvent(event)
+                }
             }
+            view?.finalize()
             return
         }
 
@@ -104,8 +114,13 @@ struct ComposeUpCommand: AsyncParsableCommand {
         // "Attached to N containers" experience.
         _ = try await InteractiveDetach.run { token in
             try await client.sendStreaming(request) { event in
-                renderComposeEvent(event)
+                if let view {
+                    view.ingest(stream: event.stream, line: event.data)
+                } else {
+                    renderComposeEvent(event)
+                }
             }
+            view?.finalize()
             // After the up call returns the daemon is done building &
             // starting. From here we attach to the project's running
             // containers' logs — implemented in a follow-up patch so
