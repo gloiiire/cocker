@@ -22,21 +22,25 @@ struct ContextLsCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let store = ContextStore.load()
-        let columns: [TableFormatter.Column] = [
-            .init("NAME", min: 16),
-            .init("DESCRIPTION", min: 24),
-            .init("DOCKER ENDPOINT", min: 40),
-            .init("CURRENT", min: 8),
-        ]
-        let rows = store.contexts.map { ctx -> [String] in
-            [
-                ctx.name,
-                ctx.description,
-                ctx.dockerHost,
-                ctx.name == store.current ? ANSI.colored("*", ANSI.green) : "",
-            ]
+        let rows: [UX.Table.Row] = store.contexts.map { ctx in
+            .init([
+                .init(ctx.name),
+                .init(ctx.description.isEmpty ? "—" : ctx.description, color: ctx.description.isEmpty ? .dim : .default),
+                .init(ctx.dockerHost, color: .dim),
+                .init(ctx.name == store.current ? "*" : "", color: .success),
+            ])
         }
-        print(TableFormatter.format(columns: columns, rows: rows))
+        let table = UX.Table(
+            columns: [
+                .init("NAME"),
+                .init("DESCRIPTION"),
+                .init("DOCKER ENDPOINT"),
+                .init("CURRENT"),
+            ],
+            rows: rows,
+            emptyMessage: "no contexts — run `cocker context create <name>` to add one"
+        )
+        print(table.render())
     }
 }
 
@@ -55,7 +59,11 @@ struct ContextCreateCommand: AsyncParsableCommand {
     mutating func run() async throws {
         var store = ContextStore.load()
         guard !store.contexts.contains(where: { $0.name == name }) else {
-            fputs("Error: context \(name) already exists\n", stderr)
+            UX.Failure.emit(
+                headline: "Cannot create context \(name)",
+                reason: "a context with this name already exists",
+                hint: "list existing ones with `cocker context ls`"
+            )
             throw ExitCode.failure
         }
         let host: String
@@ -69,7 +77,7 @@ struct ContextCreateCommand: AsyncParsableCommand {
         let ctx = CockerContext(name: name, description: description, dockerHost: host)
         store.contexts.append(ctx)
         try store.save()
-        print(name)
+        UX.printCreated(.context, name)
     }
 }
 
@@ -82,12 +90,23 @@ struct ContextUseCommand: AsyncParsableCommand {
     mutating func run() async throws {
         var store = ContextStore.load()
         guard store.contexts.contains(where: { $0.name == name }) else {
-            fputs("Error: context not found: \(name)\n", stderr)
+            UX.Failure.emit(
+                headline: "Cannot switch to context \(name)",
+                reason: "context not found",
+                hint: "list available contexts with `cocker context ls`"
+            )
             throw ExitCode.failure
         }
         store.current = name
         try store.save()
-        print("Current context is now \"\(name)\"")
+        if UX.TTY.current.isInteractive {
+            print(UX.ActionLine(
+                icon: .success, type: .context, name: name,
+                status: "Active", trailing: "current context updated"
+            ).render())
+        } else {
+            print(name)
+        }
     }
 }
 
@@ -101,12 +120,16 @@ struct ContextRmCommand: AsyncParsableCommand {
         var store = ContextStore.load()
         for name in names {
             guard name != "default" else {
-                fputs("Error: cannot remove default context\n", stderr)
+                UX.Failure.emit(
+                    headline: "Cannot remove context default",
+                    reason: "the default context cannot be removed",
+                    hint: "switch to it with `cocker context use default` if needed"
+                )
                 continue
             }
             store.contexts.removeAll { $0.name == name }
             if store.current == name { store.current = "default" }
-            print(name)
+            UX.printResult(.context, name, verb: .remove)
         }
         try store.save()
     }

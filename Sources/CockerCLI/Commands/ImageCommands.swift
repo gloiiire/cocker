@@ -69,13 +69,17 @@ struct RmiCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let client = IPCClient()
         for image in images {
-            let payload = ContainerIDRequest(id: image)
-            let request = try IPCRequest(type: .rmi, payload: payload)
+            let start = Date()
             do {
+                let request = try IPCRequest(type: .rmi, payload: ContainerIDRequest(id: image))
                 _ = try await client.send(request)
-                print("Deleted: \(image)")
+                UX.printResult(.image, image, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                fputs("Error: \(error.description)\n", stderr)
+                UX.Failure.emit(
+                    headline: "Cannot remove image \(image)",
+                    reason: error.description,
+                    hint: force ? nil : "use `--force` (-f) to remove an image referenced by stopped containers"
+                )
                 if !force { throw error }
             }
         }
@@ -98,8 +102,19 @@ struct TagCommand: AsyncParsableCommand {
         let client = IPCClient()
 
         struct TagPayload: Codable, Sendable { let source, target: String }
-        let request = try IPCRequest(type: .tag, payload: TagPayload(source: source, target: target))
-        _ = try await client.send(request)
+        let start = Date()
+        do {
+            let request = try IPCRequest(type: .tag, payload: TagPayload(source: source, target: target))
+            _ = try await client.send(request)
+            UX.printResult(.image, target, verb: .tag, elapsed: Date().timeIntervalSince(start))
+        } catch let error as CockerError {
+            UX.Failure.emit(
+                headline: "Cannot tag image",
+                reason: error.description,
+                hint: "verify source `\(source)` exists with `cocker images`"
+            )
+            throw ExitCode.failure
+        }
     }
 }
 
@@ -144,7 +159,10 @@ struct BuildCommand: AsyncParsableCommand {
         // uses ; benefits from the same incremental cache on repeat runs.
         let dockerfileFullPath = absContext + "/" + file
         let stage = try await ICloudStaging.stageIfNeeded(originalPath: dockerfileFullPath) { msg in
-            print(ANSI.colored(msg, ANSI.cyan))
+            // bird (iCloud) staging is one of the macOS-daemon touch-points
+            // the charter §12 says we name explicitly so users see what's
+            // happening behind a slow first build.
+            print(" " + UX.TTY.paint("→ bird (iCloud) " + msg, .progress))
         }
         let effectiveContext = (stage.path as NSString).deletingLastPathComponent
 
@@ -155,18 +173,33 @@ struct BuildCommand: AsyncParsableCommand {
         config.target = target
         config.platform = platform
 
-        print("Building \(ANSI.colored(config.tag, ANSI.cyan)) from \(absContext)/\(file)...")
-
         let client = IPCClient()
         let payload = BuildRequest(config: config)
         let request = try IPCRequest(type: .build, payload: payload)
 
-        try await client.sendStreaming(request) { event in
-            switch event.stream {
-            case .stdout: print(event.data, terminator: "")
-            case .stderr: fputs(event.data, stderr)
-            case .status: print(ANSI.colored(event.data, ANSI.cyan))
-            case .error: fputs("\nError: \(event.data)\n", stderr)
+        // Charter §13.3 — when stdout is a TTY, route every event through
+        // a BuildView that maintains a redraw-in-place table (one row per
+        // Dockerfile step, CACHED marker, per-step timer, final summary).
+        // Outside a TTY (CI, file redirect, pipe) fall back to plain
+        // chronological prints so logs and grep tooling stay clean.
+        if UX.TTY.current.animationEnabled {
+            let view = UX.BuildView()
+            // Pre-header so users see "what is being built" before the
+            // first Step event arrives from the daemon.
+            print(" " + UX.TTY.paint("→ Building", .progress) + " " + UX.TTY.paint(config.tag, .accent) + " " + UX.TTY.paint("from \(absContext)/\(file)", .dim))
+            try await client.sendStreaming(request) { event in
+                view.ingest(stream: event.stream, line: event.data)
+            }
+            view.finalize()
+        } else {
+            print(" → Building \(config.tag) from \(absContext)/\(file)")
+            try await client.sendStreaming(request) { event in
+                switch event.stream {
+                case .stdout: print(event.data, terminator: "")
+                case .stderr: fputs(event.data, stderr)
+                case .status: print(event.data, terminator: event.data.hasSuffix("\n") ? "" : "\n")
+                case .error:  UX.Failure.emit(headline: event.data)
+                }
             }
         }
     }
@@ -196,6 +229,7 @@ struct SaveCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        let start = Date()
         let payload = SaveRequest(image: image)
         let request = try IPCRequest(type: .save, payload: payload)
         let response = try await client.send(request)
@@ -203,7 +237,15 @@ struct SaveCommand: AsyncParsableCommand {
 
         let url = URL(fileURLWithPath: output.hasPrefix("/") ? output : FileManager.default.currentDirectoryPath + "/" + output)
         try result.tarData.write(to: url)
-        print("Image \(image) saved to \(output)")
+        if UX.TTY.current.isInteractive {
+            let trailing = "\(UX.formatBytes(Int64(result.tarData.count))) → \(output) · " + UX.formatElapsed(Date().timeIntervalSince(start))
+            print(UX.ActionLine(
+                icon: .success, type: .image, name: image,
+                status: "Saved", trailing: trailing
+            ).render())
+        } else {
+            print(output)
+        }
     }
 }
 
@@ -219,16 +261,21 @@ struct LoadCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let url = URL(fileURLWithPath: input.hasPrefix("/") ? input : FileManager.default.currentDirectoryPath + "/" + input)
         guard FileManager.default.fileExists(atPath: url.path) else {
-            fputs("Error: file not found: \(input)\n", stderr)
+            UX.Failure.emit(
+                headline: "Cannot load image archive",
+                reason: "file not found at \(input)",
+                hint: "verify the path — the CLI's current directory is \(FileManager.default.currentDirectoryPath)"
+            )
             throw ExitCode.failure
         }
         let tarData = try Data(contentsOf: url)
         let client = IPCClient()
+        let start = Date()
         let payload = LoadRequest(tarData: tarData)
         let request = try IPCRequest(type: .load, payload: payload)
         let response = try await client.send(request)
         let msg = try response.decode(String.self)
-        print(msg)
+        UX.printResult(.image, msg, verb: .load, elapsed: Date().timeIntervalSince(start))
     }
 }
 
@@ -286,12 +333,10 @@ struct ImagePruneCommand: AsyncParsableCommand {
     var force = false
 
     mutating func run() async throws {
-        if !force {
-            print("WARNING! This will remove all images not referenced by any container.")
-            print("Are you sure you want to continue? [y/N] ", terminator: "")
-            let answer = readLine()?.lowercased() ?? "n"
-            guard answer == "y" || answer == "yes" else { return }
-        }
+        guard UX.Confirm.ask(
+            summary: "This will remove all images not referenced by any container.",
+            force: force
+        ) else { return }
 
         let client = IPCClient()
         let request = try IPCRequest(type: .imagePrune, payload: EmptyPayload())
@@ -299,11 +344,12 @@ struct ImagePruneCommand: AsyncParsableCommand {
         let result = try response.decode(PruneResponse.self)
 
         if result.imagesDeleted.isEmpty {
-            print("Total reclaimed space: 0 B")
+            print(" " + UX.TTY.paint("nothing to prune — 0 B reclaimed", .dim, [.italic]))
         } else {
-            print("Deleted Images:")
-            result.imagesDeleted.forEach { print("untagged: \($0)") }
-            print("Total reclaimed space: \(formatBytes(result.spaceReclaimed))")
+            for img in result.imagesDeleted {
+                UX.printResult(.image, img, verb: .remove)
+            }
+            print(" " + UX.TTY.paint("reclaimed \(UX.formatBytes(Int64(result.spaceReclaimed)))", .dim))
         }
     }
 }
@@ -328,11 +374,21 @@ struct CommitCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        let start = Date()
         let payload = CommitRequest(containerID: container, tag: repository, author: author, message: message)
         let request = try IPCRequest(type: .commit, payload: payload)
         let response = try await client.send(request)
         let img = try response.decode(ImageInfo.self)
-        print(String(img.id.prefix(12)))
+        let shortID = String(img.id.prefix(12))
+        if UX.TTY.current.isInteractive {
+            let trailing = UX.TTY.paint(shortID, .accent) + " · " + UX.formatElapsed(Date().timeIntervalSince(start))
+            print(UX.ActionLine(
+                icon: .success, type: .image, name: repository,
+                status: "Committed", trailing: trailing
+            ).render())
+        } else {
+            print(shortID)
+        }
     }
 }
 
@@ -350,6 +406,7 @@ struct ExportCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        let start = Date()
         let payload = ExportRequest(containerID: container)
         let request = try IPCRequest(type: .export, payload: payload)
         let response = try await client.send(request)
@@ -358,7 +415,15 @@ struct ExportCommand: AsyncParsableCommand {
         if let outPath = output {
             let url = URL(fileURLWithPath: outPath.hasPrefix("/") ? outPath : FileManager.default.currentDirectoryPath + "/" + outPath)
             try result.tarData.write(to: url)
-            print("Container \(container) exported to \(outPath)")
+            if UX.TTY.current.isInteractive {
+                let trailing = "\(UX.formatBytes(Int64(result.tarData.count))) → \(outPath) · " + UX.formatElapsed(Date().timeIntervalSince(start))
+                print(UX.ActionLine(
+                    icon: .success, type: .container, name: container,
+                    status: "Exported", trailing: trailing
+                ).render())
+            } else {
+                print(outPath)
+            }
         } else {
             FileHandle.standardOutput.write(result.tarData)
         }
@@ -384,18 +449,32 @@ struct ImportCommand: AsyncParsableCommand {
         } else {
             let url = URL(fileURLWithPath: file.hasPrefix("/") ? file : FileManager.default.currentDirectoryPath + "/" + file)
             guard FileManager.default.fileExists(atPath: url.path) else {
-                fputs("Error: file not found: \(file)\n", stderr)
+                UX.Failure.emit(
+                    headline: "Cannot import image",
+                    reason: "file not found at \(file)",
+                    hint: "verify the path — the CLI's current directory is \(FileManager.default.currentDirectoryPath)"
+                )
                 throw ExitCode.failure
             }
             tarData = try Data(contentsOf: url)
         }
 
         let client = IPCClient()
+        let start = Date()
         let payload = ContainerImportRequest(tarData: tarData, tag: tag)
         let request = try IPCRequest(type: .containerImport, payload: payload)
         let response = try await client.send(request)
         let img = try response.decode(ImageInfo.self)
-        print("sha256:\(img.id.hasPrefix("sha256:") ? String(img.id.dropFirst(7)) : img.id)")
+        let sha = "sha256:\(img.id.hasPrefix("sha256:") ? String(img.id.dropFirst(7)) : img.id)"
+        if UX.TTY.current.isInteractive {
+            let trailing = UX.TTY.paint(String(sha.prefix(19)), .accent) + " · " + UX.formatElapsed(Date().timeIntervalSince(start))
+            print(UX.ActionLine(
+                icon: .success, type: .image, name: tag,
+                status: "Imported", trailing: trailing
+            ).render())
+        } else {
+            print(sha)
+        }
     }
 }
 
@@ -417,10 +496,17 @@ struct UpdateCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let client = IPCClient()
         for id in containers {
-            let payload = UpdateRequest(containerID: id, cpus: cpus, memoryMB: memory)
-            let request = try IPCRequest(type: .update, payload: payload)
-            _ = try await client.send(request)
-            print(id)
+            let start = Date()
+            do {
+                let request = try IPCRequest(type: .update, payload: UpdateRequest(containerID: id, cpus: cpus, memoryMB: memory))
+                _ = try await client.send(request)
+                UX.printResult(.container, id, verb: .update, elapsed: Date().timeIntervalSince(start))
+            } catch let error as CockerError {
+                UX.Failure.emit(
+                    headline: "Cannot update container \(id)",
+                    reason: error.description
+                )
+            }
         }
     }
 }

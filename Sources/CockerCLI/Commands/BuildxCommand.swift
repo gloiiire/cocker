@@ -198,16 +198,13 @@ struct BuildxBuildCommand: AsyncParsableCommand {
         // those yet. Native (`linux/arm64` on Apple Silicon) always works.
         let hostArch = "linux/arm64"  // Apple Silicon only
         for plat in platforms where plat != hostArch {
-            fputs(
-                "Warning: cross-arch build (\(plat)) requires qemu-user-static binaries " +
-                "inside the build rootfs at /opt/cocker/qemu/qemu-<arch>-static. " +
-                "Cocker doesn't bundle these yet — RUN steps with foreign binaries will fail. " +
-                "Native arch (\(hostArch)) always works.\n",
-                stderr
+            UX.Warning.emit(
+                "cross-arch build (\(plat)) needs qemu-user-static",
+                note: "place the binary at /opt/cocker/qemu/qemu-<arch>-static — cocker doesn't bundle these yet ; native arch (\(hostArch)) always works"
             )
         }
 
-        print("Building \(ANSI.colored(imageTag, ANSI.cyan)) for platforms: \(platforms.joined(separator: ", "))")
+        print(" " + UX.TTY.paint("→ Building", .progress) + " " + UX.TTY.paint(imageTag, .accent) + " " + UX.TTY.paint("for platforms: \(platforms.joined(separator: ", "))", .dim))
 
         let client = IPCClient()
         let contextPath = context.hasPrefix("/") ? context : FileManager.default.currentDirectoryPath + "/" + context
@@ -217,7 +214,8 @@ struct BuildxBuildCommand: AsyncParsableCommand {
 
         for plat in platforms {
             let platformTag = "\(imageTag)-\(plat.replacingOccurrences(of: "/", with: "-"))"
-            print("\n\(ANSI.colored("[+]", ANSI.blue)) Building for \(plat)...")
+            print("")
+            print(" " + UX.TTY.paint("→ Building", .progress) + " for " + UX.TTY.paint(plat, .accent))
 
             var config = BuildConfig(contextPath: contextPath, tag: platformTag)
             config.dockerfile = file
@@ -238,8 +236,8 @@ struct BuildxBuildCommand: AsyncParsableCommand {
                 switch event.stream {
                 case .stdout: print(event.data, terminator: "")
                 case .stderr: fputs(event.data, stderr)
-                case .status: print(ANSI.colored(event.data, ANSI.dim))
-                case .error: fputs("Error: \(event.data)\n", stderr)
+                case .status: print(UX.TTY.paint(event.data, .dim))
+                case .error:  UX.Failure.emit(headline: event.data)
                 }
             }
 
@@ -260,13 +258,15 @@ struct BuildxBuildCommand: AsyncParsableCommand {
         }
 
         if builtImageIDs.count > 1 {
-            print("\n\(ANSI.colored("[+]", ANSI.blue)) Created multi-platform manifest for \(imageTag)")
+            print("")
+            print(" " + UX.TTY.paint("→", .progress) + " multi-platform manifest written for " + UX.TTY.paint(imageTag, .accent))
         }
 
-        print("\n\(ANSI.colored("✓", ANSI.green)) Build complete: \(ANSI.colored(imageTag, ANSI.cyan))")
+        print("")
+        UX.printResult(.image, imageTag, verb: .build)
 
         if push {
-            print("Pushing \(imageTag)...")
+            print(" " + UX.TTY.paint("→ Pushing", .progress) + " " + UX.TTY.paint(imageTag, .accent))
             let payload = PullRequest(reference: imageTag)
             let req = try IPCRequest(type: .push, payload: payload)
             _ = try? await client.send(req)
