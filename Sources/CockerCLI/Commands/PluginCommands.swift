@@ -67,13 +67,15 @@ struct PluginInstallCommand: AsyncParsableCommand {
     mutating func run() async throws {
         var plugins = loadPlugins()
         if plugins.contains(where: { $0.name == pluginRef }) {
-            print("\(pluginRef) is already installed")
+            UX.Warning.emit("Plugin \(pluginRef) is already installed")
             return
         }
         plugins.append(PluginEntry(name: pluginRef, enabled: !disable, installedAt: Date()))
         savePlugins(plugins)
-        print("Installed plugin \(pluginRef)")
-        if !disable { print("Plugin enabled") }
+        UX.printResult(.plugin, pluginRef, verb: .install)
+        if !disable, UX.TTY.current.isInteractive {
+            print("   " + UX.TTY.paint("note    :", .dim) + " plugin runtime is a stub — registered but not executed")
+        }
     }
 }
 
@@ -82,11 +84,26 @@ struct PluginLsCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let plugins = loadPlugins()
-        print("ID            NAME                          DESCRIPTION                ENABLED")
-        for p in plugins {
+        let rows: [UX.Table.Row] = plugins.map { p in
             let id = String(p.name.hash.magnitude, radix: 16).prefix(12)
-            print("\(id)  \(p.name.padding(toLength: 30, withPad: " ", startingAt: 0))Cocker plugin              \(p.enabled ? "true" : "false")")
+            return .init([
+                .init(String(id), color: .accent),
+                .init(p.name),
+                .init("Cocker plugin", color: .dim),
+                .init(p.enabled ? "yes" : "no", color: p.enabled ? .success : .dim),
+            ])
         }
+        let table = UX.Table(
+            columns: [
+                .init("ID"),
+                .init("NAME"),
+                .init("DESCRIPTION"),
+                .init("ENABLED"),
+            ],
+            rows: rows,
+            emptyMessage: "no plugins — run `cocker plugin install <ref>` to add one"
+        )
+        print(table.render())
     }
 }
 
@@ -100,7 +117,7 @@ struct PluginRmCommand: AsyncParsableCommand {
         var plugins = loadPlugins()
         for name in names {
             plugins.removeAll { $0.name == name }
-            print(name)
+            UX.printResult(.plugin, name, verb: .remove)
         }
         savePlugins(plugins)
     }
@@ -117,9 +134,13 @@ struct PluginEnableCommand: AsyncParsableCommand {
         if let idx = plugins.firstIndex(where: { $0.name == name }) {
             plugins[idx].enabled = true
             savePlugins(plugins)
-            print(name)
+            UX.printResult(.plugin, name, verb: .enable)
         } else {
-            fputs("Error: no such plugin: \(name)\n", stderr)
+            UX.Failure.emit(
+                headline: "Cannot enable plugin \(name)",
+                reason: "no such plugin",
+                hint: "list installed plugins with `cocker plugin ls`"
+            )
             throw ExitCode.failure
         }
     }
@@ -136,9 +157,13 @@ struct PluginDisableCommand: AsyncParsableCommand {
         if let idx = plugins.firstIndex(where: { $0.name == name }) {
             plugins[idx].enabled = false
             savePlugins(plugins)
-            print(name)
+            UX.printResult(.plugin, name, verb: .disable)
         } else {
-            fputs("Error: no such plugin: \(name)\n", stderr)
+            UX.Failure.emit(
+                headline: "Cannot disable plugin \(name)",
+                reason: "no such plugin",
+                hint: "list installed plugins with `cocker plugin ls`"
+            )
             throw ExitCode.failure
         }
     }
@@ -155,7 +180,12 @@ struct PluginInspectCommand: AsyncParsableCommand {
         var entries: [[String: Any]] = []
         for name in names {
             guard let p = plugins.first(where: { $0.name == name }) else {
-                fputs("Error: no such plugin: \(name)\n", stderr); continue
+                UX.Failure.emit(
+                    headline: "Cannot inspect plugin \(name)",
+                    reason: "no such plugin",
+                    hint: "list installed plugins with `cocker plugin ls`"
+                )
+                continue
             }
             entries.append([
                 "Name": p.name,

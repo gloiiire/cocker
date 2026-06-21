@@ -41,3 +41,6 @@ DerivedData/
 *.md
 !README.md
 !**/README.md
+# Exceptions : long-lived spec docs that the codebase points to.
+!docs/UX-CHARTER.md
+!docs/APPLE-FEEDBACK-VSOCK-CALLBACK.md

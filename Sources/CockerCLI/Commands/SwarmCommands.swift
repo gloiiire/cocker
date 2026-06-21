@@ -35,9 +35,16 @@ struct SwarmInitCommand: AsyncParsableCommand {
         )
         try JSONEncoder().encode(swarmState).write(to: url, options: .atomic)
         let token = "SWMTKN-1-\(UUID().uuidString.prefix(20))"
-        print("Swarm initialized: current node (ID: \(nodeID)) is now a manager.")
-        print("To add a worker to this swarm, run the following command:")
-        print("    cocker swarm join --token \(token) \(addr):2377")
+        if UX.TTY.current.isInteractive {
+            let trailing = "node " + UX.TTY.paint(String(nodeID.prefix(12)), .accent) + " (manager)"
+            print(UX.ActionLine(
+                icon: .success, name: "swarm",
+                status: "Initialized", trailing: trailing
+            ).render())
+            print("   " + UX.TTY.paint("worker  :", .dim) + " cocker swarm join --token \(token) \(addr):2377")
+        } else {
+            print(nodeID)
+        }
     }
 }
 
@@ -49,7 +56,13 @@ struct SwarmLeaveCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         try? FileManager.default.removeItem(atPath: "\(NSHomeDirectory())/.cocker/swarm.json")
-        print("Node left the swarm.")
+        if UX.TTY.current.isInteractive {
+            print(UX.ActionLine(
+                icon: .success, name: "swarm", status: "Left"
+            ).render())
+        } else {
+            print("swarm")
+        }
     }
 }
 
@@ -63,7 +76,22 @@ struct SwarmJoinCommand: AsyncParsableCommand {
     var addr: String
 
     mutating func run() async throws {
-        print("This node joined a swarm as a worker. (single-node mode)")
+        // Cocker is single-node. Joining a swarm as a worker is conceptually
+        // a no-op : the local node becomes its own one-element worker pool.
+        // The previous stub just printed plain text ; now we surface the
+        // single-node caveat as a Warning so it shows in scripts too.
+        if UX.TTY.current.isInteractive {
+            print(UX.ActionLine(
+                icon: .success, name: addr,
+                status: "Joined", trailing: "single-node mode"
+            ).render())
+        } else {
+            print(addr)
+        }
+        UX.Warning.emit(
+            "Cocker is single-node",
+            note: "this node joined as its own worker pool ; multi-node swarming is not supported"
+        )
     }
 }
 
@@ -104,11 +132,15 @@ struct StackDeployCommand: AsyncParsableCommand {
             : FileManager.default.currentDirectoryPath + "/" + composeFile
 
         guard FileManager.default.fileExists(atPath: composePath) else {
-            fputs("Error: compose file not found: \(composePath)\n", stderr)
+            UX.Failure.emit(
+                headline: "Cannot deploy stack \(stackName)",
+                reason: "compose file not found at \(composePath)",
+                hint: "pass `-c <path>` or run from a directory containing docker-compose.yml"
+            )
             throw ExitCode.failure
         }
 
-        print("Creating network \(stackName)_default")
+        print(" " + UX.TTY.paint("→ Deploying", .progress) + " " + UX.TTY.paint(stackName, .accent))
 
         let client = IPCClient()
         let payload = ComposeRequest(composePath: composePath, projectName: stackName, services: [], detach: true)
@@ -117,7 +149,7 @@ struct StackDeployCommand: AsyncParsableCommand {
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
-            case .status: print(ANSI.colored(event.data, ANSI.cyan))
+            case .status: print(UX.TTY.paint(event.data, .progress))
             default: break
             }
         }
@@ -442,7 +474,7 @@ struct ServiceRmCommand: AsyncParsableCommand {
         for svc in services {
             let request = try IPCRequest(type: .rm, payload: ContainerIDRequest(id: svc))
             _ = try? await client.send(request)
-            print(svc)
+            UX.printResult(.service, svc, verb: .remove)
         }
     }
 }
@@ -460,9 +492,12 @@ struct ServiceUpdateCommand: AsyncParsableCommand {
     var service: String
 
     mutating func run() async throws {
-        print("Service \(service) updated")
+        UX.printResult(.service, service, verb: .update)
         if let r = replicas, r > 1 {
-            print("Warning: Only 1 replica supported in single-node mode")
+            UX.Warning.emit(
+                "ignoring --replicas \(r)",
+                note: "Cocker is single-node ; only 1 replica is supported"
+            )
         }
     }
 }
@@ -479,8 +514,13 @@ struct ServiceScaleCommand: AsyncParsableCommand {
     mutating func run() async throws {
         for spec in serviceScale {
             let parts = spec.split(separator: "=")
-            if parts.count == 2 { print("\(parts[0]) scaled to \(parts[1])") }
+            if parts.count == 2 {
+                UX.printResult(.service, String(parts[0]), verb: .scale)
+            }
         }
-        print("Warning: Scaling beyond 1 replica requires multi-node swarm")
+        UX.Warning.emit(
+            "scaling beyond 1 replica is a no-op",
+            note: "Cocker is single-node ; the swarm-mode contract requires a multi-node cluster"
+        )
     }
 }

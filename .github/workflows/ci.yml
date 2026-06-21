@@ -68,7 +68,12 @@ jobs:
           #     /var/run trigger ; not exercisable inside swift test.
           #   - AuditLog : writes ~/.cocker/audit.log with rotation ; the
           #     real coverage comes from the smoke runs.
-          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift)'
+          # 0.7.0 UX foundation additions :
+          #   - Spinner : drives a Task that writes ANSI cursor moves to
+          #     stdout in a 80 ms loop ; deterministic testing would require
+          #     a fake stdout + clock, not worth the wiring.
+          #   - StickyView : same — cursor-up redraw against a real TTY.
+          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift)'
 
           xcrun llvm-cov report "$BIN" -instr-profile="$PROF" \
             -ignore-filename-regex="$IGNORE" \

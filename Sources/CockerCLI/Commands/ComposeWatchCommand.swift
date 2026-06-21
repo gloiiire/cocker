@@ -81,10 +81,18 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             return
         }
 
-        print(ANSI.colored("Bringing up project \(effectiveProjectName) before watching…", ANSI.cyan))
+        // Charter §12 — name the macOS daemons we're talking to so the user
+        // understands what's making the project "alive". FSEvents is the
+        // kernel-level file-change subscription ; bird (iCloud) hand-off
+        // happens inside composeUp() when the project lives in iCloud Drive.
+        print(" " + UX.TTY.paint("→ Bringing up", .progress) + " " + UX.TTY.paint(effectiveProjectName, .accent) + " " + UX.TTY.paint("before watching", .dim))
         try await composeUp(originalPath: originalPath, projectName: effectiveProjectName)
 
-        print(ANSI.colored("\nWatching \(projectDir) for changes (debounce \(debounceMs)ms). Press Ctrl-C to stop.\n", ANSI.cyan))
+        print("")
+        print(" " + UX.TTY.paint("→ Watching", .progress) + " " + UX.TTY.paint(projectDir, .accent))
+        print("   " + UX.TTY.paint("FSEvents :", .dim) + " listening (debounce \(debounceMs)ms)")
+        print("   " + UX.TTY.paint("stop     :", .dim) + " Ctrl-C")
+        print("")
 
         let watcher = FSEventWatcher(path: projectDir, debounceMs: debounceMs)
         let stream = watcher.events()
@@ -96,12 +104,22 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         sigSrc.resume()
 
         for await batch in stream {
-            print(ANSI.colored("→ \(batch.count) file change(s) detected, rebuilding…", ANSI.cyan))
+            let head = UX.TTY.paint(UX.Icon.restart.rawValue, .restart)
+            print(" \(head) " + UX.TTY.paint("Change detected", .restart) + " " + UX.TTY.paint("(\(batch.count) file\(batch.count > 1 ? "s" : ""))", .dim))
+            let start = Date()
             do {
                 try await composeUp(originalPath: originalPath, projectName: effectiveProjectName, withBuild: true)
-                print(ANSI.colored("✓ Reload complete.\n", ANSI.green))
+                print(UX.ActionLine(
+                    icon: .success, name: effectiveProjectName,
+                    status: "Reloaded", trailing: UX.formatElapsed(Date().timeIntervalSince(start))
+                ).render())
+                print("")
             } catch {
-                fputs("Reload failed: \(error)\n", stderr)
+                UX.Failure.emit(
+                    headline: "Reload failed",
+                    reason: "\(error)",
+                    hint: "check the compose file for syntax errors and try `cocker compose up --build` once manually"
+                )
             }
         }
     }
@@ -129,7 +147,7 @@ struct ComposeWatchCommand: AsyncParsableCommand {
 
     private func handleStop(projectDir: String) throws {
         guard let pid = Self.livePID(projectDir: projectDir) else {
-            print("No watch running for this project.")
+            print(" " + UX.TTY.paint("no watch running for this project", .dim, [.italic]))
             return
         }
         if kill(pid, SIGTERM) != 0 {
@@ -142,16 +160,23 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         }
         if kill(pid, 0) == 0 { _ = kill(pid, SIGKILL) }
         try? FileManager.default.removeItem(atPath: Self.pidFilePath(projectDir))
-        print(ANSI.colored("Stopped watch (pid \(pid)).", ANSI.green))
+        print(UX.ActionLine(
+            icon: .success, name: "watch",
+            status: "Stopped", trailing: "pid \(pid)"
+        ).render())
     }
 
     private func handleStatus(projectDir: String) {
         if let pid = Self.livePID(projectDir: projectDir) {
-            print(ANSI.colored("Watch is running.", ANSI.green))
-            print("  pid : \(pid)")
-            print("  log : \(Self.logFilePath(projectDir))")
+            print(UX.ActionLine(
+                icon: .success, name: "watch",
+                status: "Running", trailing: "pid \(pid)"
+            ).render())
+            print("   " + UX.TTY.paint("log     :", .dim) + " " + Self.logFilePath(projectDir))
         } else {
-            print(ANSI.colored("No watch running for this project.", ANSI.yellow))
+            print(UX.ActionLine(
+                icon: .item, name: "watch", status: "Not running"
+            ).render())
         }
     }
 
@@ -186,10 +211,10 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         // two foreground watchers both calling `compose up --build` in
         // response to the same events would race and double-rebuild.
         if let existing = Self.livePID(projectDir: projectDir) {
-            print(ANSI.colored("Watch already running (pid \(existing)).", ANSI.yellow))
-            print("  log  : \(Self.logFilePath(projectDir))")
-            print("  stop : cocker compose watch --stop")
-            print("  tail : cocker compose watch --logs")
+            UX.Warning.emit(
+                "watch is already running (pid \(existing))",
+                note: "stop with `cocker compose watch --stop` or follow with `cocker compose watch --logs`"
+            )
             return
         }
 
@@ -232,12 +257,14 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         let pid = proc.processIdentifier
         try? "\(pid)\n".write(toFile: pidPath, atomically: true, encoding: .utf8)
 
-        print(ANSI.colored("Started watch in background.", ANSI.green))
-        print("  pid    : \(pid)")
-        print("  log    : \(logPath)")
-        print("  status : cocker compose watch --status")
-        print("  tail   : cocker compose watch --logs")
-        print("  stop   : cocker compose watch --stop")
+        print(UX.ActionLine(
+            icon: .success, name: "watch",
+            status: "Started (background)", trailing: "pid \(pid)"
+        ).render())
+        print("   " + UX.TTY.paint("log     :", .dim) + " " + logPath)
+        print("   " + UX.TTY.paint("status  :", .dim) + " cocker compose watch --status")
+        print("   " + UX.TTY.paint("tail    :", .dim) + " cocker compose watch --logs")
+        print("   " + UX.TTY.paint("stop    :", .dim) + " cocker compose watch --stop")
     }
 
     /// Crude $PATH walk so `Process` can find the exe by basename when
@@ -262,7 +289,7 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         withBuild: Bool = false
     ) async throws {
         let stage = try await ICloudStaging.stageIfNeeded(originalPath: originalPath) { msg in
-            print(ANSI.colored(msg, ANSI.cyan))
+            print(" " + UX.TTY.paint("→ bird (iCloud) " + msg, .progress))
         }
         let client = IPCClient()
         let payload = ComposeRequest(
@@ -276,8 +303,8 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: fputs(event.data, stderr)
-            case .status: print(ANSI.colored(event.data, ANSI.cyan))
-            case .error: fputs("Error: \(event.data)\n", stderr)
+            case .status: print(UX.TTY.paint(event.data, .progress))
+            case .error:  UX.Failure.emit(headline: event.data)
             }
         }
     }

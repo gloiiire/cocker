@@ -42,16 +42,25 @@ struct SecretCreateCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let data: Data
-        if file == "-" {
-            data = FileHandle.standardInput.readDataToEndOfFile()
-        } else {
-            data = try Data(contentsOf: URL(fileURLWithPath: file))
+        do {
+            if file == "-" {
+                data = FileHandle.standardInput.readDataToEndOfFile()
+            } else {
+                data = try Data(contentsOf: URL(fileURLWithPath: file))
+            }
+            let path = secretsDir().appendingPathComponent(name)
+            try data.write(to: path)
+            // 0600 — host root + this user only. Secrets should never be world-readable.
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+            UX.printCreated(.secret, name)
+        } catch {
+            UX.Failure.emit(
+                headline: "Cannot create secret \(name)",
+                reason: error.localizedDescription,
+                hint: "verify the source file exists and is readable"
+            )
+            throw ExitCode.failure
         }
-        let path = secretsDir().appendingPathComponent(name)
-        try data.write(to: path)
-        // 0600 — host root + this user only. Secrets should never be world-readable.
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
-        print(name)
     }
 }
 
@@ -61,15 +70,30 @@ struct SecretLsCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let dir = secretsDir()
         let files = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-        print("ID                          NAME             CREATED              SIZE")
-        for name in files.sorted() {
+        let rows: [UX.Table.Row] = files.sorted().compactMap { name in
             let path = dir.appendingPathComponent(name)
-            let attrs = try FileManager.default.attributesOfItem(atPath: path.path)
-            let created = (attrs[.creationDate] as? Date).map { ISO8601DateFormatter().string(from: $0) } ?? "-"
-            let size = (attrs[.size] as? Int).map { "\($0)" } ?? "-"
-            let id = String(name.hash.magnitude, radix: 16).padding(toLength: 25, withPad: "0", startingAt: 0)
-            print("\(id)  \(name.padding(toLength: 16, withPad: " ", startingAt: 0)) \(created.padding(toLength: 20, withPad: " ", startingAt: 0)) \(size)")
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else { return nil }
+            let created = (attrs[.creationDate] as? Date).map(relativeTime(from:)) ?? "-"
+            let size = (attrs[.size] as? Int).map { UX.formatBytes(Int64($0)) } ?? "-"
+            let id = String(name.hash.magnitude, radix: 16).prefix(12).padding(toLength: 12, withPad: "0", startingAt: 0)
+            return .init([
+                .init(String(id), color: .accent),
+                .init(name),
+                .init(created, color: .dim),
+                .init(size, color: .dim),
+            ])
         }
+        let table = UX.Table(
+            columns: [
+                .init("ID"),
+                .init("NAME"),
+                .init("CREATED"),
+                .init("SIZE", align: .right),
+            ],
+            rows: rows,
+            emptyMessage: "no secrets — run `cocker secret create <name> <file>` to add one"
+        )
+        print(table.render())
     }
 }
 
@@ -82,8 +106,16 @@ struct SecretRmCommand: AsyncParsableCommand {
     mutating func run() async throws {
         for name in names {
             let path = secretsDir().appendingPathComponent(name)
-            try FileManager.default.removeItem(at: path)
-            print(name)
+            do {
+                try FileManager.default.removeItem(at: path)
+                UX.printResult(.secret, name, verb: .remove)
+            } catch {
+                UX.Failure.emit(
+                    headline: "Cannot remove secret \(name)",
+                    reason: error.localizedDescription,
+                    hint: "check `cocker secret ls` to see what's stored"
+                )
+            }
         }
     }
 }
@@ -100,7 +132,12 @@ struct SecretInspectCommand: AsyncParsableCommand {
         for name in names {
             let path = dir.appendingPathComponent(name)
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else {
-                fputs("Error: secret not found: \(name)\n", stderr); continue
+                UX.Failure.emit(
+                    headline: "Cannot inspect secret \(name)",
+                    reason: "secret not found",
+                    hint: "list available secrets with `cocker secret ls`"
+                )
+                continue
             }
             entries.append([
                 "Name": name,
@@ -149,15 +186,24 @@ struct ConfigCreateCommand: AsyncParsableCommand {
     var file: String
 
     mutating func run() async throws {
-        let data: Data
-        if file == "-" {
-            data = FileHandle.standardInput.readDataToEndOfFile()
-        } else {
-            data = try Data(contentsOf: URL(fileURLWithPath: file))
+        do {
+            let data: Data
+            if file == "-" {
+                data = FileHandle.standardInput.readDataToEndOfFile()
+            } else {
+                data = try Data(contentsOf: URL(fileURLWithPath: file))
+            }
+            let path = configsDir().appendingPathComponent(name)
+            try data.write(to: path)
+            UX.printCreated(.config, name)
+        } catch {
+            UX.Failure.emit(
+                headline: "Cannot create config \(name)",
+                reason: error.localizedDescription,
+                hint: "verify the source file exists and is readable"
+            )
+            throw ExitCode.failure
         }
-        let path = configsDir().appendingPathComponent(name)
-        try data.write(to: path)
-        print(name)
     }
 }
 
@@ -167,15 +213,30 @@ struct ConfigLsCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let dir = configsDir()
         let files = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
-        print("ID                          NAME             CREATED              SIZE")
-        for name in files.sorted() {
+        let rows: [UX.Table.Row] = files.sorted().compactMap { name in
             let path = dir.appendingPathComponent(name)
-            let attrs = try FileManager.default.attributesOfItem(atPath: path.path)
-            let created = (attrs[.creationDate] as? Date).map { ISO8601DateFormatter().string(from: $0) } ?? "-"
-            let size = (attrs[.size] as? Int).map { "\($0)" } ?? "-"
-            let id = String(name.hash.magnitude, radix: 16).padding(toLength: 25, withPad: "0", startingAt: 0)
-            print("\(id)  \(name.padding(toLength: 16, withPad: " ", startingAt: 0)) \(created.padding(toLength: 20, withPad: " ", startingAt: 0)) \(size)")
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else { return nil }
+            let created = (attrs[.creationDate] as? Date).map(relativeTime(from:)) ?? "-"
+            let size = (attrs[.size] as? Int).map { UX.formatBytes(Int64($0)) } ?? "-"
+            let id = String(name.hash.magnitude, radix: 16).prefix(12).padding(toLength: 12, withPad: "0", startingAt: 0)
+            return .init([
+                .init(String(id), color: .accent),
+                .init(name),
+                .init(created, color: .dim),
+                .init(size, color: .dim),
+            ])
         }
+        let table = UX.Table(
+            columns: [
+                .init("ID"),
+                .init("NAME"),
+                .init("CREATED"),
+                .init("SIZE", align: .right),
+            ],
+            rows: rows,
+            emptyMessage: "no configs — run `cocker config create <name> <file>` to add one"
+        )
+        print(table.render())
     }
 }
 
@@ -188,8 +249,16 @@ struct ConfigRmCommand: AsyncParsableCommand {
     mutating func run() async throws {
         for name in names {
             let path = configsDir().appendingPathComponent(name)
-            try FileManager.default.removeItem(at: path)
-            print(name)
+            do {
+                try FileManager.default.removeItem(at: path)
+                UX.printResult(.config, name, verb: .remove)
+            } catch {
+                UX.Failure.emit(
+                    headline: "Cannot remove config \(name)",
+                    reason: error.localizedDescription,
+                    hint: "check `cocker config ls` to see what's stored"
+                )
+            }
         }
     }
 }
@@ -206,7 +275,12 @@ struct ConfigInspectCommand: AsyncParsableCommand {
         for name in names {
             let path = dir.appendingPathComponent(name)
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else {
-                fputs("Error: config not found: \(name)\n", stderr); continue
+                UX.Failure.emit(
+                    headline: "Cannot inspect config \(name)",
+                    reason: "config not found",
+                    hint: "list available configs with `cocker config ls`"
+                )
+                continue
             }
             entries.append([
                 "Name": name,
