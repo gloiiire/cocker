@@ -94,6 +94,11 @@ struct CockerCLI: AsyncParsableCommand {
             // Shell completion (bash / zsh / fish) — feeds modern
             // terminal autocomplete (Warp, Zed, Kiro, …).
             CompletionCommand.self,
+
+            // Rich autocomplete (Kiro CLI / Fig) — `cocker autocomplete
+            // install` drops the Fig spec into ~/.fig/autocomplete/build/
+            // since Homebrew's post_install sandbox can't write there.
+            AutocompleteCommand.self,
         ],
         defaultSubcommand: nil
     )
