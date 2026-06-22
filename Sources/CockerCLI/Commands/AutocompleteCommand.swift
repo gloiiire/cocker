@@ -53,16 +53,22 @@ struct AutocompleteInstallCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let fm = FileManager.default
 
-        // 1. Find the source file. Three discovery layers, first match wins :
-        //    a) explicit --source override
-        //    b) common Homebrew prefixes
-        //    c) relative to the running cocker binary (handles source
-        //       builds where the user invoked `swift build` then ran
-        //       .build/release/cocker without `brew install`)
+        // 1. Find the source file. Preference order : compiled .js (the
+        //    format Kiro's bundled autocomplete actually loads) over
+        //    raw .ts. The bottle workflow runs @withfig/autocomplete-
+        //    tools to produce cocker.js ; the .ts is shipped only as
+        //    a source-of-truth artifact. If a user did a source build
+        //    they might only have the .ts, so we fall back to it.
+        //
+        //    Discovery layers (first match wins) :
+        //      a) explicit --source override
+        //      b) common Homebrew prefixes, .js preferred over .ts
+        //      c) relative to the running cocker binary (source builds)
         let candidates: [String] = {
             if let s = explicitSource { return [s] }
             var paths: [String] = []
             for prefix in ["/opt/homebrew", "/usr/local"] {
+                paths.append("\(prefix)/share/cocker/completions/kiro/cocker.js")
                 paths.append("\(prefix)/share/cocker/completions/kiro/cocker.ts")
             }
             // Sibling-to-executable fallback. CommandLine.arguments[0] is
@@ -70,8 +76,8 @@ struct AutocompleteInstallCommand: AsyncParsableCommand {
             // .../bin/cocker → cellar prefix.
             let argv0 = CommandLine.arguments[0]
             let exe = URL(fileURLWithPath: argv0).resolvingSymlinksInPath()
-            // .../<prefix>/bin/cocker → .../<prefix>/share/cocker/completions/kiro/cocker.ts
             let exePrefix = exe.deletingLastPathComponent().deletingLastPathComponent()
+            paths.append(exePrefix.appendingPathComponent("share/cocker/completions/kiro/cocker.js").path)
             paths.append(exePrefix.appendingPathComponent("share/cocker/completions/kiro/cocker.ts").path)
             return paths
         }()
@@ -88,9 +94,13 @@ struct AutocompleteInstallCommand: AsyncParsableCommand {
         // 2. Resolve destination. Kiro CLI reads custom specs from
         //    ~/.fig/autocomplete/build/ (legacy Fig path, kept by Kiro for
         //    compatibility — confirmed in the bundled autocomplete JS).
+        //    The destination filename matches the source extension so
+        //    Kiro picks up .js / .ts correctly.
         let home = URL(fileURLWithPath: NSHomeDirectory())
         let destDir = home.appendingPathComponent(".fig/autocomplete/build")
-        let dest = destDir.appendingPathComponent("cocker.ts")
+        let srcURL = URL(fileURLWithPath: src)
+        let destFilename = srcURL.lastPathComponent
+        let dest = destDir.appendingPathComponent(destFilename)
 
         if dryRun {
             print(" " + UX.TTY.paint("→ would copy", .progress) + " " + UX.TTY.paint(src, .accent))
@@ -118,9 +128,17 @@ struct AutocompleteInstallCommand: AsyncParsableCommand {
         // 4. Replace any existing file or symlink at destination so the
         //    copy is clean (FileManager.copyItem refuses to overwrite).
         //    Handle the "empty dir created by v0.7.4 bottle bug" edge case
-        //    too — removeItem works on both files and directories.
+        //    too — removeItem works on both files and directories. Also
+        //    remove the OTHER extension if present so we don't end up
+        //    with stale cocker.ts + cocker.js side-by-side after a
+        //    format migration.
         if fm.fileExists(atPath: dest.path) {
             try? fm.removeItem(at: dest)
+        }
+        let otherExt = destFilename.hasSuffix(".js") ? "cocker.ts" : "cocker.js"
+        let other = destDir.appendingPathComponent(otherExt)
+        if fm.fileExists(atPath: other.path) {
+            try? fm.removeItem(at: other)
         }
         do {
             try fm.copyItem(atPath: src, toPath: dest.path)
