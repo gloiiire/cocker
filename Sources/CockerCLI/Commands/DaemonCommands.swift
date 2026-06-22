@@ -1463,18 +1463,44 @@ struct DaemonLogsCommand: AsyncParsableCommand {
         if follow { args.append("-f") }
         args.append(paths.logFile.path)
 
+        let useColor = !noColor && isatty(fileno(stdout)) != 0
+        let interactive = follow && isatty(fileno(stdin)) != 0
+
+        if interactive {
+            // Docker Compose-style detach UX : show a one-line hint at
+            // the top, capture single keystrokes so the user can hit
+            // `d` to bail out without killing the daemon and without
+            // the ugly "^C" + traceback Ctrl-C usually leaves behind.
+            //
+            // The hint mirrors `cocker compose up`'s footer so muscle
+            // memory transfers — both flows use the same helper
+            // (Sources/CockerCLI/InteractiveDetach.swift).
+            // Capture by value so the @Sendable closure doesn't drag
+            // `self` (a mutating command struct) in.
+            let capturedArgs = args
+            let capturedUseColor = useColor
+            _ = try await InteractiveDetach.run(
+                prompt: " " + ANSIStyle.dim + "Following " + paths.logFile.path
+                    + ". Press " + ANSIStyle.reset + ANSIStyle.bold + "d" + ANSIStyle.reset
+                    + ANSIStyle.dim + " to detach (daemon keeps running), "
+                    + ANSIStyle.reset + ANSIStyle.bold + "Ctrl-C" + ANSIStyle.reset
+                    + ANSIStyle.dim + " to stop." + ANSIStyle.reset
+            ) { token in
+                try await Self.runTailStream(
+                    args: capturedArgs, useColor: capturedUseColor, token: token
+                )
+            }
+            return
+        }
+
+        // Non-interactive : same behaviour as before — straight pipe to
+        // stdout, exits on EOF or Ctrl-C. No keystroke handling, no
+        // detach hint (would be misleading in a piped / non-TTY context).
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/tail")
         proc.arguments = args
 
-        // Force-off colors if redirected (typical: `cocker daemon logs >
-        // session.log`). Mirrors how `ls` / `git` decide on color.
-        let useColor = !noColor && isatty(fileno(stdout)) != 0
-
         if !useColor {
-            // Hot path : no colorizer at all, pass `tail` straight
-            // through to inherit stdout. Cheaper than piping when the
-            // user just wants to grep.
             try proc.run()
             proc.waitUntilExit()
             return
@@ -1483,7 +1509,6 @@ struct DaemonLogsCommand: AsyncParsableCommand {
         let pipe = Pipe()
         proc.standardOutput = pipe
         try proc.run()
-
         let colorizer = LogColorizer()
         let handle = pipe.fileHandleForReading
         var carry = Data()
@@ -1506,6 +1531,76 @@ struct DaemonLogsCommand: AsyncParsableCommand {
             print(colorizer.render(line))
         }
         proc.waitUntilExit()
+    }
+
+    /// Interactive tail loop that respects a DetachToken : runs `tail`
+    /// in a child process, streams its output through (optionally) the
+    /// LogColorizer, and tears the child down cleanly when the token is
+    /// canceled (user pressed `d`).
+    ///
+    /// Implementation note : the read loop has to be both responsive to
+    /// the detach signal AND not spin-wait on the read syscall. We
+    /// achieve this by setting the pipe's fd to non-blocking and polling
+    /// at ~20 Hz when there's no data, which is invisible to the user
+    /// but lets `token.isCanceled` win the race within ~50 ms of a key
+    /// press. The previous synchronous `availableData` loop would have
+    /// blocked indefinitely on a quiet log file even after detach.
+    private static func runTailStream(
+        args: [String], useColor: Bool, token: DetachToken
+    ) async throws {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/tail")
+        proc.arguments = args
+
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        try proc.run()
+
+        // Non-blocking so the read loop can yield to the detach poll.
+        let fd = pipe.fileHandleForReading.fileDescriptor
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+        let colorizer = useColor ? LogColorizer() : nil
+        var carry = Data()
+        var buf = [UInt8](repeating: 0, count: 16 * 1024)
+
+        defer {
+            if proc.isRunning {
+                proc.terminate()
+                // Don't waitUntilExit() — we're inside an async context
+                // and tail terminates quickly on SIGTERM. Re-parent
+                // takes over reaping.
+            }
+            // Flush whatever was left in the line buffer so the user
+            // doesn't lose a partial trailing line on Ctrl-C / detach.
+            if !carry.isEmpty, let line = String(data: carry, encoding: .utf8) {
+                print(colorizer?.render(line) ?? line)
+            }
+        }
+
+        while !token.isCanceled && proc.isRunning {
+            let n = read(fd, &buf, buf.count)
+            if n > 0 {
+                carry.append(contentsOf: buf.prefix(Int(n)))
+                while let nlRange = carry.range(of: Data([0x0A])) {
+                    let lineData = carry.subdata(in: 0..<nlRange.lowerBound)
+                    carry.removeSubrange(0..<nlRange.upperBound)
+                    if let line = String(data: lineData, encoding: .utf8) {
+                        print(colorizer?.render(line) ?? line)
+                    }
+                }
+            } else if n == 0 {
+                // EOF — tail finished (file rotated, or `-f` with no
+                // input mode? unlikely but be safe).
+                break
+            } else {
+                // n < 0 → EAGAIN (no data right now). Sleep a tiny bit
+                // and re-check the token. 50 ms keeps detach feel-time
+                // under "instant" while staying invisible CPU-wise.
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
     }
 }
 
