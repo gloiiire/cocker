@@ -933,6 +933,29 @@ const completion: Fig.Spec = {
       args: { name: "shell", suggestions: ["bash", "zsh", "fish"] },
       options: [helpOption],
     },
+
+    // ─── Autocomplete (this very spec's installer) ──────────────
+    {
+      name: "autocomplete",
+      description: "Install / inspect rich autocomplete specs (Kiro CLI, Fig)",
+      subcommands: [
+        {
+          name: "install",
+          description: "Copy the Kiro/Fig autocomplete spec into ~/.fig/autocomplete/build/",
+          options: [
+            { name: "--source", description: "Explicit path to cocker.ts / cocker.js", args: { name: "path", template: "filepaths" } },
+            { name: "--dry-run", description: "Print what would happen without modifying anything" },
+            helpOption,
+          ],
+        },
+        {
+          name: "status",
+          description: "Show where cocker's autocomplete spec is installed (if at all)",
+          options: [helpOption],
+        },
+      ],
+      options: [helpOption],
+    },
   ],
   options: [
     { name: "--version", description: "Show the cocker version" },
