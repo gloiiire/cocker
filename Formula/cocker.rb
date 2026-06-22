@@ -3,7 +3,7 @@ require "etc"
 class Cocker < Formula
   desc "Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework"
   homepage "https://github.com/gloiiire/cocker"
-  version "0.7.4"
+  version "0.7.5"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
   # Placeholder — replace with `shasum -a 256` of the actual release tarball.
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
@@ -27,7 +27,7 @@ class Cocker < Formula
   # both `version "..."` AND this `vX.Y.Z` substring on every release
   # tag so they stay in lock-step.
   bottle do
-    root_url "https://github.com/gloiiire/cocker/releases/download/v0.7.4"
+    root_url "https://github.com/gloiiire/cocker/releases/download/v0.7.5"
     sha256 cellar: :any_skip_relocation, arm64_tahoe:   "REPLACE_BOTTLE_SHA256_TAHOE"
     sha256 cellar: :any_skip_relocation, arm64_sequoia: "REPLACE_BOTTLE_SHA256_SEQUOIA"
     sha256 cellar: :any_skip_relocation, arm64_sonoma:  "REPLACE_BOTTLE_SHA256_SONOMA"
@@ -273,50 +273,22 @@ class Cocker < Formula
       tmp_plist.unlink if tmp_plist.exist?
     end
 
-    # --- 4. Kiro / Fig autocomplete spec (one-shot copy to ~/.fig) ---
+    # --- 4. Kiro / Fig autocomplete spec hint ---
     #
-    # Kiro CLI (the AWS-rebranded Fig + Amazon Q for command line) loads
-    # custom autocomplete specs from `~/.fig/autocomplete/build/`. We
-    # detect Kiro via the Cask install path (most users have it via
-    # `brew install --cask kiro-cli`) or the legacy `~/.fig/` directory ;
-    # if either is present we copy the spec straight into the user's
-    # home so rich completion lights up after the very next terminal
-    # restart, no manual step.
-    #
-    # If neither marker is found we don't touch ~/.fig — the user just
-    # gets a friendly hint in `caveats` (printed after install) telling
-    # them to install Kiro then re-run `brew postinstall cocker`.
-    begin
-      real_home   = Pathname.new(Etc.getpwuid(Process.uid).dir)
-      kiro_app    = Pathname.new("/Applications/Kiro CLI.app")
-      fig_app     = Pathname.new("/Applications/Fig.app")
-      fig_home    = real_home/".fig"
-      has_kiro    = kiro_app.exist? || fig_app.exist? || fig_home.exist?
+    # Homebrew's post_install runs inside a seatbelt sandbox that denies
+    # writes to ~/.fig/ — same constraint as the kernel/initrd section
+    # above. We therefore can't drop the spec ourselves from here ; we
+    # just point the user at `cocker autocomplete install` which runs
+    # from their shell (outside the sandbox) and does the copy cleanly
+    # in one command.
+    spec_src = share/"cocker/completions/kiro/cocker.ts"
+    kiro_app = Pathname.new("/Applications/Kiro CLI.app")
+    fig_app  = Pathname.new("/Applications/Fig.app")
+    has_kiro = kiro_app.exist? || fig_app.exist?
 
-      spec_src = share/"cocker/completions/kiro/cocker.ts"
-      if has_kiro
-        target_dir = real_home/".fig/autocomplete/build"
-        target_dir.mkpath
-        target = target_dir/"cocker.ts"
-        target.unlink if target.symlink? || target.exist?
-        cp spec_src, target
-        ohai "Installed Kiro autocomplete spec : #{target}"
-        ohai "Restart your terminal to activate rich `cocker` completion."
-      else
-        opoo <<~EOS
-          Kiro CLI not detected — skipped autocomplete spec install.
-
-          When you install Kiro CLI (https://kiro.dev) later, run :
-
-              brew postinstall cocker
-
-          to drop the spec into ~/.fig/autocomplete/build/cocker.ts.
-          Or copy it by hand from #{spec_src}.
-        EOS
-      end
-    rescue StandardError => e
-      opoo "Could not install Kiro autocomplete spec (#{e.class}: " \
-           "#{e.message.split("\n").first}) — re-run `brew postinstall cocker`."
+    if has_kiro && spec_src.exist?
+      ohai "Kiro CLI detected. Finish autocomplete setup from your shell with :"
+      ohai "    cocker autocomplete install"
     end
   end
 
