@@ -927,6 +927,90 @@ private func launchdPlistPath(for root: URL) -> URL {
         .appendingPathComponent("Library/LaunchAgents/com.cocker.cockerd\(suffix).plist")
 }
 
+/// Path of the plist `brew services` writes when the user installed via
+/// Homebrew. Only present on the prod root (homebrew has no `cockerd-dev`
+/// notion). Discovered via launchctl list as `homebrew.mxcl.cocker`.
+private func homebrewPlistPath() -> URL {
+    URL(fileURLWithPath: NSHomeDirectory())
+        .appendingPathComponent("Library/LaunchAgents/homebrew.mxcl.cocker.plist")
+}
+
+/// Drives `brew services <action> cocker`. Splits out as a helper so the
+/// three -s subcommands (start/stop/restart) share one shell-out point.
+/// Returns true on success ; false (with a printed reason) when brew is
+/// missing or returns non-zero. Stderr is surfaced so the user sees brew's
+/// own diagnostics when something goes wrong.
+@discardableResult
+private func runBrewServices(_ action: String) -> Bool {
+    let brewPath: String? = {
+        for p in ["/opt/homebrew/bin/brew", "/usr/local/bin/brew", "/home/linuxbrew/.linuxbrew/bin/brew"] {
+            if FileManager.default.isExecutableFile(atPath: p) { return p }
+        }
+        return nil
+    }()
+    guard let brew = brewPath else {
+        UX.Failure.emit(
+            headline: "brew binary not found",
+            reason: "this daemon is managed by Homebrew but `brew` isn't on PATH",
+            hint: "install Homebrew (https://brew.sh) or use `launchctl` directly"
+        )
+        return false
+    }
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: brew)
+    proc.arguments = ["services", action, "cocker"]
+    let errPipe = Pipe()
+    proc.standardError = errPipe
+    proc.standardOutput = Pipe()
+    do {
+        try proc.run()
+        proc.waitUntilExit()
+    } catch {
+        UX.Failure.emit(
+            headline: "Could not invoke `brew services \(action) cocker`",
+            reason: "\(error)"
+        )
+        return false
+    }
+    guard proc.terminationStatus == 0 else {
+        let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderrText = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        UX.Failure.emit(
+            headline: "brew services \(action) cocker failed",
+            reason: stderrText.isEmpty ? "exit code \(proc.terminationStatus)" : stderrText
+        )
+        return false
+    }
+    return true
+}
+
+/// Decide which launchd backend manages this daemon. Single helper used
+/// by start/stop/restart -s so the three sites agree on what's there.
+///   .native(url)  → install.sh-style plist (com.cocker.cockerd[suffix].plist)
+///   .homebrew     → brew services-managed (homebrew.mxcl.cocker.plist)
+///   .none(url)    → neither plist present ; url is the native one we'd
+///                    bootstrap if asked
+private enum ServiceBackend {
+    case native(URL)
+    case homebrew
+    case none(URL)
+}
+
+private func detectServiceBackend(root: URL) -> ServiceBackend {
+    let native = launchdPlistPath(for: root)
+    if FileManager.default.fileExists(atPath: native.path) {
+        return .native(native)
+    }
+    // Brew managed only the prod root (`~/.cocker`) — for SUFFIX=-dev
+    // installs we still expect the native plist, no brew fallback.
+    if root.lastPathComponent == ".cocker",
+       FileManager.default.fileExists(atPath: homebrewPlistPath().path) {
+        return .homebrew
+    }
+    return .none(native)
+}
+
 /// Run /bin/launchctl with the given args. Surfaces stderr on failure
 /// so the user gets the actual reason (already loaded, no such job, …)
 /// rather than a generic "command exited non-zero".
@@ -1031,25 +1115,41 @@ struct DaemonStartCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let paths = defaultPaths()
 
-        // --service / -s : delegate to launchd. install.sh shipped a plist
-        // at ~/Library/LaunchAgents/com.cocker.cockerd${suffix}.plist that
-        // has RunAtLoad=true and KeepAlive=true ; `launchctl bootstrap`
-        // loads it AND starts the daemon. Different code path entirely
-        // from the PID-file-based spawn below.
+        // --service / -s : delegate to launchd. Two backends supported :
+        //   1. install.sh-style plist at ~/Library/LaunchAgents/com.cocker.cockerd
+        //      [suffix].plist — managed directly via `launchctl bootstrap`.
+        //   2. brew services-managed plist (homebrew.mxcl.cocker.plist) — we
+        //      route to `brew services start cocker` so brew's bookkeeping
+        //      stays consistent (otherwise `brew services list` would lie).
         if service {
-            let plist = launchdPlistPath(for: paths.root)
-            guard FileManager.default.fileExists(atPath: plist.path) else {
-                throw ValidationError(
-                    "No launchd plist at \(plist.path). " +
-                    "Did you install via ./install.sh ? Without it there's no service to manage."
+            switch detectServiceBackend(root: paths.root) {
+            case .native(let plist):
+                try runLaunchctl(["bootstrap", "gui/\(getuid())", plist.path])
+                print(UX.ActionLine(
+                    icon: .success, name: plist.lastPathComponent,
+                    status: "Bootstrapped", trailing: "KeepAlive auto-restarts on crash"
+                ).render())
+                print("   " + UX.TTY.paint("status :", .dim) + " cocker daemon status")
+                print("   " + UX.TTY.paint("stop   :", .dim) + " cocker daemon stop -s")
+                return
+            case .homebrew:
+                if runBrewServices("start") {
+                    print(UX.ActionLine(
+                        icon: .success, name: "cocker",
+                        status: "Started (via brew services)", trailing: "managed by Homebrew"
+                    ).render())
+                    print("   " + UX.TTY.paint("status :", .dim) + " brew services list | grep cocker")
+                    print("   " + UX.TTY.paint("stop   :", .dim) + " cocker daemon stop -s   (delegates to brew)")
+                }
+                return
+            case .none(let plist):
+                UX.Failure.emit(
+                    headline: "No launchd service to start",
+                    reason: "no plist at \(plist.path) and brew services is not managing cocker either",
+                    hint: "either run install.sh, or `brew install cocker && brew services start cocker`"
                 )
+                throw ExitCode.failure
             }
-            try runLaunchctl(["bootstrap", "gui/\(getuid())", plist.path])
-            print("✓ launchd job \(plist.lastPathComponent) bootstrapped")
-            print("  KeepAlive=true → daemon auto-restarts on crash")
-            print("  → cocker daemon status     to inspect")
-            print("  → cocker daemon stop -s    to stop (no respawn)")
-            return
         }
 
         if let pid = readPID(paths.pidFile), isAlive(pid) {
@@ -1147,23 +1247,39 @@ struct DaemonStopCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let paths = defaultPaths()
 
-        // --service / -s : bootout the launchd job. SIGTERM would normally
-        // get instantly undone by KeepAlive=true ; bootout removes the
-        // job from launchd's bookkeeping so no respawn happens until the
-        // user bootstraps it again (`daemon start -s` or relog).
+        // --service / -s : tear down whichever launchd backend manages the
+        // daemon (install.sh-native via launchctl bootout, or brew services
+        // via `brew services stop`). Without -s, SIGTERM would just be
+        // undone by KeepAlive=true and the daemon would respawn.
         if service {
-            let plist = launchdPlistPath(for: paths.root)
-            guard FileManager.default.fileExists(atPath: plist.path) else {
-                throw ValidationError(
-                    "No launchd plist at \(plist.path). " +
-                    "There's no service to stop ; you probably want `cocker daemon stop` (no -s)."
+            switch detectServiceBackend(root: paths.root) {
+            case .native(let plist):
+                try runLaunchctl(["bootout", "gui/\(getuid())", plist.path])
+                try? FileManager.default.removeItem(at: paths.pidFile)
+                print(UX.ActionLine(
+                    icon: .success, name: plist.lastPathComponent,
+                    status: "Booted out", trailing: "no respawn"
+                ).render())
+                print("   " + UX.TTY.paint("restart :", .dim) + " cocker daemon start -s")
+                return
+            case .homebrew:
+                if runBrewServices("stop") {
+                    try? FileManager.default.removeItem(at: paths.pidFile)
+                    print(UX.ActionLine(
+                        icon: .success, name: "cocker",
+                        status: "Stopped (via brew services)", trailing: "no respawn"
+                    ).render())
+                    print("   " + UX.TTY.paint("restart :", .dim) + " cocker daemon start -s   (delegates to brew)")
+                }
+                return
+            case .none(let plist):
+                UX.Failure.emit(
+                    headline: "No launchd service to stop",
+                    reason: "no plist at \(plist.path) and brew services is not managing cocker either",
+                    hint: "use `cocker daemon stop` (no -s) to kill the foreground / pid-file process"
                 )
+                throw ExitCode.failure
             }
-            try runLaunchctl(["bootout", "gui/\(getuid())", plist.path])
-            try? FileManager.default.removeItem(at: paths.pidFile)
-            print("✓ launchd job \(plist.lastPathComponent) booted out (no respawn)")
-            print("  → cocker daemon start -s   to bring it back up")
-            return
         }
 
         guard let pid = readPID(paths.pidFile), isAlive(pid) else {
