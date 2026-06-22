@@ -23,6 +23,37 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Single source of truth gate (charter §release-runbook).
+      # Refuses to ship a release if the tag (vX.Y.Z), the /VERSION file,
+      # the CockerVersion.version Swift constant, or the Formula version
+      # disagree. This is the safety net behind scripts/bump-version.sh —
+      # if a maintainer hand-edits one of the files and forgets the
+      # others, the release fails before any binaries are built.
+      - name: Assert version sync (tag ↔ VERSION ↔ Swift ↔ Formula)
+        run: |
+          tag="${GITHUB_REF_NAME#v}"          # strip leading "v"
+          version_file=$(tr -d '[:space:]' < VERSION)
+          swift_version=$(grep -oE 'public static let version = "[^"]+"' \
+              Sources/CockerCore/IPC/Protocol.swift | sed -E 's/.*"([^"]+)"/\1/')
+          formula_version=$(grep -oE '^  version "[^"]+"' \
+              Formula/cocker.rb | sed -E 's/.*"([^"]+)"/\1/')
+
+          echo "tag             = $tag"
+          echo "VERSION file    = $version_file"
+          echo "Swift constant  = $swift_version"
+          echo "Formula version = $formula_version"
+
+          fail=0
+          for v in "$version_file" "$swift_version" "$formula_version"; do
+              if [ "$v" != "$tag" ]; then fail=1; fi
+          done
+          if [ $fail -ne 0 ]; then
+              echo "::error::version mismatch — run \`./scripts/bump-version.sh $tag\`"
+              echo "        on dev, merge through staging → main, then re-tag."
+              exit 1
+          fi
+          echo "✓ all four version anchors agree on $tag"
+
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
 
