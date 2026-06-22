@@ -172,11 +172,24 @@ struct AutocompleteStatusCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let fm = FileManager.default
         let home = URL(fileURLWithPath: NSHomeDirectory())
-        let dest = home.appendingPathComponent(".fig/autocomplete/build/cocker.ts")
+        let buildDir = home.appendingPathComponent(".fig/autocomplete/build")
 
-        guard fm.fileExists(atPath: dest.path) else {
+        // Look for .js first (compiled, what Kiro actually loads) ; fall
+        // back to .ts (source-build users who haven't compiled yet). Prior
+        // versions of this command only checked cocker.ts which silently
+        // reported "Not installed" when the user had the compiled .js in
+        // place — annoying but harmless misdiagnosis.
+        let jsPath = buildDir.appendingPathComponent("cocker.js")
+        let tsPath = buildDir.appendingPathComponent("cocker.ts")
+        let dest: URL? = {
+            if fm.fileExists(atPath: jsPath.path) { return jsPath }
+            if fm.fileExists(atPath: tsPath.path) { return tsPath }
+            return nil
+        }()
+
+        guard let dest else {
             print(UX.ActionLine(
-                icon: .item, name: "cocker.ts", status: "Not installed"
+                icon: .item, name: "cocker.{js,ts}", status: "Not installed"
             ).render())
             print("   " + UX.TTY.paint("install :", .dim) + " cocker autocomplete install")
             return
@@ -189,7 +202,7 @@ struct AutocompleteStatusCommand: AsyncParsableCommand {
         fm.fileExists(atPath: dest.path, isDirectory: &isDir)
         if isDir.boolValue {
             UX.Failure.emit(
-                headline: "cocker.ts is a directory (v0.7.4 bottle bug)",
+                headline: "\(dest.lastPathComponent) is a directory (v0.7.4 bottle bug)",
                 reason: "the path \(dest.path) is a directory, not a file",
                 hint: "run `cocker autocomplete install` to overwrite with the real spec"
             )
@@ -200,7 +213,7 @@ struct AutocompleteStatusCommand: AsyncParsableCommand {
         let bytes = attrs[.size] as? Int ?? 0
         let mtime = (attrs[.modificationDate] as? Date).map { relativeTime(from: $0) } ?? "?"
         print(UX.ActionLine(
-            icon: .success, name: "cocker.ts",
+            icon: .success, name: dest.lastPathComponent,
             status: "Installed", trailing: "\(UX.formatBytes(Int64(bytes))) · modified \(mtime)"
         ).render())
         print("   " + UX.TTY.paint("path :", .dim) + " " + dest.path)
