@@ -3,7 +3,7 @@ require "etc"
 class Cocker < Formula
   desc "Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework"
   homepage "https://github.com/gloiiire/cocker"
-  version "0.5.15.12"
+  version "0.7.1"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
   # Placeholder — replace with `shasum -a 256` of the actual release tarball.
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
@@ -27,10 +27,10 @@ class Cocker < Formula
   # both `version "..."` AND this `vX.Y.Z` substring on every release
   # tag so they stay in lock-step.
   bottle do
-    root_url "https://github.com/gloiiire/cocker/releases/download/v0.5.15.12"
-    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "565679c46f4ea7814a5084d1ac05d48d6400cd7dafb621a39e461a5fc1b57db6"
-    sha256 cellar: :any_skip_relocation, arm64_sequoia: "565679c46f4ea7814a5084d1ac05d48d6400cd7dafb621a39e461a5fc1b57db6"
-    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "565679c46f4ea7814a5084d1ac05d48d6400cd7dafb621a39e461a5fc1b57db6"
+    root_url "https://github.com/gloiiire/cocker/releases/download/v0.7.1"
+    sha256 cellar: :any_skip_relocation, arm64_tahoe:   "REPLACE_BOTTLE_SHA256_TAHOE"
+    sha256 cellar: :any_skip_relocation, arm64_sequoia: "REPLACE_BOTTLE_SHA256_SEQUOIA"
+    sha256 cellar: :any_skip_relocation, arm64_sonoma:  "REPLACE_BOTTLE_SHA256_SONOMA"
   end
 
   depends_on arch: :arm64
