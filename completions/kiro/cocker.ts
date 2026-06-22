@@ -926,10 +926,10 @@ const completion: Fig.Spec = {
       options: [helpOption],
     },
 
-    // ─── Completion ─────────────────────────────────────────────
+    // ─── Shell completion (bash/zsh/fish) ──────────────────────
     {
-      name: "completion",
-      description: "Generate shell completion script (bash/zsh/fish)",
+      name: ["shell-completion", "completion"],
+      description: "Generate native bash/zsh/fish completion script",
       args: { name: "shell", suggestions: ["bash", "zsh", "fish"] },
       options: [helpOption],
     },
