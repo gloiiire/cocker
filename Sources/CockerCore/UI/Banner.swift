@@ -302,7 +302,8 @@ public enum Banner {
         out += row("icloud",     "Inspect & control iCloud-aware behavior (status, prefetch, cache-clear)")
 
         out += header("SHELL INTEGRATION")
-        out += row("completion", "Generate shell completion (bash / zsh / fish) — Warp/Zed/Kiro autocomplete")
+        out += row("shell-completion", "Generate bash/zsh/fish completion script (native TAB completion)")
+        out += row("autocomplete",     "Install rich popup spec for Kiro CLI / Fig (install, status)")
 
         out += header("SYSTEM & AUTH")
         out += row("system, s",  "Manage Cocker (df, prune, info, events)")
