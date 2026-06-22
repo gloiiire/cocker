@@ -169,6 +169,20 @@ jobs:
             cp docs/man/*.1 "$ROOT/share/man/man1/" 2>/dev/null || true
           fi
 
+          # Kiro / Fig autocomplete spec — staged under share/ so the
+          # Formula's post_install can drop it into the user's
+          # ~/.fig/autocomplete/build/ when Kiro is detected. The
+          # `(share/...).install` lines in Formula/cocker.rb only run
+          # for source builds ; bottle pours skip `def install` and
+          # rely on whatever is baked into this tarball. Without this
+          # cp, v0.7.4-bottle had an empty cocker.ts directory at the
+          # destination because brew's Pathname#install never ran.
+          if [ -d completions/kiro ]; then
+            mkdir -p "$ROOT/share/cocker/completions/kiro"
+            cp completions/kiro/cocker.ts "$ROOT/share/cocker/completions/kiro/"
+            cp completions/kiro/README.md "$ROOT/share/cocker/completions/kiro/" 2>/dev/null || true
+          fi
+
           # INSTALL_RECEIPT.json — minimum brew accepts to pour the
           # bottle. The fields that actually matter to brew :
           #   - built_as_bottle = true
