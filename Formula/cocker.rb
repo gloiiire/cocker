@@ -38,6 +38,13 @@ class Cocker < Formula
   depends_on xcode: ["15.0", :build]
   depends_on "zig" => :build
 
+  # cocker runs Linux containers inside per-container VMs spun up via Apple's
+  # Virtualization.framework, but the Linux kernel itself (vmlinuz) comes from
+  # apple's `container` formula — we reuse its kernel rather than vendoring one
+  # in our own bottle. Without this dep, `cockerd setup` would hit the cold-
+  # start "no kernel found" branch on a fresh machine.
+  depends_on "container"
+
   def install
     # 1. Build cocker + cockerd
     system "swift", "build", "-c", "release", "--disable-sandbox"
