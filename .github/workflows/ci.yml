@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, staging, dev]
+    branches: [main, dev]
   pull_request:
-    branches: [main, staging, dev]
+    branches: [main, dev]
 
 # Annule les runs en cours quand un nouveau commit arrive sur la même branche.
 concurrency:
