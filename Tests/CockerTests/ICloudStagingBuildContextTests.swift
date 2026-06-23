@@ -181,4 +181,68 @@ final class ICloudStagingBuildContextTests: XCTestCase {
             composePath: tempDir.appendingPathComponent("nope.yml").path,
             projectDir: tempDir.path), [])
     }
+
+    // MARK: - End-to-end rsync semantics (PRO-41 regression)
+
+    /// Drives the actual filter rules through rsync to make sure the v2
+    /// version of the fix — `+ /<ctx>` only, no `+ /<ctx>/**` — both
+    /// (a) survives a sibling `.dockerignore` excluding the context dir,
+    /// and (b) doesn't shadow descendant excludes like `node_modules`.
+    /// Skipped if `/usr/bin/rsync` is unavailable (shouldn't happen on
+    /// any macOS / Linux CI runner cocker targets, but harmless).
+    func testRsyncRespectsBuildContextProtectionWithoutLeakingNodeModules() throws {
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/rsync") else {
+            throw XCTSkip("rsync not available on this machine")
+        }
+        // Source tree: a "real" project with one service whose context is
+        // ./frontend, plus a root .dockerignore that would exclude the
+        // entire frontend directory if cocker didn't intervene. And a
+        // node_modules INSIDE frontend that MUST NOT leak into staging.
+        try mkdir("frontend")
+        try mkdir("frontend/node_modules/lodash")
+        _ = try write("frontend/Dockerfile", "FROM node:20\n")
+        _ = try write("frontend/package.json", "{}\n")
+        _ = try write("frontend/node_modules/lodash/index.js", "// noise\n")
+        _ = try write(".dockerignore", "frontend/\n**/node_modules/\n")
+
+        // Simulate cocker's rules: + /frontend first, then the defaults
+        // (which include `**/node_modules/`), then root .dockerignore
+        // patterns. Matches what stageIfNeeded constructs.
+        let filterFile = tempDir.appendingPathComponent("filter").path
+        // rsync's --filter file requires every rule prefixed with `+ ` or
+        // `- ` — same wrapping `stageIfNeeded` does at runtime.
+        try [
+            "+ /frontend",
+            "- **/node_modules/",
+            "- frontend/",
+        ].joined(separator: "\n").write(toFile: filterFile, atomically: true, encoding: .utf8)
+
+        let staging = tempDir.appendingPathComponent("_staged")
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/rsync")
+        proc.arguments = [
+            "-a", "--delete",
+            "--filter=. \(filterFile)",
+            tempDir.path + "/", staging.path + "/",
+        ]
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        try proc.run()
+        proc.waitUntilExit()
+        if proc.terminationStatus != 0 {
+            let err = String(data: errPipe.fileHandleForReading.availableData, encoding: .utf8) ?? ""
+            XCTFail("rsync failed (\(proc.terminationStatus)): \(err)")
+            return
+        }
+
+        let fm = FileManager.default
+        XCTAssertTrue(fm.fileExists(atPath: staging.appendingPathComponent("frontend/Dockerfile").path),
+                      "PR-41 fix: frontend/Dockerfile must survive the root `frontend/` exclude")
+        XCTAssertTrue(fm.fileExists(atPath: staging.appendingPathComponent("frontend/package.json").path),
+                      "other top-level files in the build context must also survive")
+        XCTAssertFalse(fm.fileExists(atPath: staging.appendingPathComponent("frontend/node_modules").path),
+                       "node_modules inside the build context must STILL be excluded — the include rule should not be recursive")
+    }
 }
