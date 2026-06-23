@@ -11,7 +11,7 @@
 #
 # After running this, the only remaining release steps are :
 #   git commit -am "chore: bump to X.Y.Z"
-#   git push  →  PR feat → dev → staging → main
+#   git push  →  PR feat → dev → main
 #   git tag vX.Y.Z + git push --tags
 # The CI workflow (release.yml) re-validates the three places match before
 # building binaries, so a stale edit can't reach the release pipeline.
@@ -97,5 +97,5 @@ echo ""
 echo "Next steps :"
 echo "  git diff                                   # inspect"
 echo "  git commit -am \"chore: bump to ${new_version}\""
-echo "  git push                                   # PR feat → dev → staging → main"
+echo "  git push                                   # PR feat → dev → main"
 echo "  git tag v${new_version} && git push --tags # the Release workflow takes over from here"

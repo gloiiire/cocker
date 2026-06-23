@@ -49,7 +49,7 @@ jobs:
           done
           if [ $fail -ne 0 ]; then
               echo "::error::version mismatch — run \`./scripts/bump-version.sh $tag\`"
-              echo "        on dev, merge through staging → main, then re-tag."
+              echo "        on dev, merge dev → main, then re-tag."
               exit 1
           fi
           echo "✓ all four version anchors agree on $tag"
