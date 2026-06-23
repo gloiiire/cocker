@@ -30,21 +30,25 @@ struct VolumeLsCommand: AsyncParsableCommand {
 
         if quiet { result.volumes.forEach { print($0.name) }; return }
 
-        let columns: [TableFormatter.Column] = [
-            .init("DRIVER", min: 10),
-            .init("VOLUME NAME", min: 24),
-            .init("CREATED", min: 16),
-            .init("MOUNTPOINT", min: 30),
-        ]
-
-        let rows = result.volumes.map { v -> [String] in [
-            v.driver,
-            v.name,
-            relativeTime(from: v.createdAt),
-            v.mountpoint,
-        ]}
-
-        if !rows.isEmpty { print(TableFormatter.format(columns: columns, rows: rows)) }
+        let rows: [UX.Table.Row] = result.volumes.map { v in
+            .init([
+                .init(v.driver, color: .dim),
+                .init(v.name),
+                .init(relativeTime(from: v.createdAt), color: .dim),
+                .init(v.mountpoint, color: .dim),
+            ])
+        }
+        let table = UX.Table(
+            columns: [
+                .init("DRIVER"),
+                .init("VOLUME NAME"),
+                .init("CREATED"),
+                .init("MOUNTPOINT"),
+            ],
+            rows: rows,
+            emptyMessage: "no volumes — run `cocker volume create <name>` to add one"
+        )
+        print(table.render())
     }
 }
 
