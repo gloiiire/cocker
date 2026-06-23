@@ -732,10 +732,12 @@ func runSetup(rootURL: URL) async {
         print("either symlink that vmlinuz into \(kernelDir.path)/vmlinuz manually,")
         print("or paste the absolute path to vmlinuz below.")
     } else {
+        // Bottle builds since v0.7.9 declare `depends_on "container"`, so a
+        // Homebrew install path can only land here when cocker was built from
+        // source. Spell out both recovery options.
         print("Install Apple's container runtime first:")
-        print("  → Download the .pkg from https://github.com/apple/container/releases")
-        print("    (the Homebrew tap apple/container/container is not published —")
-        print("     ignore any older docs that mention it).")
+        print("  → brew: `brew install container` (auto-pulls the kernel)")
+        print("  → or download the .pkg from https://github.com/apple/container/releases")
         print("")
         print("Then re-run: cockerd setup")
     }
