@@ -37,64 +37,85 @@ struct PSCommand: AsyncParsableCommand {
             return
         }
 
-        let columns: [TableFormatter.Column] = [
-            .init("CONTAINER ID", min: 12, max: 12),
-            .init("IMAGE", min: 20, max: 40),
-            .init("COMMAND", min: 20, max: 30),
-            .init("CREATED", min: 16),
-            .init("STATUS", min: 12),
-            .init("PORTS", min: 20),
-            .init("NAMES", min: 16),
-        ]
-
-        let rows = result.containers.map { c -> [String] in
+        let rows: [UX.Table.Row] = result.containers.map { c in
             let cmd = c.command.isEmpty ? "" : c.command.joined(separator: " ")
             let ports = c.ports.map { $0.description }.joined(separator: ", ")
-            let status = statusString(c)
-            return [
-                String(c.id.prefix(12)),
-                c.image,
-                cmd.isEmpty ? "" : "\"\(cmd)\"",
-                relativeTime(from: c.createdAt),
-                status,
-                ports,
-                c.name,
-            ]
+            return .init([
+                .init(String(c.id.prefix(12)), color: .accent),
+                .init(c.image),
+                .init(cmd.isEmpty ? "" : "\"\(cmd)\""),
+                .init(relativeTime(from: c.createdAt), color: .dim),
+                .init(Self.statusText(c), color: Self.statusColor(c)),
+                .init(ports, color: .dim),
+                .init(c.name),
+            ])
         }
-
-        if result.containers.isEmpty {
-            return
-        }
-        print(TableFormatter.format(columns: columns, rows: rows))
+        let table = UX.Table(
+            columns: [
+                .init("CONTAINER ID", maxWidth: 12),
+                .init("IMAGE", maxWidth: 40),
+                .init("COMMAND", maxWidth: 30),
+                .init("CREATED"),
+                .init("STATUS"),
+                .init("PORTS"),
+                .init("NAMES"),
+            ],
+            rows: rows,
+            emptyMessage: "no containers — run `cocker run <image>` to create one"
+        )
+        print(table.render())
     }
 
-    private func statusString(_ c: Container) -> String {
+    /// Charter §5 status text (no ANSI). Color is applied by the
+    /// containing UX.Table cell via `statusColor(_:)`.
+    static func statusText(_ c: Container) -> String {
         let base: String
         switch c.status {
         case .running:
             let uptime = c.startedAt.map { relativeTime(from: $0).replacingOccurrences(of: " ago", with: "") } ?? "unknown"
-            base = ANSI.colored("Up \(uptime)", ANSI.green)
+            base = "Up \(uptime)"
         case .stopped:
             let code = c.exitCode.map { " (\($0))" } ?? ""
-            return ANSI.colored("Exited\(code)", ANSI.red)
-        case .created:
-            return ANSI.colored("Created", ANSI.yellow)
-        case .paused:
-            return ANSI.colored("Paused", ANSI.yellow)
-        case .restarting:
-            return ANSI.colored("Restarting", ANSI.yellow)
-        case .dead:
-            return ANSI.colored("Dead", ANSI.red)
+            return "Exited\(code)"
+        case .created:    return "Created"
+        case .paused:     return "Paused"
+        case .restarting: return "Restarting"
+        case .dead:       return "Dead"
         }
-        // Docker-style health suffix on running containers : "Up 2 minutes
-        // (healthy)". Only shown when a non-NONE healthcheck is configured ;
-        // .none status (no probe) prints the bare uptime.
+        // Docker-style health suffix on running containers. .none = no probe
+        // configured, render the bare uptime.
         guard let hc = c.healthcheck, !hc.isDisabled else { return base }
         switch c.healthStatus {
-        case .none:        return base
-        case .starting:    return base + ANSI.colored(" (health: starting)", ANSI.yellow)
-        case .healthy:     return base + ANSI.colored(" (healthy)", ANSI.green)
-        case .unhealthy:   return base + ANSI.colored(" (unhealthy)", ANSI.red)
+        case .none:      return base
+        case .starting:  return base + " (health: starting)"
+        case .healthy:   return base + " (healthy)"
+        case .unhealthy: return base + " (unhealthy)"
+        }
+    }
+
+    /// Charter §5 STATUS column color mapping :
+    ///   success → running (and healthy)
+    ///   failure → exited with non-zero / dead
+    ///   warn    → restarting / paused / unhealthy / health-starting
+    ///   dim     → created / cleanly-stopped (exit 0)
+    static func statusColor(_ c: Container) -> UX.Color {
+        switch c.status {
+        case .running:
+            // Health override wins over the base "running == success".
+            if let hc = c.healthcheck, !hc.isDisabled {
+                switch c.healthStatus {
+                case .unhealthy: return .warn
+                case .starting:  return .warn
+                case .healthy, .none: break
+                }
+            }
+            return .success
+        case .stopped:
+            return (c.exitCode ?? -1) == 0 ? .dim : .failure
+        case .created:    return .dim
+        case .paused:     return .warn
+        case .restarting: return .warn
+        case .dead:       return .failure
         }
     }
 }
