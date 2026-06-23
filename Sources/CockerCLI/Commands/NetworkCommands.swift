@@ -31,23 +31,27 @@ struct NetworkLsCommand: AsyncParsableCommand {
 
         if quiet { result.networks.forEach { print($0.id) }; return }
 
-        let columns: [TableFormatter.Column] = [
-            .init("NETWORK ID", min: 12, max: 12),
-            .init("NAME", min: 16, max: 30),
-            .init("DRIVER", min: 10),
-            .init("SCOPE", min: 8),
-            .init("SUBNET", min: 18),
-        ]
-
-        let rows = result.networks.map { n -> [String] in [
-            String(n.id.prefix(12)),
-            n.name,
-            n.driver.rawValue,
-            "local",
-            n.subnet,
-        ]}
-
-        if !rows.isEmpty { print(TableFormatter.format(columns: columns, rows: rows)) }
+        let rows: [UX.Table.Row] = result.networks.map { n in
+            .init([
+                .init(String(n.id.prefix(12)), color: .accent),
+                .init(n.name),
+                .init(n.driver.rawValue, color: .dim),
+                .init("local", color: .dim),
+                .init(n.subnet, color: .dim),
+            ])
+        }
+        let table = UX.Table(
+            columns: [
+                .init("NETWORK ID", maxWidth: 12),
+                .init("NAME", maxWidth: 30),
+                .init("DRIVER"),
+                .init("SCOPE"),
+                .init("SUBNET"),
+            ],
+            rows: rows,
+            emptyMessage: "no networks — run `cocker network create <name>` to add one"
+        )
+        print(table.render())
     }
 }
 
