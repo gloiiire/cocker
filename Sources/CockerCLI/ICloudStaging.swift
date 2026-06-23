@@ -82,6 +82,26 @@ struct ICloudStaging {
         for keep in runtimeKeeps {
             rules.append("+ /\(keep)")
         }
+        // Every service's `build.context:` MUST stay in the staged copy
+        // even when an outer `.dockerignore` would otherwise exclude the
+        // whole directory (e.g. a monorepo root .dockerignore listing
+        // `frontend/` to keep it out of a root-context build). Mirrors
+        // the env_file: treatment above. PRO-41.
+        //
+        // We deliberately protect ONLY the directory itself — NOT every
+        // descendant — so the defaults (`node_modules`, `.git`, …) and
+        // any per-context `.dockerignore` keep working untouched. rsync's
+        // "first match wins" means `+ /frontend` (placed first) lets
+        // rsync traverse into the dir; a later `frontend/` dir-exclude
+        // can no longer match the already-protected path, but
+        // `**/node_modules/` is still free to filter descendants. Adding
+        // a `+ /frontend/**` companion (initial v1 of this fix) was
+        // wrong — it would have shadowed the descendant excludes and
+        // ballooned the staging cache.
+        let buildContexts = collectBuildContextPaths(composePath: originalPath, projectDir: projectDir)
+        for ctx in buildContexts {
+            rules.append("+ /\(ctx)")
+        }
         for pat in collectIgnorePatterns(projectDir: projectDir) {
             if pat.hasPrefix("+ ") || pat.hasPrefix("- ") {
                 rules.append(pat)
@@ -292,6 +312,91 @@ struct ICloudStaging {
             if normalized.hasPrefix("/") || normalized.contains("..") { return nil }
             return fm.fileExists(atPath: projectDir + "/" + normalized) ? normalized : nil
         }
+    }
+
+    /// Parse the compose file and return every `services.*.build.context`
+    /// path (or the short-form `build: <path>` value), normalized to
+    /// project-relative. These become `+` rsync filter rules so the
+    /// service's build context survives even when an outer `.dockerignore`
+    /// would have excluded it.
+    ///
+    /// Supports both shapes :
+    ///   ```
+    ///   build: ./frontend
+    ///   ```
+    ///   and
+    ///   ```
+    ///   build:
+    ///     context: ./frontend
+    ///     dockerfile: Dockerfile
+    ///   ```
+    ///
+    /// Same lightweight line-based parser as `collectRuntimeKeepPaths` —
+    /// pulling in a YAML library for this single field would
+    /// disproportionately slow CLI startup. Falls back to an empty list
+    /// on parse errors (the bug we're fixing — a missing build context
+    /// in the staged tree — would then resurface, but no worse than
+    /// today's behavior).
+    static func collectBuildContextPaths(composePath: String, projectDir: String) -> [String] {
+        guard let yaml = try? String(contentsOfFile: composePath, encoding: .utf8) else {
+            return []
+        }
+        var contexts: Set<String> = []
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var i = 0
+        while i < lines.count {
+            let line = lines[i]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            // Only look at `build:` keys, not e.g. `dockerfile:` or
+            // `target:` that may share an indent. Skip comments.
+            guard trimmed.hasPrefix("build:") else { i += 1; continue }
+            let rest = trimmed.dropFirst("build:".count).trimmingCharacters(in: .whitespaces)
+            if !rest.isEmpty {
+                // Short form : `build: ./frontend`.
+                contexts.insert(stripYAMLValue(rest))
+                i += 1
+                continue
+            }
+            // Long form : look at indented children for `context:`.
+            // Compose's YAML uses 2-space indents almost universally.
+            // We scan until indent drops back to (or below) `build:`'s.
+            let buildIndent = leadingSpaces(line)
+            var j = i + 1
+            while j < lines.count {
+                let child = lines[j]
+                let childTrimmed = child.trimmingCharacters(in: .whitespaces)
+                if childTrimmed.isEmpty { j += 1; continue }
+                let childIndent = leadingSpaces(child)
+                if childIndent <= buildIndent { break }   // out of the `build:` block
+                if childTrimmed.hasPrefix("context:") {
+                    let val = childTrimmed.dropFirst("context:".count).trimmingCharacters(in: .whitespaces)
+                    if !val.isEmpty { contexts.insert(stripYAMLValue(val)) }
+                    // No `break` — continue so siblings like `dockerfile:`
+                    // don't trip the loop early on future schema additions.
+                }
+                j += 1
+            }
+            i = j
+        }
+        // Normalize : drop leading "./", reject absolute and escaping paths,
+        // and keep only contexts that actually exist on disk.
+        let fm = FileManager.default
+        return contexts.compactMap { raw in
+            var p = raw
+            if p.hasPrefix("./") { p = String(p.dropFirst(2)) }
+            if p.hasSuffix("/") { p = String(p.dropLast()) }
+            if p.isEmpty || p == "." { return nil }    // root context = nothing to protect
+            if p.hasPrefix("/") || p.contains("..") { return nil }
+            return fm.fileExists(atPath: projectDir + "/" + p) ? p : nil
+        }
+    }
+
+    private static func leadingSpaces(_ line: String) -> Int {
+        var n = 0
+        for c in line {
+            if c == " " { n += 1 } else { break }
+        }
+        return n
     }
 
     private static func stripYAMLValue(_ s: String) -> String {
