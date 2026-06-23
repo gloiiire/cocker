@@ -166,6 +166,22 @@ struct HTTPParserPipeTests {
         #expect(req?.body == Data(body.utf8))
     }
 
+    @Test func rejectsOversizeContentLength() {
+        // Regression for PRO-36 : a body larger than the cap must be refused
+        // before we allocate for it, instead of trying to read gigabytes.
+        let huge = HTTPLimits.maxBodyBytes + 1
+        let req = parse("POST /v1.41/containers/create HTTP/1.1\r\nHost: x\r\nContent-Length: \(huge)\r\n\r\n")
+        #expect(req == nil)
+    }
+
+    @Test func acceptsContentLengthAtExactlyTheCap() {
+        // Boundary : a Content-Length *equal* to the cap must NOT be rejected
+        // by the size guard (it uses `>`, not `>=`). The write end is closed
+        // so the (absent) body arrives as EOF and the request still parses.
+        let req = parse("POST /v1.41/x HTTP/1.1\r\nHost: x\r\nContent-Length: \(HTTPLimits.maxBodyBytes)\r\n\r\n")
+        #expect(req != nil)
+    }
+
     @Test func parsesMethodsBesideGET() {
         for verb in ["POST", "PUT", "DELETE", "HEAD"] {
             let req = parse("\(verb) /v1.41/x HTTP/1.1\r\nHost: x\r\n\r\n")

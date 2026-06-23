@@ -43,6 +43,7 @@ struct SecretCreateCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let data: Data
         do {
+            try ResourceName.validate(name, kind: "secret")
             if file == "-" {
                 data = FileHandle.standardInput.readDataToEndOfFile()
             } else {
@@ -107,6 +108,7 @@ struct SecretRmCommand: AsyncParsableCommand {
         for name in names {
             let path = secretsDir().appendingPathComponent(name)
             do {
+                try ResourceName.validate(name, kind: "secret")
                 try FileManager.default.removeItem(at: path)
                 UX.printResult(.secret, name, verb: .remove)
             } catch {
@@ -130,6 +132,16 @@ struct SecretInspectCommand: AsyncParsableCommand {
         let dir = secretsDir()
         var entries: [[String: Any]] = []
         for name in names {
+            do {
+                try ResourceName.validate(name, kind: "secret")
+            } catch {
+                UX.Failure.emit(
+                    headline: "Cannot inspect secret \(name)",
+                    reason: error.localizedDescription,
+                    hint: "list available secrets with `cocker secret ls`"
+                )
+                continue
+            }
             let path = dir.appendingPathComponent(name)
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else {
                 UX.Failure.emit(
@@ -187,6 +199,7 @@ struct ConfigCreateCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         do {
+            try ResourceName.validate(name, kind: "config")
             let data: Data
             if file == "-" {
                 data = FileHandle.standardInput.readDataToEndOfFile()
@@ -250,6 +263,7 @@ struct ConfigRmCommand: AsyncParsableCommand {
         for name in names {
             let path = configsDir().appendingPathComponent(name)
             do {
+                try ResourceName.validate(name, kind: "config")
                 try FileManager.default.removeItem(at: path)
                 UX.printResult(.config, name, verb: .remove)
             } catch {
@@ -273,6 +287,16 @@ struct ConfigInspectCommand: AsyncParsableCommand {
         let dir = configsDir()
         var entries: [[String: Any]] = []
         for name in names {
+            do {
+                try ResourceName.validate(name, kind: "config")
+            } catch {
+                UX.Failure.emit(
+                    headline: "Cannot inspect config \(name)",
+                    reason: error.localizedDescription,
+                    hint: "list available configs with `cocker config ls`"
+                )
+                continue
+            }
             let path = dir.appendingPathComponent(name)
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else {
                 UX.Failure.emit(
