@@ -32,25 +32,27 @@ struct ImagesCommand: AsyncParsableCommand {
             return
         }
 
-        let columns: [TableFormatter.Column] = [
-            .init("REPOSITORY", min: 20, max: 40),
-            .init("TAG", min: 10, max: 20),
-            .init("IMAGE ID", min: 12, max: 12),
-            .init("CREATED", min: 16),
-            .init("SIZE", min: 10),
-        ]
-
-        let rows = images.map { img -> [String] in [
-            img.repository,
-            img.tag,
-            String(img.id.prefix(12)),
-            relativeTime(from: img.createdAt),
-            formatBytes(img.size),
-        ]}
-
-        if !rows.isEmpty {
-            print(TableFormatter.format(columns: columns, rows: rows))
+        let rows: [UX.Table.Row] = images.map { img in
+            .init([
+                .init(img.repository),
+                .init(img.tag),
+                .init(String(img.id.prefix(12)), color: .accent),
+                .init(relativeTime(from: img.createdAt), color: .dim),
+                .init(formatBytes(img.size), color: .dim),
+            ])
         }
+        let table = UX.Table(
+            columns: [
+                .init("REPOSITORY", maxWidth: 40),
+                .init("TAG", maxWidth: 20),
+                .init("IMAGE ID", maxWidth: 12),
+                .init("CREATED"),
+                .init("SIZE", align: .right),
+            ],
+            rows: rows,
+            emptyMessage: "no images — run `cocker pull <ref>` to fetch one or `cocker build` to build one"
+        )
+        print(table.render())
     }
 }
 
