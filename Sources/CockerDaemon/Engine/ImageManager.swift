@@ -474,7 +474,30 @@ actor DockerfileBuilder {
     // Multi-stage: each FROM ... AS <name> snapshots its current rootfs URL
     // here so later stages can `COPY --from=<name> src dst`.
     private var stageRootfs: [String: URL] = [:]
+    // Companion snapshot of per-stage runtime config so `FROM <stage>` can
+    // inherit ENV / WORKDIR / USER / ENTRYPOINT / CMD / LABELS from the
+    // parent stage. Without this, the parent stage's WORKDIR=/app and the
+    // ENV that were set by its instructions would be lost the moment a
+    // later stage references it. Mirrors what Docker does. PRO-43.
+    private var stageConfig: [String: StageSnapshot] = [:]
     private var currentStageName: String?
+
+    /// Frozen image-config-ish view of a stage at the moment we hand off
+    /// to the next FROM. Only carries the fields a child stage needs to
+    /// inherit — rootfs lives in `stageRootfs` to avoid double-bookkeeping.
+    private struct StageSnapshot {
+        let env: [String: String]
+        let workdir: String
+        let user: String
+        let cmd: [String]
+        let entrypoint: [String]
+        let labels: [String: String]
+        let exposedPorts: [PortMapping]
+        let volumes: [String]
+        let stopSignal: String?
+        let layers: [CreatedLayer]
+        let healthcheck: Healthcheck?
+    }
 
     /// Rolling cache key for the build state at the current step. Updated
     /// after every RUN / COPY by hashing (previousKey || instruction).
@@ -615,6 +638,17 @@ actor DockerfileBuilder {
                 if let outgoingRootfs = currentRootfsPath,
                    let outgoingName = currentStageName {
                     stageRootfs[outgoingName] = outgoingRootfs
+                    // PRO-43: also snapshot the per-stage runtime config so
+                    // `FROM <stage>` further down can inherit it. Without
+                    // this, `FROM base AS deps` would lose the base stage's
+                    // ENV / WORKDIR / USER set by intermediate instructions.
+                    stageConfig[outgoingName] = StageSnapshot(
+                        env: env, workdir: workdir, user: user,
+                        cmd: cmd, entrypoint: entrypoint, labels: labels,
+                        exposedPorts: exposedPorts, volumes: volumes,
+                        stopSignal: stopSignal, layers: layers,
+                        healthcheck: healthcheck
+                    )
                 }
 
                 // Parse `image[:tag] [AS alias]`.
@@ -625,6 +659,46 @@ actor DockerfileBuilder {
                    asIdx + 1 < argsParts.count {
                     newStageName = argsParts[asIdx + 1]
                 }
+
+                // PRO-43: if `baseImage` matches a stage we've already
+                // built in this Dockerfile, reuse its rootfs + config
+                // instead of trying to pull `library/<stage>:latest` from
+                // the registry (which fails with "Manifest not found" and
+                // breaks every real multi-stage Dockerfile).
+                if let parentRootfs = stageRootfs[baseImage] {
+                    log(.stdout, " ---> Reusing stage: \(baseImage)\n")
+                    let stageDirName = "rootfs-\(stageRootfs.count + 1)"
+                    let layerDir = buildDir.appendingPathComponent(stageDirName)
+                    if FileManager.default.fileExists(atPath: layerDir.path) {
+                        try FileManager.default.removeItem(at: layerDir)
+                    }
+                    try FileManager.default.copyItem(at: parentRootfs, to: layerDir)
+                    currentRootfsPath = layerDir
+                    currentStageName = newStageName
+                    // Inherit the parent stage's runtime config so the
+                    // child stage sees the same WORKDIR / ENV / USER /
+                    // CMD / ENTRYPOINT / labels / etc. Falls back to
+                    // defaults if no snapshot exists (shouldn't happen
+                    // since the parent FROM would have set one).
+                    if let snap = stageConfig[baseImage] {
+                        env = snap.env
+                        workdir = snap.workdir
+                        user = snap.user
+                        cmd = snap.cmd
+                        entrypoint = snap.entrypoint
+                        labels = snap.labels
+                        exposedPorts = snap.exposedPorts
+                        volumes = snap.volumes
+                        stopSignal = snap.stopSignal
+                        layers = snap.layers
+                        healthcheck = snap.healthcheck
+                    } else {
+                        layers = []
+                    }
+                    log(.stdout, " ---> \(shortID())\n")
+                    continue
+                }
+
                 log(.stdout, " ---> Pulling base image: \(baseImage)\n")
                 if !(await imageManager.exists(baseImage)) {
                     _ = try await imageManager.pull(reference: baseImage, progressHandler: { msg in
