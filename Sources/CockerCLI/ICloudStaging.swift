@@ -83,20 +83,24 @@ struct ICloudStaging {
             rules.append("+ /\(keep)")
         }
         // Every service's `build.context:` MUST stay in the staged copy
-        // even when a sibling-scoped `.dockerignore` would otherwise
-        // exclude it (e.g. a root .dockerignore listing `frontend/` to
-        // keep it out of the backend build context — perfectly valid
-        // Docker pattern that our single-staging-dir model breaks
-        // without this include). Mirrors the env_file: treatment above.
-        // PRO-41.
+        // even when an outer `.dockerignore` would otherwise exclude the
+        // whole directory (e.g. a monorepo root .dockerignore listing
+        // `frontend/` to keep it out of a root-context build). Mirrors
+        // the env_file: treatment above. PRO-41.
+        //
+        // We deliberately protect ONLY the directory itself — NOT every
+        // descendant — so the defaults (`node_modules`, `.git`, …) and
+        // any per-context `.dockerignore` keep working untouched. rsync's
+        // "first match wins" means `+ /frontend` (placed first) lets
+        // rsync traverse into the dir; a later `frontend/` dir-exclude
+        // can no longer match the already-protected path, but
+        // `**/node_modules/` is still free to filter descendants. Adding
+        // a `+ /frontend/**` companion (initial v1 of this fix) was
+        // wrong — it would have shadowed the descendant excludes and
+        // ballooned the staging cache.
         let buildContexts = collectBuildContextPaths(composePath: originalPath, projectDir: projectDir)
         for ctx in buildContexts {
-            // Protect the directory itself AND every descendant — rsync
-            // filter rules are not recursive by default, and `frontend/`
-            // would still let `frontend/Dockerfile` get excluded by a
-            // sibling pattern. The `/**` companion line covers descendants.
             rules.append("+ /\(ctx)")
-            rules.append("+ /\(ctx)/**")
         }
         for pat in collectIgnorePatterns(projectDir: projectDir) {
             if pat.hasPrefix("+ ") || pat.hasPrefix("- ") {
