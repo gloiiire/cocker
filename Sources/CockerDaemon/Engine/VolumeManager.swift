@@ -23,6 +23,14 @@ actor VolumeManager {
     // MARK: - CRUD
 
     func create(request: VolumeCreateRequest) async throws -> VolumeInfo {
+        // Security barrier : every entry point that creates a volume — CLI,
+        // Docker API, Compose, and anonymous auto-creation via
+        // `resolveSource` — funnels through here, so validating the name in
+        // this one place confines the daemon's `mkdir` / `mke2fs` / write
+        // below `volumesRoot` no matter who asked. A name containing `..`
+        // or `/` is rejected before it can ever reach `appendingPathComponent`.
+        try ResourceName.validate(request.name, kind: "volume")
+
         if await store.volume(id: request.name) != nil {
             throw CockerError.volumeAlreadyExists(request.name)
         }

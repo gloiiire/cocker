@@ -50,6 +50,7 @@ public enum CockerError: Error, CustomStringConvertible {
     case invalidVolumeSpec(String)
     case invalidEnvironmentVar(String)
     case invalidComposeFile(String)
+    case invalidResourceName(kind: String, name: String, reason: String)
 
     // System errors
     case permissionDenied(String)
@@ -93,6 +94,8 @@ public enum CockerError: Error, CustomStringConvertible {
         case .invalidVolumeSpec(let s): return "Invalid volume spec: \(s) (expected format: source:dest[:ro])"
         case .invalidEnvironmentVar(let s): return "Invalid environment variable: \(s)"
         case .invalidComposeFile(let msg): return "Invalid compose file: \(msg)"
+        case .invalidResourceName(let kind, let name, let reason):
+            return "Invalid \(kind) name '\(name)': \(reason)"
         case .permissionDenied(let op): return "Permission denied: \(op)"
         case .diskFull: return "No space left on device"
         case .unsupportedPlatform(let p): return "Unsupported platform: \(p)"
