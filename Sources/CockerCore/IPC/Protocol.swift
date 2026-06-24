@@ -301,19 +301,28 @@ public struct ComposeRequest: Codable, Sendable {
     /// How many tail lines to send before going live (or as a one-shot
     /// when `follow == false`). Mirrors `docker compose logs --tail`.
     public let tail: Int
+    /// `compose up --build` : re-build every service with a `build:`
+    /// block even when an image with the target tag already exists.
+    /// Without this, the daemon's "skip if exists" short-circuit pins
+    /// the project to the first (possibly broken) build forever.
+    /// PRO-51. Old CLIs don't send the field → daemon falls back to
+    /// the historical "build only when missing" behaviour.
+    public let forceBuild: Bool
     public init(composePath: String, projectName: String? = nil, services: [String] = [],
                 detach: Bool = false, activeProfiles: [String]? = nil,
-                removeVolumes: Bool = false, follow: Bool = false, tail: Int = 50) {
+                removeVolumes: Bool = false, follow: Bool = false, tail: Int = 50,
+                forceBuild: Bool = false) {
         self.composePath = composePath; self.projectName = projectName
         self.services = services; self.detach = detach
         self.activeProfiles = activeProfiles
         self.removeVolumes = removeVolumes
         self.follow = follow
         self.tail = tail
+        self.forceBuild = forceBuild
     }
 
     enum CodingKeys: String, CodingKey {
-        case composePath, projectName, services, detach, activeProfiles, removeVolumes, follow, tail
+        case composePath, projectName, services, detach, activeProfiles, removeVolumes, follow, tail, forceBuild
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -328,6 +337,9 @@ public struct ComposeRequest: Codable, Sendable {
         // Same backwards-compat dance for follow/tail.
         self.follow         = try c.decodeIfPresent(Bool.self, forKey: .follow) ?? false
         self.tail           = try c.decodeIfPresent(Int.self,  forKey: .tail) ?? 50
+        // PRO-51 : default false so a pre-v0.7.10 CLI keeps the historical
+        // "skip rebuild when image already exists" behaviour.
+        self.forceBuild     = try c.decodeIfPresent(Bool.self, forKey: .forceBuild) ?? false
     }
 }
 
