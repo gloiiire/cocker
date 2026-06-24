@@ -85,7 +85,13 @@ struct ComposeUpCommand: AsyncParsableCommand {
             : nil)
 
         let client = IPCClient()
-        let payload = ComposeRequest(composePath: stage.path, projectName: effectiveProjectName, services: services, detach: detach)
+        let payload = ComposeRequest(
+            composePath: stage.path,
+            projectName: effectiveProjectName,
+            services: services,
+            detach: detach,
+            forceBuild: build
+        )
         let request = try IPCRequest(type: .composeUp, payload: payload)
 
         // Charter §13.1 — sticky multi-line table in TTY mode (one row per

@@ -299,11 +299,23 @@ actor ComposeEngine {
         // already in the local store. Without this, `compose up` on a fresh
         // project tries to pull a non-existent `<project>_<svc>:latest` from
         // Docker Hub and falls over.
+        //
+        // PRO-51 : when the CLI passes `--build`, `request.forceBuild` is
+        // true and we drop the "skip if exists" short-circuit, then untag
+        // the stale image so the new build doesn't get rejected by an
+        // `image already exists` guard further down the pipeline. Matches
+        // `docker compose up --build`.
         for serviceName in sorted {
             guard let service = compose.services[serviceName],
                   let buildSpec = service.build else { continue }
             let tag = service.image ?? "\(projectName)_\(serviceName)"
-            if await containerEngine.images.exists(tag) { continue }
+            let alreadyExists = await containerEngine.images.exists(tag)
+            if alreadyExists && !request.forceBuild { continue }
+            if alreadyExists && request.forceBuild {
+                // Best-effort untag — failure here is non-fatal (the rebuild
+                // would have failed louder if it really mattered).
+                try? await containerEngine.images.remove(tag, force: true)
+            }
             // Resolve build context relative to the compose file's directory.
             let composeDir = (request.composePath as NSString).deletingLastPathComponent
             let rawContext = buildSpec.context ?? "."
