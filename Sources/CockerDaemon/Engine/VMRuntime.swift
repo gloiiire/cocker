@@ -547,8 +547,14 @@ final class VMRuntime: NSObject {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
 
-        if vm.state == .running {
-            fputs("[vm-build] timeout after \(timeout)s — force stopping\n", stderr); fflush(stderr)
+        // PRO-52: capture whether the timeout branch fires BEFORE we
+        // ask VZ to stop, so the exit-code synthesis below can return
+        // 124 instead of falling back to the optimistic `?? 0` that
+        // made a hung RUN look like a success and silently produced
+        // half-baked images.
+        let timedOut = (vm.state == .running)
+        if timedOut {
+            fputs("[vm-build] timeout after \(timeout)s — force stopping (treating as exit 124)\n", stderr); fflush(stderr)
             try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 vm.stop { _ in continuation.resume() }
             }
@@ -566,7 +572,18 @@ final class VMRuntime: NSObject {
         // Parse l'exit code dans la sortie de cocker-init :
         //   "[cocker-init] container exited with code N"
         let output = outputBuffer.text()
-        let exitCode = parseExitCode(from: output) ?? 0
+        // PRO-52 exit-code synthesis :
+        //   - Marker present → trust it (cocker-init said the user's
+        //     command exited with that code, whether the VM was killed or
+        //     not).
+        //   - Marker missing + we force-stopped on timeout → 124 (matches
+        //     GNU `timeout`'s convention so error messages feel familiar).
+        //   - Marker missing + no timeout (cocker-init crashed before
+        //     printing the marker, kernel oops, etc.) → 125 so we never
+        //     silently swallow that as success.
+        let exitCode: Int32 = Self.synthesizeExitCode(
+            parsed: parseExitCode(from: output), timedOut: timedOut
+        )
         fputs("[vm-build] VM stopped, exitCode=\(exitCode)\n", stderr); fflush(stderr)
         if exitCode != 0 {
             // Surface the failed step's output instead of swallowing it.
@@ -588,6 +605,22 @@ final class VMRuntime: NSObject {
         try? FileManager.default.removeItem(at: rootfsPath.appendingPathComponent("cocker-ip"))
 
         return exitCode
+    }
+
+    /// PRO-52 — turn (parsed marker, timedOut) into a single exit code
+    /// the rest of the build pipeline can react to.
+    ///
+    ///   parsed != nil → trust cocker-init's marker; the user's command
+    ///                   really exited with that code.
+    ///   parsed == nil + timedOut → 124, matches GNU `timeout`.
+    ///   parsed == nil + !timedOut → 125, "VM exited without a marker"
+    ///                   (cocker-init crashed, kernel oops, etc).
+    ///
+    /// `static` + `nonisolated` so unit tests can hit it without spinning
+    /// a real VM and without crossing the actor boundary. The body is pure.
+    nonisolated static func synthesizeExitCode(parsed: Int32?, timedOut: Bool) -> Int32 {
+        if let code = parsed { return code }
+        return timedOut ? 124 : 125
     }
 
     private func parseExitCode(from log: String) -> Int32? {
