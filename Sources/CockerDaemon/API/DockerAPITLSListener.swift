@@ -290,6 +290,12 @@ final class DockerAPITLSListener {
                                 }
                             }
                         }
+                        // Refuse oversize bodies before draining gigabytes
+                        // into `buffer` (DoS guard, mirrors the fd parser).
+                        if contentLength > HTTPLimits.maxBodyBytes {
+                            conn.cancel()
+                            return
+                        }
                     }
                 }
             }

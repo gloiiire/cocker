@@ -725,7 +725,7 @@ struct DaemonInitCommand: AsyncParsableCommand {
         guard fd >= 0 else { return false }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        _ = withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dst in
                 _ = socketPath.withCString { strncpy(dst, $0, 103) }
             }

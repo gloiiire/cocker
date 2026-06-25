@@ -4,6 +4,16 @@ import CockerCore
 // Minimal HTTP/1.1 parser for the Docker-compatible API server
 // Docker Engine API over Unix socket uses plain HTTP/1.1
 
+enum HTTPLimits {
+    /// Largest request body we will buffer, in bytes (100 MiB) — matches the
+    /// IPC framer's cap. Headers are already bounded to 64 KiB ; without this
+    /// a client advertising `Content-Length: 9999999999` would make the
+    /// daemon allocate gigabytes and stall. Over the TLS/TCP surface that is
+    /// a cheap denial-of-service, so we refuse the request outright once the
+    /// declared length exceeds the cap.
+    static let maxBodyBytes = 100 * 1024 * 1024
+}
+
 struct HTTPRequest {
     let method: String
     let path: String
@@ -188,6 +198,8 @@ func parseHTTPRequest(from fd: Int32) throws -> HTTPRequest? {
     // Read body if present
     var body = Data()
     if let lengthStr = headers["content-length"], let length = Int(lengthStr), length > 0 {
+        // Refuse oversize bodies before allocating anything for them.
+        if length > HTTPLimits.maxBodyBytes { return nil }
         var remaining = length
         while remaining > 0 {
             var buf = [UInt8](repeating: 0, count: min(remaining, 65536))

@@ -66,7 +66,26 @@ struct VolumeCreateCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let volumeName = name ?? UUID().uuidString.prefix(12).lowercased()
-        let payload = VolumeCreateRequest(name: String(volumeName), driver: driver)
+
+        // `--label KEY=VALUE` arrives as raw "KEY=VALUE" strings ; turn them
+        // into the dictionary the request actually carries. A bare `--label
+        // KEY` (no `=`) maps to an empty value, matching Docker's behaviour.
+        var labelMap: [String: String] = [:]
+        for raw in labels {
+            let parts = raw.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let key = String(parts[0])
+            guard !key.isEmpty else {
+                UX.Failure.emit(
+                    headline: "Invalid label \(raw)",
+                    reason: "label key must not be empty",
+                    hint: "use the form --label KEY=VALUE, e.g. --label env=prod"
+                )
+                throw ExitCode.failure
+            }
+            labelMap[key] = parts.count == 2 ? String(parts[1]) : ""
+        }
+
+        let payload = VolumeCreateRequest(name: String(volumeName), driver: driver, labels: labelMap)
         let client = IPCClient()
         let start = Date()
         do {
