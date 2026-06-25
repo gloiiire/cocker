@@ -1183,7 +1183,12 @@ final class DockerAPIServer {
                 AttachStdin: false, AttachStdout: true, AttachStderr: true,
                 ExposedPorts: exposedPorts.isEmpty ? nil : exposedPorts,
                 Tty: false, OpenStdin: false, StdinOnce: false,
-                Env: c.env.map { "\($0.key)=\($0.value)" },
+                // Redact secret-looking env values (DB passwords, tokens…)
+                // before they cross the API boundary — keeps `GET
+                // /containers/<id>/json` consistent with `cocker inspect`,
+                // which already masks them. Keys are preserved so tooling can
+                // still see *which* vars exist.
+                Env: SecretRedactor.redact(c.env).map { "\($0.key)=\($0.value)" },
                 Cmd: c.command.isEmpty ? nil : c.command,
                 Image: c.image, Labels: c.labels,
                 WorkingDir: "", Entrypoint: nil, OnBuild: nil,

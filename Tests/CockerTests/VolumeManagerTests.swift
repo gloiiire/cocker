@@ -59,6 +59,46 @@ struct VolumeManagerCreateTests {
     }
 }
 
+@Suite("VolumeManager — name validation (path traversal)")
+struct VolumeManagerNameValidationTests {
+    // Regression for PRO-36 : a volume name containing `..` or `/` must be
+    // rejected *before* any mkdir / mke2fs / write happens, so the daemon
+    // can never escape `<root>/volumes/`.
+    @Test func rejectsParentTraversalName() async throws {
+        let (mgr, store, root) = try makeManager()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        await #expect(throws: CockerError.self) {
+            _ = try await mgr.create(request: VolumeCreateRequest(name: "../pwned"))
+        }
+        // `<root>/volumes/../pwned` would resolve to `<root>/pwned`. Prove
+        // nothing was created there, and nothing landed in the store.
+        let escaped = root.appendingPathComponent("pwned")
+        #expect(!FileManager.default.fileExists(atPath: escaped.path))
+        #expect(await store.volume(id: "../pwned") == nil)
+    }
+
+    @Test func rejectsSlashInName() async throws {
+        let (mgr, _, root) = try makeManager()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        await #expect(throws: CockerError.self) {
+            _ = try await mgr.create(request: VolumeCreateRequest(name: "a/b"))
+        }
+    }
+
+    @Test func rejectsTraversalViaResolveSource() async throws {
+        // resolveSource auto-creates a named volume from a mount source —
+        // another door into create(), so it must be guarded too.
+        let (mgr, _, root) = try makeManager()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        await #expect(throws: CockerError.self) {
+            _ = try await mgr.resolveSource(VolumeMount(source: "../evil", destination: "/x"))
+        }
+    }
+}
+
 @Suite("VolumeManager — get / list")
 struct VolumeManagerGetListTests {
     @Test func getReturnsVolume() async throws {
