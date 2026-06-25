@@ -510,6 +510,26 @@ actor DockerfileBuilder {
         let size: Int
     }
 
+    /// Per-stage default env for the build pipeline. PRO-54.
+    ///
+    /// Auto-injects `COREPACK_ENABLE_DOWNLOAD_PROMPT=0` so that `corepack`
+    /// (which drives `pnpm` / `yarn` shims since Node 16) doesn't hang on
+    /// its "! Corepack is about to download …" interactive prompt — build
+    /// VMs have no TTY so that prompt would otherwise wait forever and
+    /// hit the 600 s RUN timeout. The user's own `ENV` instructions are
+    /// applied AFTER this default and overwrite any key they set, so a
+    /// `ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=1` in the Dockerfile still
+    /// wins.
+    ///
+    /// `nonisolated static` so it's directly unit-testable without
+    /// spinning up the actor.
+    nonisolated static func defaultBuildEnv(path: String) -> [String: String] {
+        [
+            "PATH": path,
+            "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+        ]
+    }
+
     init(imageManager: ImageManager, vmRuntime: VMRuntime?, config: BuildConfig, progressHandler: @escaping (StreamEvent) -> Void) {
         self.imageManager = imageManager
         self.vmRuntime = vmRuntime
@@ -601,7 +621,7 @@ actor DockerfileBuilder {
         let defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         // ENV instructions only — these end up in the final image's runtime
         // env. Reset per stage.
-        var env: [String: String] = ["PATH": defaultPath]
+        var env: [String: String] = Self.defaultBuildEnv(path: defaultPath)
         // Build-only variables (ARG + --build-arg). Persist across stages
         // (matches Docker), used for variable substitution, NOT persisted
         // into the final image.
@@ -739,7 +759,7 @@ actor DockerfileBuilder {
                 stopSignal = nil
                 user = ""
                 workdir = "/"
-                env = ["PATH": defaultPath]
+                env = Self.defaultBuildEnv(path: defaultPath)
                 // Inherit base image layers + runtime config. Without
                 // this a Dockerfile that only declares HEALTHCHECK / LABEL
                 // would lose the parent image's CMD/ENTRYPOINT/ENV and
