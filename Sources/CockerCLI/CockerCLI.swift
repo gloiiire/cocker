@@ -87,6 +87,10 @@ struct CockerCLI: AsyncParsableCommand {
             VersionCommand.self,
             InfoCommand.self,
             PruneCommand.self,
+            // Top-level shortcut for `cocker system prune` (PRO-58).
+            // Includes the `--staging` flag for wiping the iCloud
+            // staging cache used by `cocker compose up`.
+            TopLevelPruneCommand.self,
 
             // iCloud Drive integration (macOS-specific)
             ICloudCommand.self,

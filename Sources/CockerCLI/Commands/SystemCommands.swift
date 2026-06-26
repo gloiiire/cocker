@@ -113,19 +113,24 @@ struct PruneCommand: AsyncParsableCommand {
     )
 }
 
-struct SystemPruneCommand: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "prune", abstract: "Remove unused data")
-
-    @Flag(name: [.short, .customLong("force")], help: "Do not prompt for confirmation")
-    var force = false
-
-    @Flag(name: [.short, .customLong("volumes")], help: "Also prune volumes")
-    var volumes = false
-
-    mutating func run() async throws {
-        let summary = volumes
-            ? "This will remove all stopped containers, dangling images, AND unreferenced volumes."
-            : "This will remove all stopped containers and dangling images."
+/// Shared prune logic. Two CLI surfaces invoke this :
+///   1. `cocker system prune` (Docker-compatible path)
+///   2. `cocker prune` (top-level shortcut, PRO-58 — same flags)
+/// `--staging` (PRO-58) also wipes the iCloud staging cache used by
+/// `cocker compose up`. The cache only exists for iCloud-resident
+/// projects, so on a non-iCloud workflow the staging branch is a
+/// no-op (clearCache returns 0 B reclaimed).
+enum PruneRunner {
+    static func run(force: Bool, volumes: Bool, staging: Bool) async throws {
+        var extras: [String] = []
+        if volumes { extras.append("unreferenced volumes") }
+        if staging { extras.append("the iCloud staging cache") }
+        // "containers and dangling images" + " AND volumes" → flat list ;
+        // for two extras, " AND volumes AND the staging cache" reads
+        // worse than " ; volumes ; and the staging cache" but only one
+        // extra at a time is realistic for now so keep it simple.
+        let suffix = extras.isEmpty ? "" : " and \(extras.joined(separator: ", and "))"
+        let summary = "This will remove all stopped containers and dangling images\(suffix)."
         guard UX.Confirm.ask(summary: summary, force: force) else { return }
 
         let client = IPCClient()
@@ -137,12 +142,72 @@ struct SystemPruneCommand: AsyncParsableCommand {
         for i in result.imagesDeleted     { UX.printResult(.image, i, verb: .remove) }
         for v in result.volumesDeleted    { UX.printResult(.volume, v, verb: .remove) }
 
-        let nothing = result.containersDeleted.isEmpty && result.imagesDeleted.isEmpty && result.volumesDeleted.isEmpty
+        // PRO-58 : staging happens host-side (the CLI has direct access
+        // to ~/Library/Caches/cocker/staging), not via the daemon. Run it
+        // after the daemon-side prune so the printed totals are
+        // additive. The cache has no per-project listing surface, so we
+        // print a single line rather than going through `printResult`
+        // (which expects one named entity).
+        var stagingFreed: UInt64 = 0
+        if staging {
+            stagingFreed = ICloudStaging.clearCache()
+            if stagingFreed > 0 {
+                print(" " + UX.TTY.paint("✓", .success)
+                    + " iCloud staging cache cleared ("
+                    + UX.formatBytes(Int64(stagingFreed)) + ")")
+            }
+        }
+
+        let totalReclaimed = Int64(result.spaceReclaimed) + Int64(stagingFreed)
+        let nothing = result.containersDeleted.isEmpty
+            && result.imagesDeleted.isEmpty
+            && result.volumesDeleted.isEmpty
+            && stagingFreed == 0
         if nothing {
             print(" " + UX.TTY.paint("nothing to prune — 0 B reclaimed", .dim, [.italic]))
         } else {
-            print(" " + UX.TTY.paint("reclaimed \(UX.formatBytes(Int64(result.spaceReclaimed)))", .dim))
+            print(" " + UX.TTY.paint("reclaimed \(UX.formatBytes(totalReclaimed))", .dim))
         }
+    }
+}
+
+struct SystemPruneCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(commandName: "prune", abstract: "Remove unused data")
+
+    @Flag(name: [.short, .customLong("force")], help: "Do not prompt for confirmation")
+    var force = false
+
+    @Flag(name: [.short, .customLong("volumes")], help: "Also prune volumes")
+    var volumes = false
+
+    @Flag(name: .customLong("staging"), help: "Also wipe the iCloud staging cache used by `cocker compose up`")
+    var staging = false
+
+    mutating func run() async throws {
+        try await PruneRunner.run(force: force, volumes: volumes, staging: staging)
+    }
+}
+
+/// `cocker prune` — top-level shortcut to the same flow. Same flags,
+/// same semantics. Exists because `cocker system prune` is buried
+/// under `system` and most users expect a plain `prune` (PRO-58).
+struct TopLevelPruneCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "prune",
+        abstract: "Remove unused data (alias for `cocker system prune`)"
+    )
+
+    @Flag(name: [.short, .customLong("force")], help: "Do not prompt for confirmation")
+    var force = false
+
+    @Flag(name: [.short, .customLong("volumes")], help: "Also prune volumes")
+    var volumes = false
+
+    @Flag(name: .customLong("staging"), help: "Also wipe the iCloud staging cache used by `cocker compose up`")
+    var staging = false
+
+    mutating func run() async throws {
+        try await PruneRunner.run(force: force, volumes: volumes, staging: staging)
     }
 }
 
