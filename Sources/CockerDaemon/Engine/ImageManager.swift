@@ -1707,33 +1707,11 @@ actor DockerfileBuilder {
             throw CockerError.buildFailed("apply overlay layer to rootfs: \(e)")
         }
 
-        // Apply OCI whiteouts to the host base. A `.wh.NAME` entry means
-        // NAME was deleted this step ; the extract above wrote the marker
-        // as a file, so remove both the marker and the real target it
-        // stands for, keeping the cumulative base in sync with the layer.
-        // (Opaque-dir markers `.wh..wh..opq` are left for a later pass.)
-        let listProc = Process()
-        listProc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        listProc.arguments = ["-tzf", tar.path]
-        let listPipe = Pipe()
-        listProc.standardOutput = listPipe
-        try listProc.run()
-        let listData = listPipe.fileHandleForReading.readDataToEndOfFile()
-        listProc.waitUntilExit()
-        for line in (String(data: listData, encoding: .utf8) ?? "").split(separator: "\n") {
-            var rel = String(line)
-            if rel.hasPrefix("./") { rel = String(rel.dropFirst(2)) }
-            let base = (rel as NSString).lastPathComponent
-            guard base.hasPrefix(".wh."), base != ".wh..wh..opq" else { continue }
-            let dir = (rel as NSString).deletingLastPathComponent
-            let targetName = String(base.dropFirst(4))
-            let markerURL = rootfs.appendingPathComponent(rel)
-            let targetURL = dir.isEmpty
-                ? rootfs.appendingPathComponent(targetName)
-                : rootfs.appendingPathComponent(dir).appendingPathComponent(targetName)
-            try? FileManager.default.removeItem(at: targetURL)
-            try? FileManager.default.removeItem(at: markerURL)
-        }
+        // Apply OCI whiteouts to the host base so the cumulative rootfs
+        // matches the layer. Shared with the cache-hit path (BuildCache.
+        // apply) so a fresh build and a cached rebuild reconstruct the
+        // exact same tree.
+        try BuildCache.applyWhiteouts(fromTar: tar, to: rootfs)
 
         return CreatedLayer(digest: digest, size: tarData.count)
     }
@@ -1943,6 +1921,56 @@ enum BuildCache {
         proc.waitUntilExit()
         if proc.terminationStatus != 0 {
             throw CockerError.buildFailed("cached layer extract failed (exit \(proc.terminationStatus))")
+        }
+        // A cached layer can carry OCI `.wh.` whiteouts (from a `RUN rm …`
+        // step). tar just extracted them as literal marker files ; apply
+        // them so a cache HIT reconstructs exactly the same rootfs a fresh
+        // build would (PRO-73 — the ext4-overlay path applies whiteouts the
+        // same way in registerOverlayLayer, and this keeps the two in sync).
+        try Self.applyWhiteouts(fromTar: blobPath, to: rootfs)
+    }
+
+    /// Compute the (marker, target) URL pairs an OCI layer's whiteout
+    /// entries map to under `rootfs`. `.wh.NAME` deletes NAME in the same
+    /// directory ; the opaque-dir marker `.wh..wh..opq` is skipped (handled
+    /// separately). Pure path math, split out so it's unit-testable without
+    /// any tar/filesystem.
+    static func whiteoutTargets(in entries: [String], rootfs: URL) -> [(marker: URL, target: URL)] {
+        var pairs: [(URL, URL)] = []
+        for entry in entries {
+            var rel = entry
+            if rel.hasPrefix("./") { rel = String(rel.dropFirst(2)) }
+            let base = (rel as NSString).lastPathComponent
+            guard base.hasPrefix(".wh."), base != ".wh..wh..opq" else { continue }
+            let dir = (rel as NSString).deletingLastPathComponent
+            let targetName = String(base.dropFirst(4))
+            let marker = rootfs.appendingPathComponent(rel)
+            let target = dir.isEmpty
+                ? rootfs.appendingPathComponent(targetName)
+                : rootfs.appendingPathComponent(dir).appendingPathComponent(targetName)
+            pairs.append((marker, target))
+        }
+        return pairs
+    }
+
+    /// List a layer tarball and apply its OCI whiteouts to `rootfs` —
+    /// removing both the deleted target and the `.wh.` marker the extract
+    /// wrote. Shared by cache replay (above) and the fresh ext4-overlay
+    /// build path (registerOverlayLayer) so both stay consistent.
+    static func applyWhiteouts(fromTar tarPath: URL, to rootfs: URL) throws {
+        let listProc = Process()
+        listProc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        listProc.arguments = ["-tzf", tarPath.path]
+        let pipe = Pipe()
+        listProc.standardOutput = pipe
+        try listProc.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        listProc.waitUntilExit()
+        let entries = (String(data: data, encoding: .utf8) ?? "")
+            .split(separator: "\n").map(String.init)
+        for (marker, target) in whiteoutTargets(in: entries, rootfs: rootfs) {
+            try? FileManager.default.removeItem(at: target)
+            try? FileManager.default.removeItem(at: marker)
         }
     }
 }
