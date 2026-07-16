@@ -496,6 +496,15 @@ final class VMRuntime: NSObject {
     /// puis retourne. Le rootfs est modifié en place (virtiofs rw).
     ///
     /// Pour le build seulement — pas tracké dans runningVMs.
+    /// Result of a build `RUN` : the exit code plus the VM console output
+    /// so the caller can surface a failed step's real error at the terminal
+    /// instead of the bare "exited with code N" (PRO-73 — the apt EACCES was
+    /// invisible because this output only went to cockerd.log).
+    struct EphemeralRunResult {
+        let exitCode: Int32
+        let output: String
+    }
+
     func runEphemeral(
         rootfsPath: URL,
         command: [String],
@@ -504,7 +513,7 @@ final class VMRuntime: NSObject {
         timeout: TimeInterval = 600,
         targetArch: String? = nil,
         buildOverlayOutbox: URL? = nil
-    ) async throws -> Int32 {
+    ) async throws -> EphemeralRunResult {
         fputs("[vm-build] runEphemeral cmd=\(command.joined(separator: " ")) rootfs=\(rootfsPath.path)\n", stderr)
         fflush(stderr)
         try ensureKernelAvailable()
@@ -541,7 +550,19 @@ final class VMRuntime: NSObject {
                 .appendingPathComponent("cocker-upper-\(ephID).img")
             // 16 GiB sparse : big enough for heavy `RUN`s (full toolchains,
             // node_modules), costs only the bytes actually written on APFS.
-            try Ext4Image.createFormatted(at: img, size: 16 * 1024 * 1024 * 1024)
+            try Ext4Image.createSparse(at: img, size: 16 * 1024 * 1024 * 1024)
+            // Format host-side with brew mke2fs when available (fast, common
+            // case). If e2fsprogs isn't installed, leave it unformatted —
+            // cocker-init's switch_to_overlay runs mkfs.ext4 in the VM if the
+            // base image bundles e2fsprogs. Only if neither is present does
+            // the build fail, with a clear mount error.
+            if Ext4Image.mke2fsPath() != nil {
+                try Ext4Image.format(at: img)
+            } else {
+                fputs("[vm-build] mke2fs not found on host (brew install e2fsprogs) — " +
+                      "deferring ext4 format to the VM (needs mkfs.ext4 in the base image)\n", stderr)
+                fflush(stderr)
+            }
             ext4Upper = img
             labels["com.cocker.build-overlay-dev"] = "/dev/vda"
             labels["com.cocker.build-ext4-img"] = img.path
@@ -665,7 +686,7 @@ final class VMRuntime: NSObject {
         // boot, but cleaning here keeps built images well-formed.
         try? FileManager.default.removeItem(at: rootfsPath.appendingPathComponent("cocker-ip"))
 
-        return exitCode
+        return EphemeralRunResult(exitCode: exitCode, output: output)
     }
 
     /// PRO-52 — turn (parsed marker, timedOut) into a single exit code

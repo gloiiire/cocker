@@ -28,15 +28,9 @@ enum Ext4Image {
         mke2fsCandidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    /// Create a sparse `size`-byte file at `url` and format it ext4.
-    ///
-    /// Sparse (ftruncate) so an oversized image costs only the bytes
-    /// actually written. Throws if e2fsprogs is missing or mke2fs fails —
-    /// the caller (build path) surfaces a clear "brew install e2fsprogs"
-    /// hint. cocker-init also carries an in-guest mkfs fallback for images
-    /// that bundle e2fsprogs, but formatting host-side keeps the common
-    /// case fast and self-contained.
-    static func createFormatted(at url: URL, size: UInt64) throws {
+    /// Allocate a sparse `size`-byte file at `url` (ftruncate — costs only
+    /// the bytes actually written on APFS). No filesystem yet.
+    static func createSparse(at url: URL, size: UInt64) throws {
         let fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
         guard fd >= 0 else {
             throw CockerError.requestFailed(
@@ -49,9 +43,12 @@ enum Ext4Image {
             throw CockerError.requestFailed(
                 "ftruncate ext4 image: \(String(cString: strerror(errno)))")
         }
+    }
 
+    /// Format an existing image file ext4 with brew mke2fs. Throws if
+    /// e2fsprogs isn't installed or mke2fs fails.
+    static func format(at url: URL) throws {
         guard let mke2fs = mke2fsPath() else {
-            try? FileManager.default.removeItem(at: url)
             throw CockerError.requestFailed(
                 "mke2fs not found — run `brew install e2fsprogs` to build images " +
                 "(the build rootfs upper is a native ext4 disk image, PRO-73)")
@@ -64,9 +61,22 @@ enum Ext4Image {
         try proc.run()
         proc.waitUntilExit()
         guard proc.terminationStatus == 0 else {
-            try? FileManager.default.removeItem(at: url)
             throw CockerError.requestFailed(
                 "mke2fs failed (exit \(proc.terminationStatus)) on \(url.path)")
+        }
+    }
+
+    /// Create a sparse image and format it ext4 in one shot. Throws if
+    /// e2fsprogs is missing — callers that can defer formatting to the
+    /// guest (cocker-init's in-VM mkfs.ext4 fallback) should use
+    /// createSparse + a guarded format() instead.
+    static func createFormatted(at url: URL, size: UInt64) throws {
+        try createSparse(at: url, size: size)
+        do {
+            try format(at: url)
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            throw error
         }
     }
 }

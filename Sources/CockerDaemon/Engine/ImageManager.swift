@@ -832,39 +832,50 @@ actor DockerfileBuilder {
                         plat.split(separator: "/").last.map(String.init)
                     }
 
-                    // PRO-73 : ext4-overlay build path (opt-in via
-                    // COCKER_BUILD_EXT4). The RUN's writes land on a native
-                    // ext4 overlay upper instead of straight through Apple
-                    // virtiofs, which EACCESes on dpkg's mode-000 file
-                    // creates and broke every `apt-get install` of a package
-                    // shipping files. The guest wrapper tars the overlay
-                    // upperdir (= exactly this step's changes) into the
-                    // outbox share ; we read that back as the OCI layer and
-                    // replay it onto the host working dir so subsequent steps
-                    // see a cumulative base (host-side tar → no virtiofs, no
-                    // EACCES, final modes preserved).
-                    if ProcessInfo.processInfo.environment["COCKER_BUILD_EXT4"] != nil {
+                    // PRO-73 : ext4-overlay build path (now the default ;
+                    // COCKER_BUILD_LEGACY=1 forces the old host-diff path).
+                    // The RUN's writes land on a native ext4 overlay upper
+                    // instead of straight through Apple virtiofs, which
+                    // EACCESes on dpkg's mode-000 file creates and broke every
+                    // `apt-get install` of a package shipping files. The guest
+                    // wrapper tars the overlay upperdir (= exactly this step's
+                    // changes) into the outbox share ; we read that back as the
+                    // OCI layer and replay it onto the host working dir so
+                    // subsequent steps see a cumulative base (host-side tar →
+                    // no virtiofs, no EACCES, final modes preserved). Needs
+                    // `tar`/`find` in the base image (guarded below).
+                    if ProcessInfo.processInfo.environment["COCKER_BUILD_LEGACY"] == nil {
                         let outbox = buildDir.appendingPathComponent("outbox-\(UUID().uuidString.prefix(8))")
                         try FileManager.default.createDirectory(at: outbox, withIntermediateDirectories: true)
                         // The wrapper runs the RUN command, then (on success)
                         // turns the overlay upperdir into an OCI layer tarball
-                        // in the outbox. overlayfs marks deletions with char
-                        // device 0:0 whiteouts — convert those to OCI `.wh.`
-                        // marker files first, so (a) the tar carries no device
-                        // nodes the unprivileged host tar can't recreate, and
-                        // (b) the layer expresses deletions the OCI way.
+                        // in the outbox:
+                        //  - overlayfs marks deletions with char-device 0:0
+                        //    whiteouts → convert to OCI `.wh.` markers so the
+                        //    tar carries no device nodes the unprivileged host
+                        //    tar can't recreate, and deletions are expressed
+                        //    the OCI way.
+                        //  - a wholesale-replaced dir is marked opaque via the
+                        //    trusted.overlay.opaque xattr → emit `.wh..wh..opq`
+                        //    when getfattr is available (best-effort: images
+                        //    without the attr tools skip this rare case).
                         let wrapped = command + "\n"
                             + "__cocker_rc=$?\n"
                             + "if [ \"$__cocker_rc\" -eq 0 ]; then "
                             + "find /.cocker-upper -mindepth 1 -type c 2>/dev/null | "
                             + "while IFS= read -r p; do d=${p%/*}; b=${p##*/}; "
                             + "rm -f \"$p\" && : > \"$d/.wh.$b\"; done; "
+                            + "if command -v getfattr >/dev/null 2>&1; then "
+                            + "find /.cocker-upper -mindepth 1 -type d 2>/dev/null | "
+                            + "while IFS= read -r d; do "
+                            + "getfattr -n trusted.overlay.opaque --only-values \"$d\" 2>/dev/null "
+                            + "| grep -q y && : > \"$d/.wh..wh..opq\"; done; fi; "
                             + "tar czf /.cocker-outbox/layer.tar -C /.cocker-upper "
                             + "--exclude=./.cocker-upper --exclude=./.cocker-outbox . "
                             + "2>/.cocker-outbox/tar.err || echo 'cocker: layer tar failed' >&2; "
                             + "sync; fi\n"
                             + "exit \"$__cocker_rc\"\n"
-                        let exitCode = try await vm.runEphemeral(
+                        let result = try await vm.runEphemeral(
                             rootfsPath: rootfs,
                             command: ["/bin/sh", "-c", wrapped],
                             env: substEnv(),
@@ -873,12 +884,25 @@ actor DockerfileBuilder {
                             targetArch: buildArch,
                             buildOverlayOutbox: outbox
                         )
-                        if exitCode != 0 {
+                        if result.exitCode != 0 {
                             try? FileManager.default.removeItem(at: outbox)
-                            throw CockerError.buildFailed("RUN '\(command)' exited with code \(exitCode)")
+                            throw runStepFailure(command, result)
                         }
                         let blobsDir = await imageManager.blobDir()
                         let layerTar = outbox.appendingPathComponent("layer.tar")
+                        // The wrapper always tars the upperdir after a
+                        // successful RUN, so a missing layer.tar means the
+                        // base image has no `tar` — fail loudly instead of
+                        // silently dropping the step's changes. (Set
+                        // COCKER_BUILD_LEGACY=1 to fall back to the host-diff
+                        // path for such images.)
+                        guard FileManager.default.fileExists(atPath: layerTar.path) else {
+                            try? FileManager.default.removeItem(at: outbox)
+                            throw CockerError.buildFailed(
+                                "RUN '\(command)': could not capture the layer — the base image " +
+                                "needs `tar` (and `find`) for build steps. Add it (apk add tar / " +
+                                "apt-get install tar) or set COCKER_BUILD_LEGACY=1.")
+                        }
                         if let layer = try await registerOverlayLayer(tar: layerTar, rootfs: rootfs, blobsDir: blobsDir) {
                             layers.append(layer)
                             try? await BuildCache.store(key: stepHash, layer: layer, root: buildRoot)
@@ -887,7 +911,7 @@ actor DockerfileBuilder {
                         try? FileManager.default.removeItem(at: outbox)
                     } else {
                     let before = try snapshotFiles(at: rootfs)
-                    let exitCode = try await vm.runEphemeral(
+                    let result = try await vm.runEphemeral(
                         rootfsPath: rootfs,
                         command: ["/bin/sh", "-c", command],
                         env: substEnv(),
@@ -895,8 +919,8 @@ actor DockerfileBuilder {
                         timeout: 600,
                         targetArch: buildArch
                     )
-                    if exitCode != 0 {
-                        throw CockerError.buildFailed("RUN '\(command)' exited with code \(exitCode)")
+                    if result.exitCode != 0 {
+                        throw runStepFailure(command, result)
                     }
                     let after = try snapshotFiles(at: rootfs)
                     let changed = after.filter { key, hash in before[key] != hash }.map { $0.key }
@@ -1689,6 +1713,21 @@ actor DockerfileBuilder {
     // Returns nil when the step produced no changes (no tarball, or an
     // empty one) so the caller simply appends no layer — matching the
     // legacy path's "changed.isEmpty" behaviour.
+    /// Surface a failed RUN step's real console output at the terminal,
+    /// then build the error to throw. Before this, that output only went to
+    /// cockerd.log, so the user saw a bare "exited with code N" while the
+    /// actual cause (apt's EACCES, a compiler error, a missing package)
+    /// sat invisible in the tail. (PRO-73)
+    private func runStepFailure(_ command: String, _ result: VMRuntime.EphemeralRunResult) -> CockerError {
+        let tail = String(result.output.suffix(4096))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty {
+            log(.stderr, "\nThe command '\(command)' returned a non-zero code \(result.exitCode). Output:\n")
+            log(.stderr, tail + "\n")
+        }
+        return CockerError.buildFailed("RUN '\(command)' exited with code \(result.exitCode)")
+    }
+
     private func registerOverlayLayer(tar: URL, rootfs: URL, blobsDir: URL) async throws -> CreatedLayer? {
         guard FileManager.default.fileExists(atPath: tar.path),
               let tarData = try? Data(contentsOf: tar), !tarData.isEmpty else {
@@ -1700,27 +1739,14 @@ actor DockerfileBuilder {
             try tarData.write(to: blobPath)
         }
 
-        // Replay onto the host base dir. Host-side tar writes to a local
-        // APFS dir (not virtiofs), so dpkg's transient mode-000 files —
-        // already chmod'd to their final mode inside the layer — extract
-        // fine, and the next RUN's virtiofs lower sees the new state.
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        proc.arguments = ["-xzf", tar.path, "-C", rootfs.path]
-        let errPipe = Pipe()
-        proc.standardError = errPipe
-        try proc.run()
-        proc.waitUntilExit()
-        if proc.terminationStatus != 0 {
-            let e = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw CockerError.buildFailed("apply overlay layer to rootfs: \(e)")
-        }
-
-        // Apply OCI whiteouts to the host base so the cumulative rootfs
-        // matches the layer. Shared with the cache-hit path (BuildCache.
-        // apply) so a fresh build and a cached rebuild reconstruct the
-        // exact same tree.
-        try BuildCache.applyWhiteouts(fromTar: tar, to: rootfs)
+        // Replay onto the host base dir (opaque-dir clear → extract →
+        // whiteouts), the same helper the cache-hit path uses so a fresh
+        // build and a cached rebuild reconstruct the exact same tree.
+        // Host-side tar writes to a local APFS dir (not virtiofs), so dpkg's
+        // transient mode-000 files — already chmod'd to their final mode in
+        // the layer — extract fine, and the next RUN's virtiofs lower sees
+        // the new state.
+        try BuildCache.applyLayer(tarPath: tar, to: rootfs)
 
         return CreatedLayer(digest: digest, size: tarData.count)
     }
@@ -1922,21 +1948,10 @@ enum BuildCache {
         guard FileManager.default.fileExists(atPath: blobPath.path) else {
             throw CockerError.buildFailed("cached layer blob missing: \(layer.digest)")
         }
-        // tar zxf <blob> -C <rootfs>
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        proc.arguments = ["-xzf", blobPath.path, "-C", rootfs.path]
-        try proc.run()
-        proc.waitUntilExit()
-        if proc.terminationStatus != 0 {
-            throw CockerError.buildFailed("cached layer extract failed (exit \(proc.terminationStatus))")
-        }
-        // A cached layer can carry OCI `.wh.` whiteouts (from a `RUN rm …`
-        // step). tar just extracted them as literal marker files ; apply
-        // them so a cache HIT reconstructs exactly the same rootfs a fresh
-        // build would (PRO-73 — the ext4-overlay path applies whiteouts the
-        // same way in registerOverlayLayer, and this keeps the two in sync).
-        try Self.applyWhiteouts(fromTar: blobPath, to: rootfs)
+        // Same replay as a fresh build (opaque-dir clear → extract →
+        // whiteouts) so a cache HIT reconstructs exactly the rootfs the
+        // original build produced at this step.
+        try applyLayer(tarPath: blobPath, to: rootfs)
     }
 
     /// Compute the (marker, target) URL pairs an OCI layer's whiteout
@@ -1962,25 +1977,64 @@ enum BuildCache {
         return pairs
     }
 
-    /// List a layer tarball and apply its OCI whiteouts to `rootfs` —
-    /// removing both the deleted target and the `.wh.` marker the extract
-    /// wrote. Shared by cache replay (above) and the fresh ext4-overlay
-    /// build path (registerOverlayLayer) so both stay consistent.
-    static func applyWhiteouts(fromTar tarPath: URL, to rootfs: URL) throws {
-        let listProc = Process()
-        listProc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        listProc.arguments = ["-tzf", tarPath.path]
-        let pipe = Pipe()
-        listProc.standardOutput = pipe
-        try listProc.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        listProc.waitUntilExit()
-        let entries = (String(data: data, encoding: .utf8) ?? "")
-            .split(separator: "\n").map(String.init)
+    /// Replay a layer tarball onto `rootfs` the OCI way — opaque-dir clear,
+    /// extract, then whiteout apply. Shared by the fresh ext4-overlay build
+    /// (registerOverlayLayer) and cache replay (apply) so both reconstruct
+    /// exactly the same tree.
+    static func applyLayer(tarPath: URL, to rootfs: URL) throws {
+        let entries = try listTar(tarPath)
+
+        // 1. Opaque dirs : `<dir>/.wh..wh..opq` means the layer replaces
+        //    <dir> wholesale, so wipe the base's inherited contents BEFORE
+        //    extracting the layer's version on top. (Arises from a
+        //    remove-then-recreate of a directory that existed in the base.)
+        for rel in entries.map(stripDotSlash) where (rel as NSString).lastPathComponent == ".wh..wh..opq" {
+            let dir = (rel as NSString).deletingLastPathComponent
+            let dirURL = dir.isEmpty ? rootfs : rootfs.appendingPathComponent(dir)
+            if let kids = try? FileManager.default.contentsOfDirectory(
+                at: dirURL, includingPropertiesForKeys: nil) {
+                for k in kids { try? FileManager.default.removeItem(at: k) }
+            }
+        }
+
+        // 2. Extract the diff.
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        proc.arguments = ["-xzf", tarPath.path, "-C", rootfs.path]
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        try proc.run()
+        proc.waitUntilExit()
+        if proc.terminationStatus != 0 {
+            let e = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw CockerError.buildFailed("apply layer to rootfs: \(e)")
+        }
+
+        // 3. Whiteouts : drop each `.wh.NAME` target + its marker, and the
+        //    extracted `.wh..wh..opq` markers (their effect was applied in 1).
         for (marker, target) in whiteoutTargets(in: entries, rootfs: rootfs) {
             try? FileManager.default.removeItem(at: target)
             try? FileManager.default.removeItem(at: marker)
         }
+        for rel in entries.map(stripDotSlash) where (rel as NSString).lastPathComponent == ".wh..wh..opq" {
+            try? FileManager.default.removeItem(at: rootfs.appendingPathComponent(rel))
+        }
+    }
+
+    private static func stripDotSlash(_ entry: String) -> String {
+        entry.hasPrefix("./") ? String(entry.dropFirst(2)) : entry
+    }
+
+    private static func listTar(_ tarPath: URL) throws -> [String] {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        p.arguments = ["-tzf", tarPath.path]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        try p.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return (String(data: data, encoding: .utf8) ?? "").split(separator: "\n").map(String.init)
     }
 }
 
