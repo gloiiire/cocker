@@ -40,8 +40,21 @@ public struct KernelCommandLineParams: Sendable {
     /// (dpkg's unpack pattern → every `apt-get install` of a package
     /// shipping files failed), so builds mount a native ext4 image where
     /// the guest kernel owns permissions. nil → virtiofs root, unchanged.
-    /// See PRO-73. cocker-init reads this as `cocker.rootfs=blk:<dev>`.
+    /// See PRO-73. cocker-init reads this as `cocker.rootfs=blk:<dev>`
+    /// (plain ext4 root) or `overlay:<dev>` when `buildOverlay` is set.
     public let rootDevice: String?
+
+    /// When true (with `rootDevice` set), the ext4 device is the *upper*
+    /// of an overlay whose lower is the virtiofs base image — the shape
+    /// the image-build path actually uses. Emits `cocker.rootfs=overlay:`
+    /// instead of `blk:`. See PRO-73.
+    public let buildOverlay: Bool
+
+    /// virtiofs tag of the build "outbox" share (host dir the daemon reads
+    /// the produced layer tarball from). Emitted as `cocker.outbox=<tag>`
+    /// so cocker-init mounts it at /.cocker-outbox inside the build root.
+    /// nil outside the build-overlay path.
+    public let outboxTag: String?
 
     public init(container: Container,
                 dnsIP: String,
@@ -51,7 +64,9 @@ public struct KernelCommandLineParams: Sendable {
                 qemuArch: String? = nil,
                 qemuPath: String? = nil,
                 volumeSpecs: [String] = [],
-                rootDevice: String? = nil) {
+                rootDevice: String? = nil,
+                buildOverlay: Bool = false,
+                outboxTag: String? = nil) {
         self.container = container
         self.dnsIP = dnsIP
         self.dnsPort = dnsPort
@@ -61,6 +76,8 @@ public struct KernelCommandLineParams: Sendable {
         self.qemuPath = qemuPath
         self.volumeSpecs = volumeSpecs
         self.rootDevice = rootDevice
+        self.buildOverlay = buildOverlay
+        self.outboxTag = outboxTag
     }
 }
 
@@ -88,7 +105,10 @@ public enum KernelCommandLine {
             "cocker.dns_vsock_port=\(params.dnsVsockPort)",
         ]
         if let dev = params.rootDevice {
-            parts.append("cocker.rootfs=blk:\(dev)")
+            parts.append("cocker.rootfs=\(params.buildOverlay ? "overlay" : "blk"):\(dev)")
+        }
+        if let tag = params.outboxTag {
+            parts.append("cocker.outbox=\(tag)")
         }
 
         if !params.container.hostname.isEmpty {

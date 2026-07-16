@@ -231,7 +231,11 @@ final class VMRuntime: NSObject {
             normalizedRootfs = rootfsPath
         }
 
-        let sharedDir = VZSharedDirectory(url: normalizedRootfs, readOnly: false)
+        // Build-overlay (PRO-73) : the "root" share is the overlay LOWER
+        // (base image), mounted read-only in the guest ; all writes go to
+        // the ext4 upper attached below. Normal runs keep it read-write.
+        let rootReadOnly = container.labels["com.cocker.build-overlay-dev"] != nil
+        let sharedDir = VZSharedDirectory(url: normalizedRootfs, readOnly: rootReadOnly)
         let sharing = VZSingleDirectoryShare(directory: sharedDir)
         let fsConfig = VZVirtioFileSystemDeviceConfiguration(tag: "root")
         fsConfig.share = sharing
@@ -255,6 +259,19 @@ final class VMRuntime: NSObject {
         var storageDevices: [VZStorageDeviceConfiguration] = []
         var volumeSpecs: [String] = []
         var blockIdx = 0
+
+        // Build-overlay (PRO-73) : the ext4 upper is attached as the FIRST
+        // block device so it lands at /dev/vda (the value the cmdline's
+        // `cocker.rootfs=overlay:/dev/vda` and cocker-init agree on). It
+        // must precede any volume block device so the /dev/vd<letter>
+        // accounting below stays correct.
+        if let ext4Path = container.labels["com.cocker.build-ext4-img"] {
+            let attachment = try VZDiskImageStorageDeviceAttachment(
+                url: URL(fileURLWithPath: ext4Path), readOnly: false)
+            storageDevices.append(VZVirtioBlockDeviceConfiguration(attachment: attachment))
+            blockIdx += 1 // /dev/vda consumed by the ext4 upper
+        }
+
         for (i, mount) in container.volumes.enumerated() {
             let hostURL: URL
             if mount.source.hasPrefix("/") {
@@ -336,6 +353,18 @@ final class VMRuntime: NSObject {
             let qemuFS = VZVirtioFileSystemDeviceConfiguration(tag: "qemu")
             qemuFS.share = qemuShare
             fsDevices.append(qemuFS)
+        }
+
+        // Build-overlay (PRO-73) : the "outbox" share is a host dir the
+        // guest RUN wrapper writes the produced layer tarball into, which
+        // the daemon then reads back as the OCI layer. cocker-init mounts
+        // it at /.cocker-outbox inside the build root.
+        if let outboxPath = container.labels["com.cocker.build-outbox"] {
+            let outboxShare = VZSingleDirectoryShare(
+                directory: VZSharedDirectory(url: URL(fileURLWithPath: outboxPath), readOnly: false))
+            let outboxFS = VZVirtioFileSystemDeviceConfiguration(tag: "outbox")
+            outboxFS.share = outboxShare
+            fsDevices.append(outboxFS)
         }
 
         config.directorySharingDevices = fsDevices
@@ -423,6 +452,12 @@ final class VMRuntime: NSObject {
         // to plumb. Production runs leave it empty.
         let qemuArch = container.labels["com.cocker.qemu-arch"]
         let qemuPath = qemuArch.map { _ in "/opt/cocker/qemu/qemu-\(qemuArch!)-static" }
+        // Build-overlay (PRO-73) : when the synthetic build container is
+        // stamped with the ext4-upper device, emit the overlay rootfs spec
+        // + outbox tag so cocker-init boots the base-virtiofs/ext4-upper
+        // overlay instead of a plain virtiofs root.
+        let overlayDev = container.labels["com.cocker.build-overlay-dev"]
+        let outboxTag = container.labels["com.cocker.build-outbox"] != nil ? "outbox" : nil
         return KernelCommandLine.build(KernelCommandLineParams(
             container: container,
             dnsIP: DNSServer.hostIP(),
@@ -431,7 +466,10 @@ final class VMRuntime: NSObject {
             cockerSwitchGateway: NetworkManager.cockerSwitchGateway,
             qemuArch: qemuArch,
             qemuPath: qemuPath,
-            volumeSpecs: volumeSpecs
+            volumeSpecs: volumeSpecs,
+            rootDevice: overlayDev,
+            buildOverlay: overlayDev != nil,
+            outboxTag: outboxTag
         ))
     }
 
@@ -464,7 +502,8 @@ final class VMRuntime: NSObject {
         env: [String: String],
         workdir: String?,
         timeout: TimeInterval = 600,
-        targetArch: String? = nil
+        targetArch: String? = nil,
+        buildOverlayOutbox: URL? = nil
     ) async throws -> Int32 {
         fputs("[vm-build] runEphemeral cmd=\(command.joined(separator: " ")) rootfs=\(rootfsPath.path)\n", stderr)
         fflush(stderr)
@@ -488,6 +527,28 @@ final class VMRuntime: NSObject {
             }
             labels["com.cocker.qemu-arch"] = kernelArch
         }
+
+        // Build-overlay (PRO-73) : back the RUN step's writes with a fresh
+        // ext4 upper instead of writing straight through Apple virtiofs
+        // (which EACCESes on dpkg's mode-000 file creates). createVM keys
+        // off these labels to attach the ext4 image at /dev/vda + the
+        // outbox share ; the upper is the produced layer, tarred into the
+        // outbox by the caller's wrapper. The image is ephemeral — one per
+        // RUN, removed on the way out.
+        var ext4Upper: URL?
+        if let outbox = buildOverlayOutbox {
+            let img = FileManager.default.temporaryDirectory
+                .appendingPathComponent("cocker-upper-\(ephID).img")
+            // 16 GiB sparse : big enough for heavy `RUN`s (full toolchains,
+            // node_modules), costs only the bytes actually written on APFS.
+            try Ext4Image.createFormatted(at: img, size: 16 * 1024 * 1024 * 1024)
+            ext4Upper = img
+            labels["com.cocker.build-overlay-dev"] = "/dev/vda"
+            labels["com.cocker.build-ext4-img"] = img.path
+            labels["com.cocker.build-outbox"] = outbox.path
+        }
+        defer { if let u = ext4Upper { try? FileManager.default.removeItem(at: u) } }
+
         var container = Container(
             id: ephID,
             name: ephID,

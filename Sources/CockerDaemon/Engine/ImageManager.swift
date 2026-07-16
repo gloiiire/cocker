@@ -819,10 +819,65 @@ actor DockerfileBuilder {
                     // The platform field (e.g. "linux/amd64") tells the VM
                     // to mount the qemu-user-static share + register
                     // binfmt_misc so x86_64 RUN steps work on Apple Silicon.
-                    let before = try snapshotFiles(at: rootfs)
                     let buildArch = config.platform.flatMap { plat in
                         plat.split(separator: "/").last.map(String.init)
                     }
+
+                    // PRO-73 : ext4-overlay build path (opt-in via
+                    // COCKER_BUILD_EXT4). The RUN's writes land on a native
+                    // ext4 overlay upper instead of straight through Apple
+                    // virtiofs, which EACCESes on dpkg's mode-000 file
+                    // creates and broke every `apt-get install` of a package
+                    // shipping files. The guest wrapper tars the overlay
+                    // upperdir (= exactly this step's changes) into the
+                    // outbox share ; we read that back as the OCI layer and
+                    // replay it onto the host working dir so subsequent steps
+                    // see a cumulative base (host-side tar → no virtiofs, no
+                    // EACCES, final modes preserved).
+                    if ProcessInfo.processInfo.environment["COCKER_BUILD_EXT4"] != nil {
+                        let outbox = buildDir.appendingPathComponent("outbox-\(UUID().uuidString.prefix(8))")
+                        try FileManager.default.createDirectory(at: outbox, withIntermediateDirectories: true)
+                        // The wrapper runs the RUN command, then (on success)
+                        // turns the overlay upperdir into an OCI layer tarball
+                        // in the outbox. overlayfs marks deletions with char
+                        // device 0:0 whiteouts — convert those to OCI `.wh.`
+                        // marker files first, so (a) the tar carries no device
+                        // nodes the unprivileged host tar can't recreate, and
+                        // (b) the layer expresses deletions the OCI way.
+                        let wrapped = command + "\n"
+                            + "__cocker_rc=$?\n"
+                            + "if [ \"$__cocker_rc\" -eq 0 ]; then "
+                            + "find /.cocker-upper -mindepth 1 -type c 2>/dev/null | "
+                            + "while IFS= read -r p; do d=${p%/*}; b=${p##*/}; "
+                            + "rm -f \"$p\" && : > \"$d/.wh.$b\"; done; "
+                            + "tar czf /.cocker-outbox/layer.tar -C /.cocker-upper "
+                            + "--exclude=./.cocker-upper --exclude=./.cocker-outbox . "
+                            + "2>/.cocker-outbox/tar.err || echo 'cocker: layer tar failed' >&2; "
+                            + "sync; fi\n"
+                            + "exit \"$__cocker_rc\"\n"
+                        let exitCode = try await vm.runEphemeral(
+                            rootfsPath: rootfs,
+                            command: ["/bin/sh", "-c", wrapped],
+                            env: substEnv(),
+                            workdir: workdir,
+                            timeout: 600,
+                            targetArch: buildArch,
+                            buildOverlayOutbox: outbox
+                        )
+                        if exitCode != 0 {
+                            try? FileManager.default.removeItem(at: outbox)
+                            throw CockerError.buildFailed("RUN '\(command)' exited with code \(exitCode)")
+                        }
+                        let blobsDir = await imageManager.blobDir()
+                        let layerTar = outbox.appendingPathComponent("layer.tar")
+                        if let layer = try await registerOverlayLayer(tar: layerTar, rootfs: rootfs, blobsDir: blobsDir) {
+                            layers.append(layer)
+                            try? await BuildCache.store(key: stepHash, layer: layer, blobsDir: blobsDir)
+                            log(.stdout, " ---> Created layer \(String(layer.digest.prefix(19))) (ext4 overlay)\n")
+                        }
+                        try? FileManager.default.removeItem(at: outbox)
+                    } else {
+                    let before = try snapshotFiles(at: rootfs)
                     let exitCode = try await vm.runEphemeral(
                         rootfsPath: rootfs,
                         command: ["/bin/sh", "-c", command],
@@ -853,6 +908,7 @@ actor DockerfileBuilder {
                                                      layer: layer,
                                                      blobsDir: blobsDir)
                         log(.stdout, " ---> Created layer \(String(layer.digest.prefix(19))) (\(changed.count) changed, \(deleted.count) deleted)\n")
+                    }
                     }
                 } else {
                     // Fallback : exec via /bin/sh macOS (commandes manipulant
@@ -1612,6 +1668,71 @@ actor DockerfileBuilder {
         let blobPath = blobsDir.appendingPathComponent(String(digest.dropFirst(7)))
         if !FileManager.default.fileExists(atPath: blobPath.path) {
             try tarData.write(to: blobPath)
+        }
+
+        return CreatedLayer(digest: digest, size: tarData.count)
+    }
+
+    // PRO-73 : turn the guest-produced overlay-upper tarball (sitting in
+    // the build outbox) into a registered OCI layer, and replay it onto the
+    // host working rootfs so later steps build on a cumulative base.
+    //
+    // Returns nil when the step produced no changes (no tarball, or an
+    // empty one) so the caller simply appends no layer — matching the
+    // legacy path's "changed.isEmpty" behaviour.
+    private func registerOverlayLayer(tar: URL, rootfs: URL, blobsDir: URL) async throws -> CreatedLayer? {
+        guard FileManager.default.fileExists(atPath: tar.path),
+              let tarData = try? Data(contentsOf: tar), !tarData.isEmpty else {
+            return nil
+        }
+        let digest = "sha256:" + SHA256.hash(data: tarData).hexString
+        let blobPath = blobsDir.appendingPathComponent(String(digest.dropFirst(7)))
+        if !FileManager.default.fileExists(atPath: blobPath.path) {
+            try tarData.write(to: blobPath)
+        }
+
+        // Replay onto the host base dir. Host-side tar writes to a local
+        // APFS dir (not virtiofs), so dpkg's transient mode-000 files —
+        // already chmod'd to their final mode inside the layer — extract
+        // fine, and the next RUN's virtiofs lower sees the new state.
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        proc.arguments = ["-xzf", tar.path, "-C", rootfs.path]
+        let errPipe = Pipe()
+        proc.standardError = errPipe
+        try proc.run()
+        proc.waitUntilExit()
+        if proc.terminationStatus != 0 {
+            let e = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw CockerError.buildFailed("apply overlay layer to rootfs: \(e)")
+        }
+
+        // Apply OCI whiteouts to the host base. A `.wh.NAME` entry means
+        // NAME was deleted this step ; the extract above wrote the marker
+        // as a file, so remove both the marker and the real target it
+        // stands for, keeping the cumulative base in sync with the layer.
+        // (Opaque-dir markers `.wh..wh..opq` are left for a later pass.)
+        let listProc = Process()
+        listProc.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        listProc.arguments = ["-tzf", tar.path]
+        let listPipe = Pipe()
+        listProc.standardOutput = listPipe
+        try listProc.run()
+        let listData = listPipe.fileHandleForReading.readDataToEndOfFile()
+        listProc.waitUntilExit()
+        for line in (String(data: listData, encoding: .utf8) ?? "").split(separator: "\n") {
+            var rel = String(line)
+            if rel.hasPrefix("./") { rel = String(rel.dropFirst(2)) }
+            let base = (rel as NSString).lastPathComponent
+            guard base.hasPrefix(".wh."), base != ".wh..wh..opq" else { continue }
+            let dir = (rel as NSString).deletingLastPathComponent
+            let targetName = String(base.dropFirst(4))
+            let markerURL = rootfs.appendingPathComponent(rel)
+            let targetURL = dir.isEmpty
+                ? rootfs.appendingPathComponent(targetName)
+                : rootfs.appendingPathComponent(dir).appendingPathComponent(targetName)
+            try? FileManager.default.removeItem(at: targetURL)
+            try? FileManager.default.removeItem(at: markerURL)
         }
 
         return CreatedLayer(digest: digest, size: tarData.count)
