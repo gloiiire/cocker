@@ -56,16 +56,11 @@ static void forward_stop_signal_to_child(int sig) {
     }
 }
 
-/* Mount the virtiofs rootfs tag "root" at /newroot, then switch_root */
-static void switch_to_virtiofs(void) {
-    if (mkdir("/newroot", 0755) < 0 && errno != EEXIST)
-        die("mkdir /newroot: %s", strerror(errno));
-
-    if (mount("root", "/newroot", "virtiofs", 0, NULL) < 0)
-        die("mount virtiofs /newroot: %s", strerror(errno));
-
-    info("virtiofs rootfs mounted at /newroot");
-
+/* Shared tail for every rootfs backend : once the real root is mounted
+ * at /newroot, move the early /proc,/sys,/dev into it, set up
+ * /run,/tmp,/dev/pts, then switch_root into /newroot. Only the backing
+ * mount (virtiofs vs ext4 block) differs between callers. */
+static void finish_switch_root(void) {
     mkdir("/newroot/proc", 0755);
     mkdir("/newroot/sys", 0755);
     mkdir("/newroot/dev", 0755);
@@ -93,6 +88,53 @@ static void switch_to_virtiofs(void) {
         die("move /newroot to /: %s", strerror(errno));
     if (chroot(".") < 0) die("chroot: %s", strerror(errno));
     if (chdir("/") < 0) die("chdir /: %s", strerror(errno));
+}
+
+/* Mount the virtiofs rootfs tag "root" at /newroot, then switch_root */
+static void switch_to_virtiofs(void) {
+    if (mkdir("/newroot", 0755) < 0 && errno != EEXIST)
+        die("mkdir /newroot: %s", strerror(errno));
+
+    if (mount("root", "/newroot", "virtiofs", 0, NULL) < 0)
+        die("mount virtiofs /newroot: %s", strerror(errno));
+
+    info("virtiofs rootfs mounted at /newroot");
+    finish_switch_root();
+}
+
+/* Mount an ext4 block device (e.g. /dev/vda) as the rootfs at /newroot,
+ * then switch_root. Used by the image-build path where the rootfs is a
+ * real ext4 disk image instead of an Apple virtiofs share : virtiofs
+ * returns EACCES for create-with-mode-000 (exactly dpkg's unpack
+ * pattern — every `apt-get install` of a package shipping files broke),
+ * which a native ext4 filesystem handles correctly. See PRO-73. */
+static void switch_to_block(const char *dev) {
+    if (mkdir("/newroot", 0755) < 0 && errno != EEXIST)
+        die("mkdir /newroot: %s", strerror(errno));
+
+    if (mount(dev, "/newroot", "ext4", 0, NULL) < 0)
+        die("mount ext4 %s /newroot: %s", dev, strerror(errno));
+
+    info("ext4 rootfs %s mounted at /newroot", dev);
+    finish_switch_root();
+}
+
+/* Pick the rootfs backend from the cmdline and hand off into it.
+ *
+ * `cocker.rootfs=blk:/dev/vdX` selects an ext4 block device (build
+ * path). Absent (or any non-"blk:" value) → the default virtiofs share,
+ * so every existing run/build keeps booting exactly as before. The spec
+ * mirrors the per-volume `blk:` convention in mount_volumes(). */
+static void switch_to_root(const char *cmdline) {
+    char *spec = cmdline_get(cmdline, "rootfs");
+    if (spec && strncmp(spec, "blk:", 4) == 0) {
+        const char *dev = spec + 4;
+        switch_to_block(dev);
+        free(spec);
+        return;
+    }
+    if (spec) free(spec);
+    switch_to_virtiofs();
 }
 
 /* Recursively mkdir all components of `path` (mkdir -p). */
@@ -316,7 +358,7 @@ int main(int argc, char **argv) {
         sethostname(name, strlen(name));
     }
 
-    switch_to_virtiofs();
+    switch_to_root(cmdline);
     mount_volumes(cmdline);
 
     /* `--shm-size` : Linux gives /dev/shm only 64 MB by default which
