@@ -244,6 +244,14 @@ actor ImageManager {
         await store.rootDir.appendingPathComponent("blobs/sha256")
     }
 
+    /// The daemon's data root (the `--root` cockerd was launched with).
+    /// `store.rootDir` is `<root>/images`, so its parent is the root.
+    /// BuildCache uses this to place its cache next to the blobs instead
+    /// of guessing from $HOME/COCKER_ROOT (which breaks non-default roots).
+    func daemonRootDir() async -> URL {
+        await store.rootDir.deletingLastPathComponent()
+    }
+
     /// Clone le rootfs d'une image vers un rootfs dédié au container (overlay
     /// via APFS clonefile). Garantit l'isolation entre containers de la même
     /// image. Voir ImageStore.cloneRootfs pour les détails.
@@ -804,10 +812,11 @@ actor DockerfileBuilder {
                 // so a divergence at any step invalidates everything
                 // downstream — matches docker's behaviour.
                 let stepHash = self.advanceCacheKey("RUN " + command)
+                let buildRoot = await imageManager.daemonRootDir()
                 if config.noCache == false,
-                   let cached = try await BuildCache.lookup(key: stepHash) {
+                   let cached = try await BuildCache.lookup(key: stepHash, root: buildRoot) {
                     log(.stdout, " ---> Using cache (layer \(String(cached.digest.prefix(19))))\n")
-                    try await BuildCache.apply(layer: cached, to: rootfs)
+                    try await BuildCache.apply(layer: cached, to: rootfs, root: buildRoot)
                     layers.append(CreatedLayer(digest: cached.digest, size: cached.size))
                     log(.stdout, " ---> \(shortID())\n")
                     continue
@@ -872,7 +881,7 @@ actor DockerfileBuilder {
                         let layerTar = outbox.appendingPathComponent("layer.tar")
                         if let layer = try await registerOverlayLayer(tar: layerTar, rootfs: rootfs, blobsDir: blobsDir) {
                             layers.append(layer)
-                            try? await BuildCache.store(key: stepHash, layer: layer, blobsDir: blobsDir)
+                            try? await BuildCache.store(key: stepHash, layer: layer, root: buildRoot)
                             log(.stdout, " ---> Created layer \(String(layer.digest.prefix(19))) (ext4 overlay)\n")
                         }
                         try? FileManager.default.removeItem(at: outbox)
@@ -906,7 +915,7 @@ actor DockerfileBuilder {
                         // sequence skips the VM exec entirely.
                         try? await BuildCache.store(key: stepHash,
                                                      layer: layer,
-                                                     blobsDir: blobsDir)
+                                                     root: buildRoot)
                         log(.stdout, " ---> Created layer \(String(layer.digest.prefix(19))) (\(changed.count) changed, \(deleted.count) deleted)\n")
                     }
                     }
@@ -1863,26 +1872,28 @@ enum BuildCache {
         let size: Int
     }
 
-    /// Cache root, lazily created on first store(). Resolved relative
-    /// to `$HOME/.cocker` ; tests can override via `COCKER_ROOT`.
-    private static var cacheDir: URL {
-        let root = ProcessInfo.processInfo.environment["COCKER_ROOT"]
-                ?? "\(NSHomeDirectory())/.cocker"
-        return URL(fileURLWithPath: root).appendingPathComponent("build-cache")
+    // Cache + blob locations, derived from the daemon's actual data root
+    // (passed in by the caller). They must track the root cockerd was
+    // launched with (`--root`), NOT $HOME/.cocker or a COCKER_ROOT env var
+    // — otherwise a non-default root (e.g. the dev-mode `cocker-dev`
+    // install) writes cache pointers into ~/.cocker while its blobs live
+    // elsewhere, so the cache never hits and it pollutes the prod cache.
+    private static func cacheDir(_ root: URL) -> URL {
+        root.appendingPathComponent("build-cache")
+    }
+    private static func blobsDir(_ root: URL) -> URL {
+        root.appendingPathComponent("images/blobs/sha256")
     }
 
-    static func lookup(key: String) async throws -> CachedLayerEntry? {
-        let url = cacheDir.appendingPathComponent("\(key).json")
+    static func lookup(key: String, root: URL) async throws -> CachedLayerEntry? {
+        let url = cacheDir(root).appendingPathComponent("\(key).json")
         guard let data = try? Data(contentsOf: url),
               let entry = try? JSONDecoder().decode(CachedLayerEntry.self, from: data)
         else { return nil }
         // Sanity check : the blob still exists in the store. The blob
         // GC sweep might have collected it between builds.
-        let blobsDir = URL(fileURLWithPath: (ProcessInfo.processInfo.environment["COCKER_ROOT"]
-                ?? "\(NSHomeDirectory())/.cocker"))
-            .appendingPathComponent("images/blobs/sha256")
         let blobName = String(entry.digest.dropFirst("sha256:".count))
-        let blobPath = blobsDir.appendingPathComponent(blobName)
+        let blobPath = blobsDir(root).appendingPathComponent(blobName)
         guard FileManager.default.fileExists(atPath: blobPath.path) else {
             // Stale cache pointer ; wipe it so future lookups don't waste IO.
             try? FileManager.default.removeItem(at: url)
@@ -1893,23 +1904,21 @@ enum BuildCache {
 
     static func store(key: String,
                        layer: DockerfileBuilder.CreatedLayer,
-                       blobsDir: URL) async throws {
-        try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+                       root: URL) async throws {
+        let dir = cacheDir(root)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let entry = CachedLayerEntry(digest: layer.digest, size: layer.size)
         let data = try JSONEncoder().encode(entry)
-        try data.write(to: cacheDir.appendingPathComponent("\(key).json"), options: .atomic)
+        try data.write(to: dir.appendingPathComponent("\(key).json"), options: .atomic)
     }
 
     /// Materialise a cached layer onto an existing rootfs. The layer blob
     /// is a gzipped tar diff produced by `createLayer` ; we extract it
     /// in-place so the next Dockerfile step sees the same filesystem the
     /// cached build produced at this point.
-    static func apply(layer: CachedLayerEntry, to rootfs: URL) async throws {
-        let blobsDir = URL(fileURLWithPath: (ProcessInfo.processInfo.environment["COCKER_ROOT"]
-                ?? "\(NSHomeDirectory())/.cocker"))
-            .appendingPathComponent("images/blobs/sha256")
+    static func apply(layer: CachedLayerEntry, to rootfs: URL, root: URL) async throws {
         let blobName = String(layer.digest.dropFirst("sha256:".count))
-        let blobPath = blobsDir.appendingPathComponent(blobName)
+        let blobPath = blobsDir(root).appendingPathComponent(blobName)
         guard FileManager.default.fileExists(atPath: blobPath.path) else {
             throw CockerError.buildFailed("cached layer blob missing: \(layer.digest)")
         }
