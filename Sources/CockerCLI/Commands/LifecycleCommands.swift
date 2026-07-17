@@ -23,6 +23,7 @@ struct StartCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for id in containers {
             let start = Date()
             do {
@@ -30,6 +31,7 @@ struct StartCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .start, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot start container \(id)",
                     reason: error.description,
@@ -37,6 +39,7 @@ struct StartCommand: AsyncParsableCommand {
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 
@@ -54,6 +57,7 @@ struct StopCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for id in containers {
             let start = Date()
             do {
@@ -61,6 +65,7 @@ struct StopCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .stop, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot stop container \(id)",
                     reason: error.description,
@@ -68,6 +73,7 @@ struct StopCommand: AsyncParsableCommand {
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 
@@ -85,6 +91,7 @@ struct KillCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for id in containers {
             let start = Date()
             do {
@@ -92,12 +99,14 @@ struct KillCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .kill, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot kill container \(id)",
                     reason: error.description
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 
@@ -115,6 +124,7 @@ struct RestartCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for id in containers {
             let start = Date()
             do {
@@ -122,12 +132,14 @@ struct RestartCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .restart, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot restart container \(id)",
                     reason: error.description
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 
@@ -142,6 +154,7 @@ struct PauseCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for id in containers {
             let start = Date()
             do {
@@ -149,6 +162,7 @@ struct PauseCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .pause, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot pause container \(id)",
                     reason: error.description,
@@ -156,6 +170,7 @@ struct PauseCommand: AsyncParsableCommand {
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 
@@ -170,6 +185,7 @@ struct UnpauseCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for id in containers {
             let start = Date()
             do {
@@ -177,12 +193,14 @@ struct UnpauseCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .unpause, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot unpause container \(id)",
                     reason: error.description
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 
@@ -203,6 +221,7 @@ struct RmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for id in containers {
             let start = Date()
             do {
@@ -210,6 +229,7 @@ struct RmCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot remove container \(id)",
                     reason: error.description,
@@ -217,6 +237,7 @@ struct RmCommand: AsyncParsableCommand {
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 
@@ -446,7 +467,7 @@ struct RenameCommand: AsyncParsableCommand {
             _ = try await client.send(request)
             UX.printResult(.container, newName, verb: .rename, elapsed: Date().timeIntervalSince(start))
         } catch let error as CockerError {
-            UX.Failure.emit(
+            try UX.Failure.fail(
                 headline: "Cannot rename container \(container)",
                 reason: error.description,
                 hint: "another container may already be named `\(newName)`"

@@ -105,6 +105,7 @@ struct SecretRmCommand: AsyncParsableCommand {
     var names: [String]
 
     mutating func run() async throws {
+        var failed = false
         for name in names {
             let path = secretsDir().appendingPathComponent(name)
             do {
@@ -112,6 +113,7 @@ struct SecretRmCommand: AsyncParsableCommand {
                 try FileManager.default.removeItem(at: path)
                 UX.printResult(.secret, name, verb: .remove)
             } catch {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot remove secret \(name)",
                     reason: error.localizedDescription,
@@ -119,6 +121,7 @@ struct SecretRmCommand: AsyncParsableCommand {
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 
@@ -131,10 +134,12 @@ struct SecretInspectCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let dir = secretsDir()
         var entries: [[String: Any]] = []
+        var failed = false
         for name in names {
             do {
                 try ResourceName.validate(name, kind: "secret")
             } catch {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot inspect secret \(name)",
                     reason: error.localizedDescription,
@@ -144,6 +149,7 @@ struct SecretInspectCommand: AsyncParsableCommand {
             }
             let path = dir.appendingPathComponent(name)
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot inspect secret \(name)",
                     reason: "secret not found",
@@ -160,6 +166,7 @@ struct SecretInspectCommand: AsyncParsableCommand {
         }
         let data = try JSONSerialization.data(withJSONObject: entries, options: .prettyPrinted)
         print(String(data: data, encoding: .utf8) ?? "[]")
+        if failed { throw ExitCode.failure }
     }
 }
 
@@ -260,6 +267,7 @@ struct ConfigRmCommand: AsyncParsableCommand {
     var names: [String]
 
     mutating func run() async throws {
+        var failed = false
         for name in names {
             let path = configsDir().appendingPathComponent(name)
             do {
@@ -267,6 +275,7 @@ struct ConfigRmCommand: AsyncParsableCommand {
                 try FileManager.default.removeItem(at: path)
                 UX.printResult(.config, name, verb: .remove)
             } catch {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot remove config \(name)",
                     reason: error.localizedDescription,
@@ -274,6 +283,7 @@ struct ConfigRmCommand: AsyncParsableCommand {
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 
@@ -286,10 +296,12 @@ struct ConfigInspectCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let dir = configsDir()
         var entries: [[String: Any]] = []
+        var failed = false
         for name in names {
             do {
                 try ResourceName.validate(name, kind: "config")
             } catch {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot inspect config \(name)",
                     reason: error.localizedDescription,
@@ -299,6 +311,7 @@ struct ConfigInspectCommand: AsyncParsableCommand {
             }
             let path = dir.appendingPathComponent(name)
             guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path) else {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot inspect config \(name)",
                     reason: "config not found",
@@ -315,5 +328,6 @@ struct ConfigInspectCommand: AsyncParsableCommand {
         }
         let data = try JSONSerialization.data(withJSONObject: entries, options: .prettyPrinted)
         print(String(data: data, encoding: .utf8) ?? "[]")
+        if failed { throw ExitCode.failure }
     }
 }

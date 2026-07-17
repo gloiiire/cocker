@@ -497,6 +497,7 @@ struct UpdateCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for id in containers {
             let start = Date()
             do {
@@ -504,12 +505,14 @@ struct UpdateCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .update, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot update container \(id)",
                     reason: error.description
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 

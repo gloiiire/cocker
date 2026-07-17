@@ -178,8 +178,10 @@ struct PluginInspectCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let plugins = loadPlugins()
         var entries: [[String: Any]] = []
+        var failed = false
         for name in names {
             guard let p = plugins.first(where: { $0.name == name }) else {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot inspect plugin \(name)",
                     reason: "no such plugin",
@@ -195,5 +197,6 @@ struct PluginInspectCommand: AsyncParsableCommand {
         }
         let data = try JSONSerialization.data(withJSONObject: entries, options: .prettyPrinted)
         print(String(data: data, encoding: .utf8) ?? "[]")
+        if failed { throw ExitCode.failure }
     }
 }
