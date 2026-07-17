@@ -42,6 +42,37 @@ struct KernelCommandLineTests {
         #expect(cmdline.contains("quiet"))
     }
 
+    @Test func defaultsToVirtiofsRootWithNoBlockSpec() {
+        // No rootDevice → the rootfs stays the virtiofs share, exactly as
+        // before PRO-73. No cocker.rootfs param is emitted, so cocker-init
+        // takes its default virtiofs branch.
+        let cmdline = KernelCommandLine.build(KernelCommandLineParams(
+            container: makeContainer(),
+            dnsIP: "192.168.64.1", dnsPort: 5300, cockerSwitchGateway: "10.42.0.1"
+        ))
+        #expect(cmdline.contains("root=virtiofs"))
+        #expect(cmdline.contains("rootfstype=virtiofs"))
+        #expect(!cmdline.contains("cocker.rootfs"))
+        #expect(!cmdline.contains("root=/dev/"))
+    }
+
+    @Test func ext4RootDeviceSwapsRootParamsAndEmitsBlockSpec() {
+        // Image-build path : rootfs is a real ext4 disk image at /dev/vda.
+        // The stock root=/rootfstype= flip to ext4 and cocker-init keys off
+        // cocker.rootfs=blk:/dev/vda to mount the block device instead of
+        // the virtiofs share.
+        let cmdline = KernelCommandLine.build(KernelCommandLineParams(
+            container: makeContainer(),
+            dnsIP: "192.168.64.1", dnsPort: 5300, cockerSwitchGateway: "10.42.0.1",
+            rootDevice: "/dev/vda"
+        ))
+        #expect(cmdline.contains("root=/dev/vda"))
+        #expect(cmdline.contains("rootfstype=ext4"))
+        #expect(cmdline.contains("cocker.rootfs=blk:/dev/vda"))
+        #expect(!cmdline.contains("root=virtiofs"))
+        #expect(!cmdline.contains("rootfstype=virtiofs"))
+    }
+
     @Test func carriesIdNameAndHostname() {
         let cmdline = KernelCommandLine.build(KernelCommandLineParams(
             container: makeContainer(id: "deadbeef1234", name: "srv-a", hostname: "myhost"),
