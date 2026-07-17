@@ -56,16 +56,11 @@ static void forward_stop_signal_to_child(int sig) {
     }
 }
 
-/* Mount the virtiofs rootfs tag "root" at /newroot, then switch_root */
-static void switch_to_virtiofs(void) {
-    if (mkdir("/newroot", 0755) < 0 && errno != EEXIST)
-        die("mkdir /newroot: %s", strerror(errno));
-
-    if (mount("root", "/newroot", "virtiofs", 0, NULL) < 0)
-        die("mount virtiofs /newroot: %s", strerror(errno));
-
-    info("virtiofs rootfs mounted at /newroot");
-
+/* Shared tail for every rootfs backend : once the real root is mounted
+ * at /newroot, move the early /proc,/sys,/dev into it, set up
+ * /run,/tmp,/dev/pts, then switch_root into /newroot. Only the backing
+ * mount (virtiofs vs ext4 block) differs between callers. */
+static void finish_switch_root(void) {
     mkdir("/newroot/proc", 0755);
     mkdir("/newroot/sys", 0755);
     mkdir("/newroot/dev", 0755);
@@ -93,6 +88,132 @@ static void switch_to_virtiofs(void) {
         die("move /newroot to /: %s", strerror(errno));
     if (chroot(".") < 0) die("chroot: %s", strerror(errno));
     if (chdir("/") < 0) die("chdir /: %s", strerror(errno));
+}
+
+/* Mount the virtiofs rootfs tag "root" at /newroot, then switch_root */
+static void switch_to_virtiofs(void) {
+    if (mkdir("/newroot", 0755) < 0 && errno != EEXIST)
+        die("mkdir /newroot: %s", strerror(errno));
+
+    if (mount("root", "/newroot", "virtiofs", 0, NULL) < 0)
+        die("mount virtiofs /newroot: %s", strerror(errno));
+
+    info("virtiofs rootfs mounted at /newroot");
+    finish_switch_root();
+}
+
+/* Mount an ext4 block device (e.g. /dev/vda) as the rootfs at /newroot,
+ * then switch_root. Used by the image-build path where the rootfs is a
+ * real ext4 disk image instead of an Apple virtiofs share : virtiofs
+ * returns EACCES for create-with-mode-000 (exactly dpkg's unpack
+ * pattern — every `apt-get install` of a package shipping files broke),
+ * which a native ext4 filesystem handles correctly. See PRO-73. */
+static void switch_to_block(const char *dev) {
+    if (mkdir("/newroot", 0755) < 0 && errno != EEXIST)
+        die("mkdir /newroot: %s", strerror(errno));
+
+    if (mount(dev, "/newroot", "ext4", 0, NULL) < 0)
+        die("mount ext4 %s /newroot: %s", dev, strerror(errno));
+
+    info("ext4 rootfs %s mounted at /newroot", dev);
+    finish_switch_root();
+}
+
+/* Set when the rootfs is a build overlay (below). main() reads it to skip
+ * etc_overlay_setup() — that workaround exists only for Apple virtiofs's
+ * /etc metadata bug, and in overlay mode /etc writes already land on the
+ * native ext4 upper (and a tmpfs /etc overlay would hide those changes
+ * from the build layer). */
+static int g_build_overlay = 0;
+
+/* Defined further down (near mount_volumes) — forward-declared so the
+ * build-overlay setup above can reuse the same ext4 probe + fork/exec. */
+static int has_ext_fs(const char *device);
+static int run_cmd(char *const argv[]);
+
+/* Build-overlay rootfs (PRO-73). lowerdir = the virtiofs "root" share
+ * (base image, read-only) ; upperdir = an ext4 block device (rw, native
+ * Linux permissions so dpkg's create-with-mode-000 unpack works, unlike
+ * Apple virtiofs which returns EACCES and broke every `apt-get install`
+ * of a package shipping files). The upperdir IS the build layer : the
+ * cockerd-generated RUN wrapper tars it (bind-mounted at /.cocker-upper)
+ * into the "outbox" virtiofs share (/.cocker-outbox), which the host
+ * reads back as the OCI layer. */
+static void switch_to_overlay(const char *dev, const char *outbox_tag) {
+    if (mkdir("/lower", 0755) < 0 && errno != EEXIST)
+        die("mkdir /lower: %s", strerror(errno));
+    if (mount("root", "/lower", "virtiofs", MS_RDONLY, NULL) < 0)
+        die("mount virtiofs lower: %s", strerror(errno));
+
+    if (mkdir("/upper", 0755) < 0 && errno != EEXIST)
+        die("mkdir /upper: %s", strerror(errno));
+    /* The host formats the ext4 upper with brew mke2fs before boot ; the
+     * in-guest mkfs is only a fallback for images that bundle e2fsprogs. */
+    if (!has_ext_fs(dev)) {
+        info("build ext4 upper %s unformatted, mkfs.ext4 …", dev);
+        char *mkfs_argv[] = { (char *)"mkfs.ext4", (char *)"-F", (char *)"-q",
+                              (char *)dev, NULL };
+        if (run_cmd(mkfs_argv) != 0)
+            die("mkfs.ext4 %s failed (host e2fsprogs missing and image lacks it)", dev);
+    }
+    if (mount(dev, "/upper", "ext4", 0, NULL) < 0)
+        die("mount ext4 upper %s: %s", dev, strerror(errno));
+
+    if (mkdir("/upper/up", 0755) < 0 && errno != EEXIST)
+        die("mkdir /upper/up: %s", strerror(errno));
+    if (mkdir("/upper/work", 0755) < 0 && errno != EEXIST)
+        die("mkdir /upper/work: %s", strerror(errno));
+
+    if (mkdir("/newroot", 0755) < 0 && errno != EEXIST)
+        die("mkdir /newroot: %s", strerror(errno));
+    if (mount("overlay", "/newroot", "overlay", 0,
+              "lowerdir=/lower,upperdir=/upper/up,workdir=/upper/work") < 0)
+        die("mount overlay: %s", strerror(errno));
+
+    info("overlay rootfs (lower=virtiofs base, upper=ext4 %s) mounted at /newroot", dev);
+
+    /* Expose the raw upperdir + outbox inside the new root so the RUN
+     * wrapper can tar the changes out. These mountpoints are created in
+     * the merged view (so the empty dirs land in the upperdir) ; the
+     * wrapper's tar excludes them. */
+    mkdir("/newroot/.cocker-upper", 0755);
+    if (mount("/upper/up", "/newroot/.cocker-upper", NULL, MS_BIND, NULL) < 0)
+        info("bind upperdir -> /.cocker-upper failed: %s", strerror(errno));
+    if (outbox_tag) {
+        mkdir("/newroot/.cocker-outbox", 0755);
+        if (mount(outbox_tag, "/newroot/.cocker-outbox", "virtiofs", 0, NULL) < 0)
+            info("mount outbox %s -> /.cocker-outbox failed: %s", outbox_tag, strerror(errno));
+    }
+
+    finish_switch_root();
+}
+
+/* Pick the rootfs backend from the cmdline and hand off into it.
+ *
+ * `cocker.rootfs=overlay:/dev/vdX` → build overlay (base virtiofs lower +
+ * ext4 upper, PRO-73). `cocker.rootfs=blk:/dev/vdX` → plain ext4 block
+ * root. Absent (or any other value) → the default virtiofs share, so
+ * every existing run/build keeps booting exactly as before. The spec
+ * mirrors the per-volume `blk:` convention in mount_volumes(). */
+static void switch_to_root(const char *cmdline) {
+    char *spec = cmdline_get(cmdline, "rootfs");
+    if (spec && strncmp(spec, "overlay:", 8) == 0) {
+        const char *dev = spec + 8;
+        char *outbox = cmdline_get(cmdline, "outbox");
+        g_build_overlay = 1;
+        switch_to_overlay(dev, outbox);
+        if (outbox) free(outbox);
+        free(spec);
+        return;
+    }
+    if (spec && strncmp(spec, "blk:", 4) == 0) {
+        const char *dev = spec + 4;
+        switch_to_block(dev);
+        free(spec);
+        return;
+    }
+    if (spec) free(spec);
+    switch_to_virtiofs();
 }
 
 /* Recursively mkdir all components of `path` (mkdir -p). */
@@ -316,7 +437,7 @@ int main(int argc, char **argv) {
         sethostname(name, strlen(name));
     }
 
-    switch_to_virtiofs();
+    switch_to_root(cmdline);
     mount_volumes(cmdline);
 
     /* `--shm-size` : Linux gives /dev/shm only 64 MB by default which
@@ -357,7 +478,7 @@ int main(int argc, char **argv) {
      * useradd) — must happen BEFORE pin_resolv_conf so the runtime pin
      * lands on the tmpfs overlay and doesn't accidentally persist into
      * the rootfs at exit. See etc_overlay.c for the full story. */
-    etc_overlay_setup();
+    if (!g_build_overlay) etc_overlay_setup();
 
     /* Networking. */
     net_bring_up_loopback();

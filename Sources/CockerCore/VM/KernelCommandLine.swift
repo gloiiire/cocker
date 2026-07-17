@@ -34,6 +34,28 @@ public struct KernelCommandLineParams: Sendable {
     /// array → cmdline emits no `cocker.vol*` params at all.
     public let volumeSpecs: [String]
 
+    /// Guest device path (e.g. `/dev/vda`) when the rootfs is a real ext4
+    /// disk image instead of the default virtiofs share. Set only on the
+    /// image-build path: Apple's virtiofs rejects create-with-mode-000
+    /// (dpkg's unpack pattern → every `apt-get install` of a package
+    /// shipping files failed), so builds mount a native ext4 image where
+    /// the guest kernel owns permissions. nil → virtiofs root, unchanged.
+    /// See PRO-73. cocker-init reads this as `cocker.rootfs=blk:<dev>`
+    /// (plain ext4 root) or `overlay:<dev>` when `buildOverlay` is set.
+    public let rootDevice: String?
+
+    /// When true (with `rootDevice` set), the ext4 device is the *upper*
+    /// of an overlay whose lower is the virtiofs base image — the shape
+    /// the image-build path actually uses. Emits `cocker.rootfs=overlay:`
+    /// instead of `blk:`. See PRO-73.
+    public let buildOverlay: Bool
+
+    /// virtiofs tag of the build "outbox" share (host dir the daemon reads
+    /// the produced layer tarball from). Emitted as `cocker.outbox=<tag>`
+    /// so cocker-init mounts it at /.cocker-outbox inside the build root.
+    /// nil outside the build-overlay path.
+    public let outboxTag: String?
+
     public init(container: Container,
                 dnsIP: String,
                 dnsPort: UInt16,
@@ -41,7 +63,10 @@ public struct KernelCommandLineParams: Sendable {
                 cockerSwitchGateway: String,
                 qemuArch: String? = nil,
                 qemuPath: String? = nil,
-                volumeSpecs: [String] = []) {
+                volumeSpecs: [String] = [],
+                rootDevice: String? = nil,
+                buildOverlay: Bool = false,
+                outboxTag: String? = nil) {
         self.container = container
         self.dnsIP = dnsIP
         self.dnsPort = dnsPort
@@ -50,16 +75,27 @@ public struct KernelCommandLineParams: Sendable {
         self.qemuArch = qemuArch
         self.qemuPath = qemuPath
         self.volumeSpecs = volumeSpecs
+        self.rootDevice = rootDevice
+        self.buildOverlay = buildOverlay
+        self.outboxTag = outboxTag
     }
 }
 
 public enum KernelCommandLine {
     /// Build the full cmdline string for one container's VM boot.
     public static func build(_ params: KernelCommandLineParams) -> String {
-        var parts = [
-            "console=hvc0",
-            "root=virtiofs",
-            "rootfstype=virtiofs",
+        // Rootfs backend. Default = Apple virtiofs share (tag "root").
+        // When `rootDevice` is set (image-build path), the rootfs is a
+        // real ext4 disk image at that /dev/vdX ; cocker-init keys off
+        // `cocker.rootfs=blk:<dev>` (below) to mount it, and we set the
+        // stock root=/rootfstype= to match so the kernel agrees.
+        var parts = ["console=hvc0"]
+        if let dev = params.rootDevice {
+            parts += ["root=\(dev)", "rootfstype=ext4"]
+        } else {
+            parts += ["root=virtiofs", "rootfstype=virtiofs"]
+        }
+        parts += [
             "rw",
             "quiet",
             "cocker.id=\(params.container.id)",
@@ -68,6 +104,12 @@ public enum KernelCommandLine {
             "cocker.dns_port=\(params.dnsPort)",
             "cocker.dns_vsock_port=\(params.dnsVsockPort)",
         ]
+        if let dev = params.rootDevice {
+            parts.append("cocker.rootfs=\(params.buildOverlay ? "overlay" : "blk"):\(dev)")
+        }
+        if let tag = params.outboxTag {
+            parts.append("cocker.outbox=\(tag)")
+        }
 
         if !params.container.hostname.isEmpty {
             parts.append("cocker.hostname=\(params.container.hostname)")
