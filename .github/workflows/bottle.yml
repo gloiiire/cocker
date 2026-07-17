@@ -7,10 +7,11 @@ name: Bottle
 # Strategy : repack the artifacts that the Release workflow already
 # uploaded, rather than calling `brew install --build-bottle` (which
 # would `swift build` from scratch a SECOND time on each matrix
-# entry). The arm64 cocker binary is identical across Sonoma /
-# Sequoia / Tahoe — only the tarball's filename (and therefore
-# sha256) differs per OS, so we build three named tarballs from one
-# Cellar staging dir on a fast Ubuntu runner.
+# entry). The arm64 cocker binary is identical across every macOS
+# version, so we repack it into a SINGLE bottle tagged `all` (one
+# tarball, one sha256) from one Cellar staging dir on a fast Ubuntu
+# runner — Homebrew's `all` tag then matches any macOS, present or
+# future, with no per-OS symbol to maintain.
 #
 # Wins vs. the old `brew install --build-bottle` matrix :
 #   - No macOS runner provisioning (~2 min/runner × 3 → 0).
@@ -253,22 +254,22 @@ jobs:
           }
           JSON
 
-          # Build three OS-tagged copies. Same bytes inside, different
-          # filename → different sha256 of the FILE itself. We use
-          # tar -C to enter the staging root so the tarball contains
-          # `cocker/<ver>/...` paths exactly as brew expects.
-          # Filename uses the bare version (no `v` prefix) because
-          # brew computes the bottle filename from the formula's
-          # `version` string, NOT from any tag/url. Earlier this used
-          # ${TAG} → user got 404 because brew asked for
-          # `cocker-0.5.14.3.arm64_tahoe.bottle.tar.gz` but we'd
-          # uploaded `cocker-v0.5.14.3.arm64_tahoe.bottle.tar.gz`.
-          # Reproducible tarball : identical input bytes must produce
-          # identical sha256, otherwise a Bottle re-run (e.g. because
-          # the upstream Release retried) overwrites the released file
-          # with a NEW sha while the previous run's sha is already
-          # baked into Formula on main → brew gets a checksum
-          # mismatch at install time. Three pins :
+          # Build ONE bottle tagged `all`. The arm64 binary is
+          # byte-identical across macOS versions, so a single `all:`
+          # bottle matches every macOS — Sonoma, Tahoe, and any future
+          # release — via Homebrew's `all` tag. No per-OS matrix, and no
+          # per-OS symbol to add when a new macOS ships (that's the whole
+          # point : macOS 27+ "just works" with no formula change).
+          # Filename uses the bare version (no `v` prefix) because brew
+          # computes the bottle filename from the formula's `version`
+          # string, NOT from any tag/url. Earlier a `v` prefix caused a
+          # 404 : brew asked for `cocker-0.5.14.3.all.bottle.tar.gz` but
+          # we'd uploaded `cocker-v0.5.14.3...`.
+          # Reproducible tarball : identical input bytes must produce an
+          # identical sha256, otherwise a Bottle re-run (e.g. the upstream
+          # Release retried) overwrites the released file with a NEW sha
+          # while the previous run's sha is already baked into Formula on
+          # main → brew gets a checksum mismatch at install time. Pins :
           #   --sort=name              deterministic entry order
           #   --mtime, --owner, --group fixed values, not the runner's
           #                            ctime / uid / gid
@@ -276,18 +277,16 @@ jobs:
           #                            header so the .gz envelope is
           #                            also bit-identical.
           mkdir -p out
-          for os in tahoe sequoia sonoma; do
-            NAME="cocker-${VER}.arm64_${os}.bottle.tar.gz"
-            tar -C bottle-staging --sort=name \
-                --mtime='2025-01-01 00:00:00 UTC' \
-                --owner=0 --group=0 --numeric-owner \
-                -cf - "cocker/${VER}" \
-              | gzip -9 -n > "out/${NAME}"
-            SHA=$(sha256sum "out/${NAME}" | awk '{print $1}')
-            echo "sha_${os}=${SHA}" >> "$GITHUB_OUTPUT"
-            echo "Built ${NAME}"
-            echo "  sha256 ${SHA}"
-          done
+          NAME="cocker-${VER}.all.bottle.tar.gz"
+          tar -C bottle-staging --sort=name \
+              --mtime='2025-01-01 00:00:00 UTC' \
+              --owner=0 --group=0 --numeric-owner \
+              -cf - "cocker/${VER}" \
+            | gzip -9 -n > "out/${NAME}"
+          SHA=$(sha256sum "out/${NAME}" | awk '{print $1}')
+          echo "sha_all=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Built ${NAME}"
+          echo "  sha256 ${SHA}"
           ls -la out/
 
       # Upload via REST API directly — `gh release upload` 401s on
@@ -340,9 +339,7 @@ jobs:
         run: |
           REPO="${{ github.repository }}"
           TAG="${{ steps.tag.outputs.tag }}"
-          SHA_TAHOE="${{ steps.assemble.outputs.sha_tahoe }}"
-          SHA_SEQUOIA="${{ steps.assemble.outputs.sha_sequoia }}"
-          SHA_SONOMA="${{ steps.assemble.outputs.sha_sonoma }}"
+          SHA_ALL="${{ steps.assemble.outputs.sha_all }}"
 
           if [ -z "${GH_TOKEN:-}" ]; then
             echo "::error::RELEASE_PUSH_TOKEN secret is not set."
@@ -359,14 +356,12 @@ jobs:
           FILE_SHA=$(echo "$FILE_META" | jq -r '.sha')
           echo "$FILE_META" | jq -r '.content' | base64 -d > /tmp/cocker.rb
 
-          # Patch placeholders. If none present, nothing to do.
-          if ! grep -q REPLACE_BOTTLE_SHA256_TAHOE /tmp/cocker.rb; then
-            echo "No REPLACE_BOTTLE_SHA256_* placeholders on main — already patched."
+          # Patch the placeholder. If absent, nothing to do.
+          if ! grep -q REPLACE_BOTTLE_SHA256_ALL /tmp/cocker.rb; then
+            echo "No REPLACE_BOTTLE_SHA256_ALL placeholder on main — already patched."
             exit 0
           fi
-          sed -i "s|REPLACE_BOTTLE_SHA256_TAHOE|${SHA_TAHOE}|"   /tmp/cocker.rb
-          sed -i "s|REPLACE_BOTTLE_SHA256_SEQUOIA|${SHA_SEQUOIA}|" /tmp/cocker.rb
-          sed -i "s|REPLACE_BOTTLE_SHA256_SONOMA|${SHA_SONOMA}|"  /tmp/cocker.rb
+          sed -i "s|REPLACE_BOTTLE_SHA256_ALL|${SHA_ALL}|" /tmp/cocker.rb
 
           B64=$(base64 -w0 /tmp/cocker.rb)
           RESP=$(curl -fsS -X PUT \
