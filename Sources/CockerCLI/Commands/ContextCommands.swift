@@ -118,8 +118,10 @@ struct ContextRmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         var store = ContextStore.load()
+        var failed = false
         for name in names {
             guard name != "default" else {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot remove context default",
                     reason: "the default context cannot be removed",
@@ -132,6 +134,7 @@ struct ContextRmCommand: AsyncParsableCommand {
             UX.printResult(.context, name, verb: .remove)
         }
         try store.save()
+        if failed { throw ExitCode.failure }
     }
 }
 

@@ -871,7 +871,7 @@ actor DockerfileBuilder {
                             + "getfattr -n trusted.overlay.opaque --only-values \"$d\" 2>/dev/null "
                             + "| grep -q y && : > \"$d/.wh..wh..opq\"; done; fi; "
                             + "tar czf /.cocker-outbox/layer.tar -C /.cocker-upper "
-                            + "--exclude=./.cocker-upper --exclude=./.cocker-outbox . "
+                            + "--exclude=./.cocker-upper --exclude=./.cocker-outbox --exclude=./tmp . "
                             + "2>/.cocker-outbox/tar.err || echo 'cocker: layer tar failed' >&2; "
                             + "sync; fi\n"
                             + "exit \"$__cocker_rc\"\n"

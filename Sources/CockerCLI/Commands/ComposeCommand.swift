@@ -98,19 +98,34 @@ struct ComposeUpCommand: AsyncParsableCommand {
         // network/volume/container with live status + per-resource timer),
         // chronological passthrough otherwise (CI, pipes, logs).
         let view: UX.ComposeUpView? = UX.TTY.current.animationEnabled ? UX.ComposeUpView() : nil
+        // A `.error` stream event reports a build/start failure the stream
+        // doesn't itself throw for — latch it and fail after draining so
+        // `compose up` doesn't exit 0 on a broken build. See PRO-76.
+        let fail = UX.FailFlag()
 
         // `-d` short-circuits the interactive footer : the user explicitly
         // asked for background mode, so we just stream the build / start
         // progress and exit when the daemon says it's done.
         if detach {
-            try await client.sendStreaming(request) { event in
-                if let view {
-                    view.ingest(stream: event.stream, line: event.data)
-                } else {
-                    renderComposeEvent(event)
+            do {
+                try await client.sendStreaming(request) { event in
+                    if case .error = event.stream { fail.trip() }
+                    if let view {
+                        view.ingest(stream: event.stream, line: event.data)
+                    } else {
+                        renderComposeEvent(event)
+                    }
                 }
+            } catch {
+                // Flush the sticky view's buffered build output (the real
+                // RUN failure) BEFORE the error propagates — otherwise a
+                // failed build shows only the one-line headline and the
+                // actual cause is lost. See PRO-76.
+                view?.finalize()
+                throw error
             }
             view?.finalize()
+            try fail.throwIfTripped()
             return
         }
 
@@ -119,14 +134,21 @@ struct ComposeUpCommand: AsyncParsableCommand {
         // without tearing the project down. Matches `docker compose up`'s
         // "Attached to N containers" experience.
         _ = try await InteractiveDetach.run { token in
-            try await client.sendStreaming(request) { event in
-                if let view {
-                    view.ingest(stream: event.stream, line: event.data)
-                } else {
-                    renderComposeEvent(event)
+            do {
+                try await client.sendStreaming(request) { event in
+                    if case .error = event.stream { fail.trip() }
+                    if let view {
+                        view.ingest(stream: event.stream, line: event.data)
+                    } else {
+                        renderComposeEvent(event)
+                    }
                 }
+            } catch {
+                view?.finalize()  // flush buffered build output before the error surfaces (PRO-76)
+                throw error
             }
             view?.finalize()
+            try fail.throwIfTripped()
             // After the up call returns the daemon is done building &
             // starting. From here we attach to the project's running
             // containers' logs — implemented in a follow-up patch so
@@ -405,14 +427,16 @@ struct ComposeRunCommand: AsyncParsableCommand {
         let payload = ComposeRequest(composePath: composePath, projectName: projectName, services: [service], detach: detach)
         let request = try IPCRequest(type: .composeRun, payload: payload)
 
+        let fail = UX.FailFlag()
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: fputs(event.data, stderr)
             case .status: print(UX.TTY.paint(event.data, .progress))
-            case .error:  UX.Failure.emit(headline: event.data)
+            case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
             }
         }
+        try fail.throwIfTripped()
     }
 }
 
@@ -437,14 +461,16 @@ struct ComposeBuildCommand: AsyncParsableCommand {
         let payload = ComposeRequest(composePath: composePath, projectName: projectName, services: services)
         let request = try IPCRequest(type: .composeBuild, payload: payload)
 
+        let fail = UX.FailFlag()
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: fputs(event.data, stderr)
             case .status: print(UX.TTY.paint(event.data, .progress))
-            case .error:  UX.Failure.emit(headline: event.data)
+            case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
             }
         }
+        try fail.throwIfTripped()
     }
 }
 
@@ -466,14 +492,16 @@ struct ComposePullCommand: AsyncParsableCommand {
         let payload = ComposeRequest(composePath: composePath, projectName: projectName, services: services)
         let request = try IPCRequest(type: .composePull, payload: payload)
 
+        let fail = UX.FailFlag()
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: fputs(event.data, stderr)
             case .status: print(UX.TTY.paint(event.data, .progress))
-            case .error:  UX.Failure.emit(headline: event.data)
+            case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
             }
         }
+        try fail.throwIfTripped()
     }
 }
 

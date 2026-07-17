@@ -195,14 +195,16 @@ struct BuildCommand: AsyncParsableCommand {
             view.finalize()
         } else {
             print(" → Building \(config.tag) from \(absContext)/\(file)")
+            let fail = UX.FailFlag()
             try await client.sendStreaming(request) { event in
                 switch event.stream {
                 case .stdout: print(event.data, terminator: "")
                 case .stderr: fputs(event.data, stderr)
                 case .status: print(event.data, terminator: event.data.hasSuffix("\n") ? "" : "\n")
-                case .error:  UX.Failure.emit(headline: event.data)
+                case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
                 }
             }
+            try fail.throwIfTripped()
         }
     }
 
@@ -497,6 +499,7 @@ struct UpdateCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for id in containers {
             let start = Date()
             do {
@@ -504,12 +507,14 @@ struct UpdateCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .update, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot update container \(id)",
                     reason: error.description
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 

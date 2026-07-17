@@ -110,6 +110,7 @@ struct NetworkRmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for name in networks {
             let start = Date()
             do {
@@ -117,6 +118,7 @@ struct NetworkRmCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.network, name, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot remove network \(name)",
                     reason: error.description,
@@ -124,6 +126,7 @@ struct NetworkRmCommand: AsyncParsableCommand {
                 )
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 

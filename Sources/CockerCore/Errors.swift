@@ -44,6 +44,11 @@ public enum CockerError: Error, CustomStringConvertible {
     case connectionFailed(String)
     case requestFailed(String)
     case responseDecodingFailed(String)
+    /// A failure the daemon already described well. Carries the daemon's
+    /// message VERBATIM — unlike `requestFailed`, its `description` adds no
+    /// prefix, so the CLI doesn't stack "Request failed: Build failed: …".
+    /// The transport throws this instead of re-wrapping daemon errors.
+    case daemon(String)
 
     // Config errors
     case invalidPortMapping(String)
@@ -90,6 +95,7 @@ public enum CockerError: Error, CustomStringConvertible {
         case .connectionFailed(let msg): return "Connection failed: \(msg)"
         case .requestFailed(let msg): return "Request failed: \(msg)"
         case .responseDecodingFailed(let msg): return "Response decoding failed: \(msg)"
+        case .daemon(let msg): return msg
         case .invalidPortMapping(let s): return "Invalid port mapping: \(s) (expected format: host:container)"
         case .invalidVolumeSpec(let s): return "Invalid volume spec: \(s) (expected format: source:dest[:ro])"
         case .invalidEnvironmentVar(let s): return "Invalid environment variable: \(s)"
@@ -100,6 +106,63 @@ public enum CockerError: Error, CustomStringConvertible {
         case .diskFull: return "No space left on device"
         case .unsupportedPlatform(let p): return "Unsupported platform: \(p)"
         case .internalError(let msg): return "Internal error: \(msg)"
+        }
+    }
+
+    /// Charter §6 split into what / why / how, for `UX.Failure`. Most cases
+    /// fall back to the flat `description` as the headline ; the ones where
+    /// a reason or an actionable hint is knowable lift it out so the CLI can
+    /// render the three-line block instead of one dense sentence.
+    public var presentation: (headline: String, reason: String?, hint: String?) {
+        switch self {
+        case .daemonNotRunning:
+            return ("Cannot connect to cockerd", "the daemon isn't running", "start it with `cockerd`")
+        case .kernelNotFound:
+            return ("Linux kernel not found", nil, "run `cockerd setup`")
+        case .initrdNotFound:
+            return ("initrd not found", nil, "run `cockerd setup`")
+        case .buildFailed(let msg):
+            return ("Build failed", msg, nil)
+        case .imagePullFailed(let ref, let reason):
+            return ("Failed to pull \(ref)", reason, nil)
+        case .permissionDenied(let op):
+            return ("Permission denied", op, nil)
+        case .invalidPortMapping(let s):
+            return ("Invalid port mapping: \(s)", nil, "expected `host:container`")
+        case .invalidVolumeSpec(let s):
+            return ("Invalid volume spec: \(s)", nil, "expected `source:dest[:ro]`")
+        case .daemon(let msg):
+            // The daemon already wrote a good message. Lift a leading
+            // "Xxx failed: …" into headline + reason so it reads as a block
+            // (e.g. "Build failed: RUN … exited 1" → what/why), otherwise
+            // use it verbatim as the headline.
+            if let sep = msg.range(of: ": "),
+               msg[..<sep.lowerBound].lowercased().hasSuffix("failed") {
+                return (String(msg[..<sep.lowerBound]),
+                        String(msg[sep.upperBound...]), nil)
+            }
+            return (msg, nil, nil)
+        default:
+            return (description, nil, nil)
+        }
+    }
+
+    /// Process exit code for this error. Binary 0/1 tells a script nothing ;
+    /// this borrows Docker's 125–127 convention so `$?` distinguishes "no
+    /// such object" from "daemon down" from "not runnable".
+    public var exitCode: Int32 {
+        switch self {
+        case .containerNotFound, .imageNotFound, .networkNotFound, .volumeNotFound,
+             .manifestNotFound, .dockerfileNotFound:
+            return 127  // no such object
+        case .permissionDenied:
+            return 126  // found but not runnable
+        case .daemonNotRunning, .connectionFailed, .responseDecodingFailed,
+             .kernelNotFound, .initrdNotFound, .vmStartFailed, .vmStopFailed,
+             .vmCommunicationFailed:
+            return 125  // cocker itself failed
+        default:
+            return 1
         }
     }
 }
