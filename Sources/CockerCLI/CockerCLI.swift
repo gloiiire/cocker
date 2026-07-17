@@ -155,13 +155,15 @@ struct CockerCLI: AsyncParsableCommand {
             let raw = Self.fullMessage(for: error)
             let code = Self.exitCode(for: error)
 
-            // CockerError surfaces as a typed value — print it in red,
-            // exit 1. (`fullMessage` would already include it, but we
-            // want the consistent "Error:" prefix the rest of the codebase
-            // uses for application-level failures.)
+            // CockerError → the charter §6 failure block (red ✗ + headline,
+            // dim reason/hint), to stderr. One chokepoint for every command:
+            // no more "Error: Request failed: …" triple-prefix, and the exit
+            // code reflects the kind (125 daemon / 126 not-runnable / 127 no
+            // such object) so scripts can branch on it.
             if let cockerErr = error as? CockerError {
-                fputs("\(ANSI.colored("Error:", ANSI.red)) \(cockerErr.description)\n", stderr)
-                Foundation.exit(1)
+                let p = cockerErr.presentation
+                UX.Failure.emit(headline: p.headline, reason: p.reason, hint: p.hint)
+                Foundation.exit(cockerErr.exitCode)
             }
 
             // ExitCode propagated from inside run() — pass through.
