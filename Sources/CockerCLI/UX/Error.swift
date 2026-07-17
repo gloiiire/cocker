@@ -1,4 +1,5 @@
 import Foundation
+import ArgumentParser
 
 // Cocker UX charter §6 — three-line error formatter. Every error a
 // command emits answers the same three questions :
@@ -41,6 +42,20 @@ public extension UX {
         ) {
             let text = render(headline: headline, reason: reason, hint: hint, details: details) + "\n"
             FileHandle.standardError.write(Data(text.utf8))
+        }
+
+        /// Emit the §6 block AND fail the command with `code`. Use this at
+        /// the ~dozens of sites that printed an error then `return`ed —
+        /// which silently exited 0 (a script couldn't tell success from
+        /// failure). `try UX.Failure.fail(...)` replaces `emit(...)` +
+        /// `return`, and the CLI's top-level catch exits with `code`.
+        @discardableResult
+        public static func fail(
+            headline: String, reason: String? = nil, hint: String? = nil,
+            details: String? = nil, code: Int32 = 1
+        ) throws -> Never {
+            emit(headline: headline, reason: reason, hint: hint, details: details)
+            throw ExitCode(code)
         }
     }
 

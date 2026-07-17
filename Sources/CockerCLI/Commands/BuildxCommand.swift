@@ -72,8 +72,9 @@ struct BuildxInstallQemuCommand: AsyncParsableCommand {
         ]
         if !all {
             guard supported.contains(arch) else {
-                print("Error: unsupported arch '\(arch)'. Choose one of: \(supported.sorted().joined(separator: ", "))")
-                throw ExitCode.failure
+                try UX.Failure.fail(
+                    headline: "Unsupported arch '\(arch)'",
+                    hint: "choose one of: \(supported.sorted().joined(separator: ", "))")
             }
         }
 
@@ -103,8 +104,7 @@ struct BuildxInstallQemuCommand: AsyncParsableCommand {
         let assetName = "qemu_\(qemuVersion)_linux-arm64.tar.gz"
         let urlStr = "https://github.com/tonistiigi/binfmt/releases/download/\(version)/\(assetName)"
         guard let url = URL(string: urlStr) else {
-            print("Error: could not form release URL")
-            throw ExitCode.failure
+            try UX.Failure.fail(headline: "Could not form the release URL")
         }
 
         let tarball = qemuDir.appendingPathComponent(".\(assetName)")
@@ -116,8 +116,8 @@ struct BuildxInstallQemuCommand: AsyncParsableCommand {
         curl.waitUntilExit()
         guard curl.terminationStatus == 0 else {
             try? FileManager.default.removeItem(at: tarball)
-            print("Error: download failed (curl exit \(curl.terminationStatus))")
-            throw ExitCode.failure
+            try UX.Failure.fail(headline: "Download failed",
+                                reason: "curl exited \(curl.terminationStatus)")
         }
 
         // Extract one or all binaries. The tarball is flat — entries
@@ -134,8 +134,8 @@ struct BuildxInstallQemuCommand: AsyncParsableCommand {
         tar.waitUntilExit()
         try? FileManager.default.removeItem(at: tarball)
         guard tar.terminationStatus == 0 else {
-            print("Error: tar extract failed (exit \(tar.terminationStatus))")
-            throw ExitCode.failure
+            try UX.Failure.fail(headline: "Extract failed",
+                                reason: "tar exited \(tar.terminationStatus)")
         }
 
         // Rename qemu-<arch> → qemu-<arch>-static so the binfmt
