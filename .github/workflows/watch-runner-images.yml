@@ -39,17 +39,16 @@ jobs:
             GitHub-hosted runner image `macos-__V__` is now available
             (https://github.com/actions/runner-images/blob/main/images/macos/).
 
-            Action items to ship a bottle for it :
+            Good news : since PRO-74 the bottle uses Homebrew's `all` tag
+            (one bottle for every macOS), so **no bottle change is needed** —
+            `macos-__V__` users already get the existing bottle, no per-OS
+            symbol to add.
 
-            1. `.github/workflows/bottle.yml` — add a matrix entry :
-                - runner: macos-__V__
-                  macos: <codename>   # check Apple's release name
-            2. `Formula/cocker.rb` — add a sha256 placeholder line in the
-            `bottle do` block (between sequoia and tahoe to keep order roughly
-            chronological) :
-                sha256 cellar: :any_skip_relocation, arm64_<codename>: "REPLACE_BOTTLE_SHA256_<CODENAME>"
-            3. `.github/workflows/bottle.yml` → `update-formula` job — extract
-            the `arm64_<codename>` sha256 and sed it in.
+            Optional follow-ups worth a look :
+            - Verify `swift build -c release` still succeeds on the new runner
+              (SDK / toolchain drift).
+            - If Apple dropped support for the current `depends_on macos:`
+              floor, consider bumping it in `Formula/cocker.rb`.
 
             Triggered by `.github/workflows/watch-runner-images.yml` cron run on
             __DATE__.

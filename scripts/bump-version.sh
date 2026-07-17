@@ -63,11 +63,9 @@ mv "$tmp" "$protocol_file"
 # 3. Formula/cocker.rb : three substitutions on a single file.
 #  a) version "X.Y.Z"
 #  b) root_url "...releases/download/vX.Y.Z"
-#  c) The three sha256 lines for arm64_tahoe / sequoia / sonoma → reset to
-#     placeholders so the Bottle workflow patches them with the real hash
-#     once the release is up. If the formula already carries the new
-#     version's hashes (e.g. we're re-running bump for a patch on top of
-#     an already-released bottle), we skip the reset.
+#  c) The bottle sha256 → reset to a single `all:` placeholder so the
+#     Bottle workflow patches it with the real hash once the release is
+#     up. One bottle covers every macOS (see below).
 tmp="$(mktemp)"
 sed -E \
     -e "s|^( *version )\"[^\"]+\"|\1\"${new_version}\"|" \
@@ -75,15 +73,22 @@ sed -E \
     "$formula_file" > "$tmp"
 mv "$tmp" "$formula_file"
 
-# Reset the bottle sha256s — only if the workflow would otherwise no-op.
-# We replace any 64-hex string in an `arm64_<codename>:` line with the
-# canonical placeholder for that codename.
+# Reset the bottle sha256 to a SINGLE `all:` placeholder. The arm64
+# binary is byte-identical across macOS versions, so one bottle tagged
+# `all` matches every macOS (Sonoma, Tahoe, and any future release)
+# without needing a per-OS symbol — the Bottle workflow patches the one
+# placeholder with the real hash. Idempotent : collapses the legacy 3
+# per-OS lines OR an already-`all` line down to the single placeholder.
 tmp="$(mktemp)"
-sed -E \
-    -e "s|(arm64_tahoe: +)\"[0-9a-f]{64}\"|\1\"REPLACE_BOTTLE_SHA256_TAHOE\"|" \
-    -e "s|(arm64_sequoia: +)\"[0-9a-f]{64}\"|\1\"REPLACE_BOTTLE_SHA256_SEQUOIA\"|" \
-    -e "s|(arm64_sonoma: +)\"[0-9a-f]{64}\"|\1\"REPLACE_BOTTLE_SHA256_SONOMA\"|" \
-    "$formula_file" > "$tmp"
+awk '
+  /^  bottle do/ { inb=1 }
+  inb && /^    sha256 cellar: :any_skip_relocation, (arm64_|all:)/ {
+    if (!done) { print "    sha256 cellar: :any_skip_relocation, all:      \"REPLACE_BOTTLE_SHA256_ALL\""; done=1 }
+    next
+  }
+  inb && /^  end/ { inb=0 }
+  { print }
+' "$formula_file" > "$tmp"
 mv "$tmp" "$formula_file"
 
 # Pretty diff summary so a human can sanity-check what changed without
@@ -92,7 +97,7 @@ echo ""
 echo "Bumped cocker → ${new_version}"
 echo "  /VERSION                                  →  ${new_version}"
 echo "  Sources/CockerCore/IPC/Protocol.swift     →  version = \"${new_version}\""
-echo "  Formula/cocker.rb                         →  version + root_url + REPLACE_BOTTLE_SHA256_* placeholders"
+echo "  Formula/cocker.rb                         →  version + root_url + REPLACE_BOTTLE_SHA256_ALL placeholder"
 echo ""
 echo "Next steps :"
 echo "  git diff                                   # inspect"
