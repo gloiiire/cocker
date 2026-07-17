@@ -31,6 +31,7 @@ struct PullCommand: AsyncParsableCommand {
         }
         let buf = LayerBuffer()
         let reporter = ProgressReporter()
+        let fail = UX.FailFlag()
 
         try await client.sendStreaming(request) { event in
             if event.stream == .status {
@@ -46,11 +47,13 @@ struct PullCommand: AsyncParsableCommand {
                     reporter.update(buf.states)
                 }
             } else if event.stream == .error {
+                fail.trip()
                 UX.Failure.emit(headline: event.data)
             }
         }
 
         reporter.done()
+        try fail.throwIfTripped()
         UX.printResult(.image, image, verb: .pull, elapsed: Date().timeIntervalSince(start))
     }
 }
@@ -70,14 +73,16 @@ struct PushCommand: AsyncParsableCommand {
         let start = Date()
         let payload = PullRequest(reference: image)
         let request = try IPCRequest(type: .push, payload: payload)
+        let fail = UX.FailFlag()
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: fputs(event.data, stderr)
             case .status: print(UX.TTY.paint(event.data, .progress))
-            case .error:  UX.Failure.emit(headline: event.data)
+            case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
             }
         }
+        try fail.throwIfTripped()
         UX.printResult(.image, image, verb: .push, elapsed: Date().timeIntervalSince(start))
     }
 }

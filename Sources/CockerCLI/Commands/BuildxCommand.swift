@@ -232,14 +232,16 @@ struct BuildxBuildCommand: AsyncParsableCommand {
             let payload = BuildRequest(config: config)
             let request = try IPCRequest(type: .build, payload: payload)
 
+            let fail = UX.FailFlag()
             try await client.sendStreaming(request) { event in
                 switch event.stream {
                 case .stdout: print(event.data, terminator: "")
                 case .stderr: fputs(event.data, stderr)
                 case .status: print(UX.TTY.paint(event.data, .dim))
-                case .error:  UX.Failure.emit(headline: event.data)
+                case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
                 }
             }
+            try fail.throwIfTripped()
 
             // Retrieve the built image ID
             let imagesReq = try IPCRequest(type: .images, payload: EmptyPayload())

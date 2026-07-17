@@ -299,14 +299,16 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             detach: true
         )
         let request = try IPCRequest(type: .composeUp, payload: payload)
+        let fail = UX.FailFlag()
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: fputs(event.data, stderr)
             case .status: print(UX.TTY.paint(event.data, .progress))
-            case .error:  UX.Failure.emit(headline: event.data)
+            case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
             }
         }
+        try fail.throwIfTripped()
     }
 }
 

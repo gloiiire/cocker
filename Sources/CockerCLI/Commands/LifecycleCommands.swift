@@ -493,6 +493,7 @@ struct AttachCommand: AsyncParsableCommand {
         let payload = ContainerIDRequest(id: container)
         let request = try IPCRequest(type: .attach, payload: payload)
 
+        let fail = UX.FailFlag()
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
@@ -500,9 +501,11 @@ struct AttachCommand: AsyncParsableCommand {
             case .status:
                 if !event.data.isEmpty { print(event.data, terminator: "") }
             case .error:
+                fail.trip()
                 UX.Failure.emit(headline: event.data)
             }
         }
+        try fail.throwIfTripped()
     }
 }
 

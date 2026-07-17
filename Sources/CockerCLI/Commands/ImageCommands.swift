@@ -195,14 +195,16 @@ struct BuildCommand: AsyncParsableCommand {
             view.finalize()
         } else {
             print(" → Building \(config.tag) from \(absContext)/\(file)")
+            let fail = UX.FailFlag()
             try await client.sendStreaming(request) { event in
                 switch event.stream {
                 case .stdout: print(event.data, terminator: "")
                 case .stderr: fputs(event.data, stderr)
                 case .status: print(event.data, terminator: event.data.hasSuffix("\n") ? "" : "\n")
-                case .error:  UX.Failure.emit(headline: event.data)
+                case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
                 }
             }
+            try fail.throwIfTripped()
         }
     }
 

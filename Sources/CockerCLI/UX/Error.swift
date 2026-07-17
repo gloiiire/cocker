@@ -9,6 +9,22 @@ import ArgumentParser
 // An optional 4th "details:" line points to logs / stack traces.
 
 public extension UX {
+    /// Thread-safe failure latch for streaming commands. `sendStreaming`'s
+    /// handler is `@Sendable (StreamEvent) -> Void` and can't throw, so a
+    /// `.error` stream event trips this and the command calls
+    /// `throwIfTripped()` after the stream drains — otherwise it would
+    /// print an error yet exit 0.
+    final class FailFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        public init() {}
+        public func trip() { lock.lock(); value = true; lock.unlock() }
+        public var tripped: Bool { lock.lock(); defer { lock.unlock() }; return value }
+        public func throwIfTripped(code: Int32 = 1) throws {
+            if tripped { throw ExitCode(code) }
+        }
+    }
+
     enum Failure {
         public static func render(
             headline: String,
