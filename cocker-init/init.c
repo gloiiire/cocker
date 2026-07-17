@@ -56,6 +56,12 @@ static void forward_stop_signal_to_child(int sig) {
     }
 }
 
+/* Set when the rootfs is a build overlay (switch_to_overlay, below).
+ * Read by finish_switch_root() (roomy /tmp) and main() (skip etc_overlay,
+ * which only works around Apple virtiofs's /etc metadata bug — moot on the
+ * native ext4 upper). Declared up here so finish_switch_root can see it. */
+static int g_build_overlay = 0;
+
 /* Shared tail for every rootfs backend : once the real root is mounted
  * at /newroot, move the early /proc,/sys,/dev into it, set up
  * /run,/tmp,/dev/pts, then switch_root into /newroot. Only the backing
@@ -73,8 +79,21 @@ static void finish_switch_root(void) {
 
     mount("tmpfs", "/newroot/run", "tmpfs", MS_NOSUID | MS_NODEV,
           "mode=755,size=64m");
-    mount("tmpfs", "/newroot/tmp", "tmpfs", MS_NOSUID | MS_NODEV,
-          "mode=1777,size=64m");
+    if (g_build_overlay) {
+        /* Build VMs : keep /tmp on the roomy ext4 overlay (~16 GiB) rather
+         * than a 64 MB tmpfs. pip / npm / cargo stage large downloads under
+         * /tmp, and a 64 MB tmpfs overflows with ENOSPC ("No space left on
+         * device") on any non-trivial requirements.txt (numpy + scipy +
+         * matplotlib alone blow past 64 MB). The base image already ships a
+         * 1777 /tmp ; ensure the mode for `FROM scratch`. The RUN wrapper
+         * excludes ./tmp from the layer tar so this scratch never lands in
+         * the image (matching the old tmpfs "never in the layer" behaviour).
+         * See PRO-75. */
+        chmod("/newroot/tmp", 01777);
+    } else {
+        mount("tmpfs", "/newroot/tmp", "tmpfs", MS_NOSUID | MS_NODEV,
+              "mode=1777,size=64m");
+    }
 
     /* devpts : required for openpty()/openpty-allocated /dev/pts/N pairs.
      * Without this `cocker exec -t` fails at openpty() inside the listener. */
@@ -118,13 +137,6 @@ static void switch_to_block(const char *dev) {
     info("ext4 rootfs %s mounted at /newroot", dev);
     finish_switch_root();
 }
-
-/* Set when the rootfs is a build overlay (below). main() reads it to skip
- * etc_overlay_setup() — that workaround exists only for Apple virtiofs's
- * /etc metadata bug, and in overlay mode /etc writes already land on the
- * native ext4 upper (and a tmpfs /etc overlay would hide those changes
- * from the build layer). */
-static int g_build_overlay = 0;
 
 /* Defined further down (near mount_volumes) — forward-declared so the
  * build-overlay setup above can reuse the same ext4 probe + fork/exec. */
