@@ -59,7 +59,10 @@ public actor IPCClient {
             throw CockerError.responseDecodingFailed("Could not decode response")
         }
         if !response.success, let err = response.error {
-            throw CockerError.requestFailed(err)
+            // Pass the daemon's already-formatted message through as-is —
+            // `.daemon` adds no prefix, so the CLI shows a clean block
+            // instead of "Error: Request failed: Build failed: …".
+            throw CockerError.daemon(err)
         }
         return response
     }
@@ -92,7 +95,8 @@ public actor IPCClient {
             if frameData.isEmpty { return }
             let response = try JSONDecoder().decode(IPCResponse.self, from: frameData)
             if !response.success, let err = response.error {
-                throw CockerError.requestFailed(err)
+                // Pass the daemon message through unprefixed (see send()).
+                throw CockerError.daemon(err)
             }
             if response.isStreaming {
                 let event = try response.decode(StreamEvent.self)
