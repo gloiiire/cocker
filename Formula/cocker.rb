@@ -305,15 +305,10 @@ class Cocker < Formula
   def caveats
     <<~EOS
       cocker is signed and ready — it runs out of the box on this Mac.
-      Two things to finish before launching containers:
+      The Apple Container Linux kernel it boots comes bundled via the
+      `container` dependency, installed automatically alongside cocker.
 
-      1) Apple Container Linux kernel (booted inside each container VM)
-           brew install container
-
-         Installed it after cocker? Provision the kernel + initrd with:
-           cocker daemon setup
-
-      2) Start the daemon
+      Start the daemon:
            brew services start cocker
 
          Logs:        #{var}/log/cockerd.log
@@ -321,6 +316,10 @@ class Cocker < Formula
          First try:   cocker pull alpine:latest
                       cocker run -d alpine:latest -- /bin/sh -c \\
                         'while true; do date; sleep 1; done'
+
+         Kernel not found on first run? A fresh install's post-install
+         step is sandboxed from writing ~/.cocker — provision it once:
+           cocker daemon setup
 
       Signing (only if you move the binary between Macs)
         cockerd is ad-hoc signed at install — enough for macOS to let it
