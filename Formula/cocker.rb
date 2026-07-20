@@ -3,7 +3,7 @@ require "etc"
 class Cocker < Formula
   desc "Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework"
   homepage "https://github.com/gloiiire/cocker"
-  version "0.7.13"
+  version "0.7.13.1"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
   # Placeholder — replace with `shasum -a 256` of the actual release tarball.
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
@@ -27,8 +27,8 @@ class Cocker < Formula
   # both `version "..."` AND this `vX.Y.Z` substring on every release
   # tag so they stay in lock-step.
   bottle do
-    root_url "https://github.com/gloiiire/cocker/releases/download/v0.7.13"
-    sha256 cellar: :any_skip_relocation, all:      "75d4f301f94741aad5908f79d4b1e6a86c007ac2b34c401428a6a535bf39e83f"
+    root_url "https://github.com/gloiiire/cocker/releases/download/v0.7.13.1"
+    sha256 cellar: :any_skip_relocation, all:      "REPLACE_BOTTLE_SHA256_ALL"
   end
 
   depends_on arch: :arm64
@@ -166,18 +166,15 @@ class Cocker < Formula
     ohai "codesign: #{cs_err.strip}" unless cs_err.empty?
     ohai cs_out.strip unless cs_out.empty?
 
-    # Tell the user how to get a real cert signature without making
-    # the install feel broken.
-    opoo <<~EOS
-      cockerd was ad-hoc signed (Homebrew's sandbox denies keychain access,
-      so we can't read your Apple Development cert from inside the install).
+    # Ad-hoc signing is enough to boot VMs on this Mac, so this is a
+    # calm ohai note, not an opoo warning — nothing is broken. Only a
+    # user moving the binary to another machine needs a real cert.
+    ohai <<~EOS
+      cockerd is ad-hoc signed — enough for macOS to let it boot VMs on
+      this Mac. Only if you copy the binary to another machine (or hit a
+      stricter signing policy) do you need a real Apple Development cert:
 
-      To resign with your real cert (TeamIdentifier-bearing, portable across
-      machines) :
-
-        cocker daemon resign
-
-      Re-run after every `brew upgrade cocker`.
+        cocker daemon resign        (re-run after each `brew upgrade cocker`)
     EOS
 
     # --- 2. Provision ~/.cocker/kernel/ (kernel symlink + initrd copy) ---
@@ -307,26 +304,11 @@ class Cocker < Formula
 
   def caveats
     <<~EOS
-      cocker needs three things before it can launch containers:
+      cocker is signed and ready — it runs out of the box on this Mac.
+      The Apple Container Linux kernel it boots comes bundled via the
+      `container` dependency, installed automatically alongside cocker.
 
-      1) Apple Development signing certificate (free, one-time setup)
-         Required because cockerd uses Virtualization.framework, which
-         macOS only allows for binaries signed by a real Apple developer
-         certificate — not an ad-hoc signature.
-
-         How to get one:
-           a) Open Xcode → Settings → Accounts
-           b) Sign in with your Apple ID (free account is fine)
-           c) Click "Manage Certificates" → "+" → "Apple Development"
-         Then re-run:  brew postinstall cocker
-
-      2) Apple Container Linux kernel (booted inside each container VM)
-           brew install container
-
-         If you install it after cocker, finish setup with:
-           brew postinstall cocker
-
-      3) Start the daemon
+      Start the daemon:
            brew services start cocker
 
          Logs:        #{var}/log/cockerd.log
@@ -335,13 +317,23 @@ class Cocker < Formula
                       cocker run -d alpine:latest -- /bin/sh -c \\
                         'while true; do date; sleep 1; done'
 
-      Rich autocomplete (optional — Kiro CLI users)
-        If you use Kiro CLI / Fig (https://kiro.dev) we ship a spec at
-        #{HOMEBREW_PREFIX}/share/cocker/completions/kiro/cocker.ts.
-        On install we try to drop it into ~/.fig/autocomplete/build/
-        automatically — if Kiro wasn't installed yet, run :
-            brew postinstall cocker
-        after `brew install --cask kiro-cli`, then restart your terminal.
+         Kernel not found on first run? A fresh install's post-install
+         step is sandboxed from writing ~/.cocker — provision it once:
+           cocker daemon setup
+
+      Signing (only if you move the binary between Macs)
+        cockerd is ad-hoc signed at install — enough for macOS to let it
+        boot VMs on THIS machine. You only need a real Apple Development
+        cert to copy the binary to another Mac or satisfy a stricter
+        policy:
+          a) Xcode → Settings → Accounts → sign in (a free Apple ID works)
+          b) Manage Certificates → "+" → "Apple Development"
+          c) cocker daemon resign        # re-run after each brew upgrade
+
+      Autocomplete (optional — Kiro CLI)
+        If you use Kiro CLI (https://kiro.dev), install the shipped spec:
+          cocker autocomplete install
+        then restart your terminal.
 
       Uninstalling cocker? Your container state lives in ~/.cocker
       (kept across upgrades). Remove it with:
