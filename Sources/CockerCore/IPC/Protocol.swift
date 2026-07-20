@@ -141,6 +141,17 @@ public struct EmptyPayload: Codable, Sendable {
     public init() {}
 }
 
+/// `image prune` payload. `all == false` keeps the historical behavior
+/// (only images referenced by NO container are removed). `all == true`
+/// also removes images referenced by stopped/dead containers, keeping
+/// only those a currently-running container depends on. Decoded with a
+/// fallback to `all: false` so an older CLI sending `EmptyPayload` still
+/// gets the safe, backward-compatible prune.
+public struct ImagePruneRequest: Codable, Sendable {
+    public let all: Bool
+    public init(all: Bool = false) { self.all = all }
+}
+
 public struct PingResponse: Codable, Sendable {
     public let version: String
     public let apiVersion: String
@@ -487,7 +498,7 @@ public struct UpdateRequest: Codable, Sendable {
 public enum CockerVersion {
     // Bumped manually with each tag. TODO : drive from a Version.generated.swift
     // produced by the release workflow so this can't drift again.
-    public static let version = "0.7.13.1"
+    public static let version = "0.7.13.2"
     public static let apiVersion = "1.0"
     public static let buildTime = "2026-06-13"
     public static let minAPIVersion = "1.0"
