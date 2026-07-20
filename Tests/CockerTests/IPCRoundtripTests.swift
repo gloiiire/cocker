@@ -17,6 +17,27 @@ struct IPCRoundtripTests {
         _ = try dec.decode(EmptyPayload.self, from: raw)
     }
 
+    @Test func imagePruneRequestRoundtrips() throws {
+        for flag in [true, false] {
+            let back = try dec.decode(ImagePruneRequest.self, from: enc.encode(ImagePruneRequest(all: flag)))
+            #expect(back.all == flag)
+        }
+    }
+
+    @Test func imagePruneDefaultsToAllFalse() throws {
+        // Safety default when constructed without an argument.
+        #expect(ImagePruneRequest().all == false)
+    }
+
+    @Test func imagePruneFallsBackWhenEmptyPayloadSent() throws {
+        // An older CLI sends EmptyPayload for `image prune`. The daemon decodes
+        // it as ImagePruneRequest with `try?` and must fall back to all:false
+        // (the safe, backward-compatible prune) rather than crash.
+        let legacy = try enc.encode(EmptyPayload())
+        let decoded = (try? dec.decode(ImagePruneRequest.self, from: legacy)) ?? ImagePruneRequest(all: false)
+        #expect(decoded.all == false)
+    }
+
     @Test func pingResponseCarriesVersion() throws {
         let p = PingResponse()
         let back = try dec.decode(PingResponse.self, from: enc.encode(p))
