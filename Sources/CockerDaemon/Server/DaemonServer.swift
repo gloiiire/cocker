@@ -359,7 +359,10 @@ final class DaemonServer {
                 try sendResponse(requestId: request.id, payload: ImageHistoryResponse(entries: entries), to: fd)
 
             case .imagePrune:
-                let result = try await handleImagePrune()
+                // Backward-compatible: an older CLI sends EmptyPayload, which
+                // fails to decode as ImagePruneRequest → default to all:false.
+                let pruneReq = (try? JSONDecoder().decode(ImagePruneRequest.self, from: request.payload)) ?? ImagePruneRequest(all: false)
+                let result = try await handleImagePrune(all: pruneReq.all)
                 try sendResponse(requestId: request.id, payload: result, to: fd)
 
             case .containerPrune:
@@ -748,17 +751,36 @@ final class DaemonServer {
         return "Loaded image: \(img.repository):\(img.tag)"
     }
 
-    private func handleImagePrune() async throws -> PruneResponse {
+    private func handleImagePrune(all: Bool = false) async throws -> PruneResponse {
         let allImages = await engine.images.list()
         let allContainers = await engine.state.allContainers(includeAll: true)
-        let usedImages = Set(allContainers.map { $0.image })
+
+        // Containers whose image must be protected. Default prune protects
+        // images referenced by ANY container (running or stopped) ; `--all`
+        // narrows that to images a *running* container depends on — a running
+        // VM has already cloned its own rootfs, but yanking the source image
+        // out from under it would break commit/restart, so we keep those.
+        let holders = all ? allContainers.filter { $0.status == .running } : allContainers
+
+        // Resolve each holder's stored image string to a concrete image ID via
+        // the same lookup the rest of the daemon uses. A container records the
+        // reference the user typed (`alpine:3.19`) while the image is stored
+        // normalized (`library/alpine:3.19`) — comparing the raw strings never
+        // matched, so a plain prune used to delete images still held by a
+        // stopped container. Matching by resolved ID fixes that.
+        var protectedIDs = Set<String>()
+        for c in holders {
+            if let img = try? await engine.images.find(c.image) {
+                protectedIDs.insert(img.id)
+            }
+        }
 
         var deleted: [String] = []
         var reclaimed: UInt64 = 0
 
-        for img in allImages where !usedImages.contains(img.reference) && !usedImages.contains(img.id) {
+        for img in allImages where !protectedIDs.contains(img.id) {
             reclaimed += img.size
-            try? await engine.images.remove(img.reference)
+            try? await engine.images.remove(img.reference, force: all)
             deleted.append(img.reference)
         }
 

@@ -342,17 +342,22 @@ struct ImagePruneCommand: AsyncParsableCommand {
         abstract: "Remove unused images"
     )
 
+    @Flag(name: [.short, .customLong("all")], help: "Also remove images held by stopped containers (keeps only images used by a running container)")
+    var all = false
+
     @Flag(name: [.short, .customLong("force")], help: "Do not prompt for confirmation")
     var force = false
 
     mutating func run() async throws {
         guard UX.Confirm.ask(
-            summary: "This will remove all images not referenced by any container.",
+            summary: all
+                ? "This will remove ALL images, including those held by stopped containers (only images used by a running container are kept)."
+                : "This will remove all images not referenced by any container.",
             force: force
         ) else { return }
 
         let client = IPCClient()
-        let request = try IPCRequest(type: .imagePrune, payload: EmptyPayload())
+        let request = try IPCRequest(type: .imagePrune, payload: ImagePruneRequest(all: all))
         let response = try await client.send(request)
         let result = try response.decode(PruneResponse.self)
 
