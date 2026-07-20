@@ -154,12 +154,17 @@ struct BuildCommand: AsyncParsableCommand {
         let cwd = FileManager.default.currentDirectoryPath
         let absContext = context.hasPrefix("/") ? context : cwd + "/" + context
 
+        // `-f` may be absolute or relative. A relative `-f` is anchored on the
+        // context ; an absolute `-f` is taken verbatim. Naively doing
+        // `absContext + "/" + file` concatenates the two absolute paths into
+        // garbage (`/ctx//abs/Dockerfile`) — the bug behind PRO-78.
+        let dockerfileFullPath = file.hasPrefix("/") ? file : absContext + "/" + file
+
         // Stage iCloud-resident build contexts to a local cache. cockerd
         // can't read iCloud files reliably (`bird` coordinator deadlocks
         // inside the daemon process) ; the CLI has full TCC access and
         // can copy via rsync. Same staging mechanism `cocker compose up`
         // uses ; benefits from the same incremental cache on repeat runs.
-        let dockerfileFullPath = absContext + "/" + file
         let stage = try await ICloudStaging.stageIfNeeded(originalPath: dockerfileFullPath) { msg in
             // bird (iCloud) staging is one of the macOS-daemon touch-points
             // the charter §12 says we name explicitly so users see what's
@@ -169,7 +174,11 @@ struct BuildCommand: AsyncParsableCommand {
         let effectiveContext = (stage.path as NSString).deletingLastPathComponent
 
         var config = BuildConfig(contextPath: effectiveContext, tag: tag.isEmpty ? "cocker-image:\(Int(Date().timeIntervalSince1970))" : tag)
-        config.dockerfile = file
+        // The daemon joins `contextPath + "/" + dockerfile`, so send just the
+        // filename — `effectiveContext` already points at the Dockerfile's
+        // staged directory. Sending the raw (possibly absolute) `file` here
+        // was the other half of the PRO-78 path-concatenation bug.
+        config.dockerfile = (stage.path as NSString).lastPathComponent
         config.buildArgs = try parseKV(buildArgs)
         config.noCache = noCache
         config.target = target
@@ -188,13 +197,13 @@ struct BuildCommand: AsyncParsableCommand {
             let view = UX.BuildView()
             // Pre-header so users see "what is being built" before the
             // first Step event arrives from the daemon.
-            print(" " + UX.TTY.paint("→ Building", .progress) + " " + UX.TTY.paint(config.tag, .accent) + " " + UX.TTY.paint("from \(absContext)/\(file)", .dim))
+            print(" " + UX.TTY.paint("→ Building", .progress) + " " + UX.TTY.paint(config.tag, .accent) + " " + UX.TTY.paint("from \(dockerfileFullPath)", .dim))
             try await client.sendStreaming(request) { event in
                 view.ingest(stream: event.stream, line: event.data)
             }
             view.finalize()
         } else {
-            print(" → Building \(config.tag) from \(absContext)/\(file)")
+            print(" → Building \(config.tag) from \(dockerfileFullPath)")
             let fail = UX.FailFlag()
             try await client.sendStreaming(request) { event in
                 switch event.stream {
