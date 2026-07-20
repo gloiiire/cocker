@@ -439,10 +439,17 @@ actor ComposeEngine {
         let projectName = request.projectName ?? inferProjectName(from: request.composePath)
         let services = request.services.isEmpty ? Array(compose.services.keys) : request.services
 
+        // Resolve every build context relative to the compose file's own
+        // directory — NOT the daemon's cwd. `compose up --build` already does
+        // this (see above) ; `compose build` must match, otherwise a relative
+        // `context: ./webapp/api` resolves against wherever cockerd happens to
+        // run and the Dockerfile is "not found". PRO-78.
+        let composeDir = (request.composePath as NSString).deletingLastPathComponent
         for serviceName in services {
             guard let service = compose.services[serviceName],
                   let buildSpec = service.build else { continue }
-            let context = buildSpec.context ?? "."
+            let rawContext = buildSpec.context ?? "."
+            let context = rawContext.hasPrefix("/") ? rawContext : "\(composeDir)/\(rawContext)"
             let dockerfile = buildSpec.dockerfile ?? "Dockerfile"
             let tag = service.image ?? "\(projectName)_\(serviceName)"
             progressHandler(StreamEvent(stream: .status, data: "Building \(serviceName)...\n"))
