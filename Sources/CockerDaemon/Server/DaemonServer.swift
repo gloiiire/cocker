@@ -389,7 +389,7 @@ final class DaemonServer {
 
             case .composePs:
                 let req = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
-                let pName = req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent
+                let pName = ProjectName.normalize(req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent)
                 let filter = ["label": "com.cocker.project=\(pName)"]
                 let containers = await engine.list(all: true, filter: filter)
                 try sendResponse(requestId: request.id, payload: PSResponse(containers: containers), to: fd)
@@ -965,7 +965,7 @@ final class DaemonServer {
     }
 
     private func handleComposeLogs(_ req: ComposeRequest, requestId: String, to fd: Int32) async throws {
-        let pName = req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent
+        let pName = ProjectName.normalize(req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent)
         let filter = ["label": "com.cocker.project=\(pName)"]
         var containers = await engine.list(all: true, filter: filter)
         if !req.services.isEmpty {
@@ -1011,7 +1011,7 @@ final class DaemonServer {
     }
 
     private func handleComposeRestart(_ req: ComposeRequest) async throws {
-        let pName = req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent
+        let pName = ProjectName.normalize(req.projectName ?? URL(fileURLWithPath: req.composePath).deletingLastPathComponent().lastPathComponent)
         let filter = ["label": "com.cocker.project=\(pName)"]
         var containers = await engine.list(all: false, filter: filter)
         if !req.services.isEmpty {

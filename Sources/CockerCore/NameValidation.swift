@@ -72,3 +72,46 @@ public enum ResourceName {
         }
     }
 }
+
+/// Normalizes a Compose *project name* into a safe, predictable identifier.
+///
+/// A project name becomes a prefix for every container / network / volume /
+/// image the project owns (`<project>_<service>_1`, `<project>_default`...).
+/// Users derive it from the directory name by default, and directories can
+/// contain spaces, capitals and accents (`Memoire M2`) — which would leak
+/// straight into container names like `Memoire M2_api_1`, fragile to quote
+/// and inconsistent with Docker.
+///
+/// The rule : lowercase, turn any run of whitespace into a single `_` (so
+/// the word boundary survives — `Memoire M2` reads as `memoire_m2`, not
+/// `memoirem2`), keep only `[a-z0-9_-]` (drop accents and punctuation), then
+/// strip leading/trailing `_`/`-` so the result satisfies `[a-z0-9][a-z0-9_-]*`.
+///
+///   `Memoire M2`  -> `memoire_m2`
+///   `My_App-01`   -> `my_app-01`
+///   `  --weird!`  -> `weird`
+///
+/// The normalization is **idempotent** (`normalize(normalize(x)) == normalize(x)`),
+/// so it is safe to apply on both the write path (naming containers) and the
+/// lookup path (teardown / `ps`) without the two ever disagreeing. When the
+/// input reduces to nothing valid, we fall back to `"default"` rather than
+/// producing an empty prefix.
+public enum ProjectName {
+    public static func normalize(_ raw: String) -> String {
+        let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789_-")
+        var out = ""
+        for ch in raw.lowercased() {
+            if ch.isWhitespace {
+                // Collapse a run of spaces/tabs into one underscore.
+                if out.last != "_" { out.append("_") }
+            } else if allowed.contains(ch) {
+                out.append(ch)
+            }
+            // everything else (accents, punctuation) is dropped
+        }
+        // Trim separators from both ends so we never get `_foo` or `foo_`.
+        while let f = out.first, f == "_" || f == "-" { out.removeFirst() }
+        while let l = out.last, l == "_" || l == "-" { out.removeLast() }
+        return out.isEmpty ? "default" : out
+    }
+}
