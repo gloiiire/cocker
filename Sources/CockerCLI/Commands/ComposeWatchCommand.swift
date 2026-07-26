@@ -91,7 +91,12 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         print("")
         print(" " + UX.TTY.paint("→ Watching", .progress) + " " + UX.TTY.paint(projectDir, .accent))
         print("   " + UX.TTY.paint("FSEvents :", .dim) + " listening (debounce \(debounceMs)ms)")
-        print("   " + UX.TTY.paint("stop     :", .dim) + " Ctrl-C")
+        // Charter §2 (Explicit) : the detach / status / stop controls exist but
+        // were invisible — advertise them so the user doesn't have to discover
+        // `-d`, `--status`, `--stop` from the help text.
+        print("   " + UX.TTY.paint("detach   :", .dim) + " re-run with " + UX.TTY.paint("-d", .accent) + " to keep watching in the background")
+        print("   " + UX.TTY.paint("status   :", .dim) + " " + UX.TTY.paint("cocker compose watch --status", .accent))
+        print("   " + UX.TTY.paint("stop     :", .dim) + " Ctrl-C" + UX.TTY.paint("  (or", .dim) + " " + UX.TTY.paint("--stop", .accent) + UX.TTY.paint(" if detached)", .dim))
         print("")
 
         let watcher = FSEventWatcher(path: projectDir, debounceMs: debounceMs)

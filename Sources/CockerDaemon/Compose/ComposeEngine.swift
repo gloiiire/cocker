@@ -381,7 +381,21 @@ actor ComposeEngine {
 
             let id = try await containerEngine.run(config: runConfig)
             startedContainers[serviceName] = runConfig.name ?? id
-            progressHandler(StreamEvent(stream: .stdout, data: " Container \(projectName)_\(serviceName)_1 Started (id: \(String(id.prefix(12))))\n"))
+
+            // Charter §2 (Explicit) : when the service publishes ports, tell the
+            // user where to reach it. The data is already in `runConfig.ports` —
+            // we surface a clickable localhost URL per published port so a web
+            // dev knows exactly what to open, instead of guessing.
+            let portSuffix: String
+            if runConfig.ports.isEmpty {
+                portSuffix = ""
+            } else {
+                let urls = runConfig.ports
+                    .map { "http://localhost:\($0.hostPort)" }
+                    .joined(separator: ", ")
+                portSuffix = "  -> \(urls)"
+            }
+            progressHandler(StreamEvent(stream: .stdout, data: " Container \(projectName)_\(serviceName)_1 Started (id: \(String(id.prefix(12))))\(portSuffix)\n"))
         }
 
         progressHandler(StreamEvent(stream: .status, data: "All services started.\n"))
