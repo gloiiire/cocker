@@ -257,7 +257,17 @@ actor ImageManager {
     /// image. Voir ImageStore.cloneRootfs pour les détails.
     func cloneRootfs(for reference: String, containerID: String) async throws -> URL {
         let img = try await find(reference)
-        return try await store.cloneRootfs(for: img, containerID: containerID)
+        let rootfs = try await store.cloneRootfs(for: img, containerID: containerID)
+        // Strip stale runtime state that leaked into the image rootfs from a
+        // previous container. `/cocker-ip` holds the LAST container's leased
+        // IP (cocker-init writes it, and it can persist into the shared image
+        // rootfs); if it survives the clone, the daemon's IP-discovery task
+        // reads it on attempt 0 — BEFORE this boot's DHCP client writes the
+        // current lease — and pins port-forwarding to a dead IP, so the
+        // published port is unreachable from the host. Removing it forces
+        // discovery to wait for this boot's real /cocker-ip.
+        try? FileManager.default.removeItem(at: rootfs.appendingPathComponent("cocker-ip"))
+        return rootfs
     }
 
     /// Supprime le rootfs cloné d'un container.
