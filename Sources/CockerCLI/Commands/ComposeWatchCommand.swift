@@ -60,7 +60,11 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             throw CockerError.invalidComposeFile("File not found: \(originalPath)")
         }
         let projectDir = (originalPath as NSString).deletingLastPathComponent
-        let effectiveProjectName = projectName ?? (projectDir as NSString).lastPathComponent
+        // Normalize here too (not just daemon-side) so the "→ Bringing up X"
+        // banner we print below shows the SAME name the containers actually
+        // get — otherwise a `Memoire M2` dir would display `Memoire M2` while
+        // the containers are named `memoire_m2_api_1`.
+        let effectiveProjectName = ProjectName.normalize(projectName ?? (projectDir as NSString).lastPathComponent)
 
         // Sub-commands disguised as flags. ArgumentParser doesn't make
         // it cheap to nest subcommands two levels deep ("compose watch

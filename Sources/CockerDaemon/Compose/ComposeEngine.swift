@@ -247,7 +247,7 @@ actor ComposeEngine {
 
     func up(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
         let compose = try loadComposeFile(at: request.composePath)
-        let projectName = request.projectName ?? inferProjectName(from: request.composePath)
+        let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
 
         progressHandler(StreamEvent(stream: .status, data: "Starting project: \(projectName)\n"))
 
@@ -450,7 +450,7 @@ actor ComposeEngine {
 
     func build(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
         let compose = try loadComposeFile(at: request.composePath)
-        let projectName = request.projectName ?? inferProjectName(from: request.composePath)
+        let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
         let services = request.services.isEmpty ? Array(compose.services.keys) : request.services
 
         // Resolve every build context relative to the compose file's own
@@ -499,7 +499,7 @@ actor ComposeEngine {
     func run(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
         // One-off run: start the service's container with detach
         let compose = try loadComposeFile(at: request.composePath)
-        let projectName = request.projectName ?? inferProjectName(from: request.composePath)
+        let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
         let serviceName = request.services.first ?? ""
 
         guard let service = compose.services[serviceName] else {
@@ -513,7 +513,7 @@ actor ComposeEngine {
 
     func down(request: ComposeRequest) async throws {
         let compose = try loadComposeFile(at: request.composePath)
-        let projectName = request.projectName ?? inferProjectName(from: request.composePath)
+        let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
 
         // Find every container belonging to this project via the label we
         // stamp at create-time. The previous name-based lookup missed
