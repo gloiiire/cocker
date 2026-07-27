@@ -1133,7 +1133,12 @@ actor DockerfileBuilder {
                         } else {
                             try Self.copyTree(from: srcURL, to: dstURL)
                         }
-                        log(.stdout, " ---> COPY \(src) -> \(dstPath)\n")
+                        // No " ---> COPY src -> dst" echo here : the "Step N/M :
+                        // COPY ..." header already announced this instruction, so
+                        // repeating the resolved path added a redundant line with
+                        // no new information for the single-file/dir case. The
+                        // multi-entry branch above keeps its echo because it also
+                        // reports entry / ignored counts, which the header can't.
                     } else {
                         log(.stderr, "Warning: source \(src) not found in build context\n")
                     }
@@ -1815,7 +1820,11 @@ actor DockerfileBuilder {
     }
 
     private func shortID() -> String {
-        String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12))
+        // Synthetic per-step marker mimicking Docker's intermediate image IDs.
+        // Foundation returns UUID strings uppercase ; lowercase them so these
+        // read as hex consistent with the lowercase `sha256:` layer digests
+        // printed alongside — no more UPPERCASE/lowercase mix in one build log.
+        String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)).lowercased()
     }
 
     private func parseRepo(_ tag: String) -> String {
