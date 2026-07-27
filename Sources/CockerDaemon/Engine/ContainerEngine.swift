@@ -350,16 +350,23 @@ final class ContainerEngine {
                         fputs("[eng] IP read on attempt \(attempt): \(ip)\n", stderr); fflush(stderr)
                         break
                     }
-                    // After 2 s, start polling the host's vmnet lease file
-                    // in parallel — that way an in-VM DHCP loss doesn't
-                    // doom port-forwarding, the host knows the lease too.
-                    if attempt >= 20, attempt % 5 == 0, let mac = natMAC,
-                       let leased = ContainerEngine.lookupLeasedIP(forMAC: mac) {
-                        realIP = leased
-                        fputs("[eng] IP recovered from /var/db/dhcpd_leases on attempt \(attempt): \(leased) (mac=\(mac))\n", stderr); fflush(stderr)
-                        break
-                    }
                     try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                // /cocker-ip (written by cocker-init once eth0 is actually
+                // configured) is AUTHORITATIVE — it is the container's real
+                // leased IP. Only if it never appears do we fall back to the
+                // host's vmnet lease table, and only AFTER the full poll
+                // window. Previously this fallback ran INSIDE the loop from
+                // 2 s on: a slow embedded DHCP client (dhcp-min, used when the
+                // image ships no udhcpc/dhclient) let a stale/tentative lease
+                // (e.g. .210) win before the real IP (e.g. .248) landed in
+                // /cocker-ip — pinning the port-forward to a dead IP so the
+                // published port was unreachable. images WITH udhcpc were fine
+                // only because /cocker-ip appeared before the fallback fired.
+                if realIP == nil, let mac = natMAC,
+                   let leased = ContainerEngine.lookupLeasedIP(forMAC: mac) {
+                    realIP = leased
+                    fputs("[eng] /cocker-ip never appeared; recovered from /var/db/dhcpd_leases: \(leased) (mac=\(mac))\n", stderr); fflush(stderr)
                 }
                 let finalIP = realIP ?? "127.0.0.1"
                 if realIP == nil {
