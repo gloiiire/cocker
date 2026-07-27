@@ -323,56 +323,97 @@ jobs:
               "${UP_BASE}?name=${name}" >/dev/null
           done
 
-      # Patch the source formula's bottle do block with the actual
-      # sha256s we just computed. Commit on main via GitHub's contents
-      # API — that path produces a signed commit (the "GitHub
-      # web-flow" signer) which satisfies main's `required_signatures`
-      # rule. The PAT (RELEASE_PUSH_TOKEN, fine-grained on
-      # gloiiire/cocker with Contents R/W) is the admin user's token,
-      # so it bypasses `pull_request` and `required_status_checks` via
-      # the `RepositoryRole=admin` entry in main's ruleset
-      # bypass_actors. `git push` would fail because github-actions[bot]
-      # cannot sign and isn't in bypass_actors on a personal repo.
-      - name: Rewrite Formula sha256s and commit (signed, via API)
+      # Patch the source formula's bottle do block with the sha256s we
+      # just computed and commit on main with a GPG signature WE apply in
+      # the runner.
+      #
+      # Why not the GitHub Contents API? GitHub's server-side "web-flow"
+      # signing is NOT applied to Contents-API commits authored with a
+      # fine-grained PAT (it only signs bot / GitHub-App / OAuth tokens).
+      # The old `PUT /contents` path therefore produced UNSIGNED commits
+      # that main's — and dev's — `required_signatures` rule rejects,
+      # which broke `main -> dev` release syncs. Signing locally is
+      # deterministic. The push still goes out as the RELEASE_PUSH_TOKEN
+      # user (admin, in main's ruleset bypass_actors), so it also clears
+      # `pull_request` / `required_status_checks`; and now the commit is
+      # genuinely signed, so `required_signatures` is satisfied too.
+      #
+      # One-time setup: generate a PASSPHRASE-LESS GPG key whose UID email
+      # is COMMITTER_EMAIL below, add the PUBLIC key to that GitHub account
+      # (Settings -> SSH and GPG keys), and store the ASCII-armored PRIVATE
+      # key as secret BOTTLE_SIGNING_GPG_KEY and its long key id as
+      # BOTTLE_SIGNING_GPG_KEY_ID. Until those secrets exist the step
+      # falls back to an UNSIGNED commit (with a loud warning) so releases
+      # keep working — it does NOT hard-fail on missing GPG secrets.
+      - name: Rewrite Formula sha256s and commit (signed if GPG secrets set) on main
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PUSH_TOKEN }}
+          GH_TOKEN:        ${{ secrets.RELEASE_PUSH_TOKEN }}
+          GPG_PRIVATE_KEY: ${{ secrets.BOTTLE_SIGNING_GPG_KEY }}
+          GPG_KEY_ID:      ${{ secrets.BOTTLE_SIGNING_GPG_KEY_ID }}
+          COMMITTER_NAME:  "Gloire Bikouta"
+          COMMITTER_EMAIL: "134594230+gloiiire@users.noreply.github.com"
         run: |
+          set -euo pipefail
           REPO="${{ github.repository }}"
           TAG="${{ steps.tag.outputs.tag }}"
           SHA_ALL="${{ steps.assemble.outputs.sha_all }}"
 
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::RELEASE_PUSH_TOKEN secret is not set."
-            echo "Generate a fine-grained PAT for ${REPO} with Contents: Read and write"
-            echo "and store it under Settings → Secrets and variables → Actions."
+            echo "::error::RELEASE_PUSH_TOKEN secret is not set (fine-grained PAT, Contents: R/W)."
             exit 1
           fi
 
-          # Fetch current main Formula
-          FILE_META=$(curl -fsS \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/Formula/cocker.rb?ref=main")
-          FILE_SHA=$(echo "$FILE_META" | jq -r '.sha')
-          echo "$FILE_META" | jq -r '.content' | base64 -d > /tmp/cocker.rb
+          # Work on a fresh shallow clone of main (the earlier checkout is
+          # the release TAG snapshot, not the branch we push to).
+          WORK="$(mktemp -d)"
+          git clone --depth 1 --branch main \
+            "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$WORK"
+          cd "$WORK"
 
-          # Patch the placeholder. If absent, nothing to do.
-          if ! grep -q REPLACE_BOTTLE_SHA256_ALL /tmp/cocker.rb; then
+          if ! grep -q REPLACE_BOTTLE_SHA256_ALL Formula/cocker.rb; then
             echo "No REPLACE_BOTTLE_SHA256_ALL placeholder on main — already patched."
             exit 0
           fi
-          sed -i "s|REPLACE_BOTTLE_SHA256_ALL|${SHA_ALL}|" /tmp/cocker.rb
+          sed -i "s|REPLACE_BOTTLE_SHA256_ALL|${SHA_ALL}|" Formula/cocker.rb
+          git add Formula/cocker.rb
 
-          B64=$(base64 -w0 /tmp/cocker.rb)
-          RESP=$(curl -fsS -X PUT \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/contents/Formula/cocker.rb" \
-            -d "$(jq -n \
-              --arg msg "chore(bottle): refresh sha256 for ${TAG}" \
-              --arg content "$B64" \
-              --arg sha "$FILE_SHA" \
-              --arg branch "main" \
-              '{message:$msg, content:$content, sha:$sha, branch:$branch}')")
-          NEW_SHA=$(echo "$RESP" | jq -r '.commit.sha')
-          echo "Signed commit on main: $NEW_SHA"
+          if [ -n "${GPG_PRIVATE_KEY:-}" ] && [ -n "${GPG_KEY_ID:-}" ]; then
+            # Signed path : import the (passphrase-less) key into a throwaway
+            # keyring and sign the commit ourselves — deterministic, unlike
+            # GitHub's web-flow signing which no-ops for fine-grained PATs.
+            export GNUPGHOME="$(mktemp -d)"
+            chmod 700 "$GNUPGHOME"
+            printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+            git config user.name       "$COMMITTER_NAME"
+            git config user.email      "$COMMITTER_EMAIL"
+            git config user.signingkey "$GPG_KEY_ID"
+            git commit -S -m "chore(bottle): refresh sha256 for ${TAG}"
+            NEW_SHA="$(git rev-parse HEAD)"
+            git push origin main
+            echo "Signed commit pushed to main: $NEW_SHA"
+
+            # Guardrail: fail the release if GitHub did NOT mark it verified
+            # — the exact failure mode this path exists to fix.
+            sleep 3
+            VERIFIED="$(curl -fsS \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/commits/${NEW_SHA}" \
+              | jq -r '.commit.verification.verified')"
+            echo "verification.verified = $VERIFIED"
+            if [ "$VERIFIED" != "true" ]; then
+              echo "::error::Bottle commit ${NEW_SHA} is NOT GitHub-verified. Check the public key is on ${COMMITTER_EMAIL}'s account and its UID email matches."
+              exit 1
+            fi
+          else
+            # Fallback : GPG secrets not set yet. Commit UNSIGNED (same as
+            # before this fix) so releases keep working, but warn loudly —
+            # main->dev sync will need a one-time `--admin` merge until the
+            # BOTTLE_SIGNING_GPG_KEY[_ID] secrets are added.
+            echo "::warning::BOTTLE_SIGNING_GPG_KEY / _ID not set — committing UNSIGNED. main->dev sync will need an --admin merge. Add the GPG secrets to enable verified commits."
+            git config user.name  "$COMMITTER_NAME"
+            git config user.email "$COMMITTER_EMAIL"
+            git commit -m "chore(bottle): refresh sha256 for ${TAG}"
+            git push origin main
+            echo "Unsigned commit pushed to main: $(git rev-parse HEAD)"
+          fi
