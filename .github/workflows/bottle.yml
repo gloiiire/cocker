@@ -342,8 +342,10 @@ jobs:
       # is COMMITTER_EMAIL below, add the PUBLIC key to that GitHub account
       # (Settings -> SSH and GPG keys), and store the ASCII-armored PRIVATE
       # key as secret BOTTLE_SIGNING_GPG_KEY and its long key id as
-      # BOTTLE_SIGNING_GPG_KEY_ID.
-      - name: Rewrite Formula sha256s and commit (GPG-signed) on main
+      # BOTTLE_SIGNING_GPG_KEY_ID. Until those secrets exist the step
+      # falls back to an UNSIGNED commit (with a loud warning) so releases
+      # keep working — it does NOT hard-fail on missing GPG secrets.
+      - name: Rewrite Formula sha256s and commit (signed if GPG secrets set) on main
         env:
           GH_TOKEN:        ${{ secrets.RELEASE_PUSH_TOKEN }}
           GPG_PRIVATE_KEY: ${{ secrets.BOTTLE_SIGNING_GPG_KEY }}
@@ -356,15 +358,13 @@ jobs:
           TAG="${{ steps.tag.outputs.tag }}"
           SHA_ALL="${{ steps.assemble.outputs.sha_all }}"
 
-          for v in GH_TOKEN GPG_PRIVATE_KEY GPG_KEY_ID; do
-            if [ -z "${!v:-}" ]; then
-              echo "::error::$v secret is not set — see this step's comment for the one-time GPG setup."
-              exit 1
-            fi
-          done
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::RELEASE_PUSH_TOKEN secret is not set (fine-grained PAT, Contents: R/W)."
+            exit 1
+          fi
 
-          # The earlier checkout is the release TAG snapshot, not the
-          # branch we push to. Clone main fresh (shallow) using the PAT.
+          # Work on a fresh shallow clone of main (the earlier checkout is
+          # the release TAG snapshot, not the branch we push to).
           WORK="$(mktemp -d)"
           git clone --depth 1 --branch main \
             "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "$WORK"
@@ -375,35 +375,45 @@ jobs:
             exit 0
           fi
           sed -i "s|REPLACE_BOTTLE_SHA256_ALL|${SHA_ALL}|" Formula/cocker.rb
-
-          # Import the signing key into a throwaway keyring and tell git to
-          # use it. The key is passphrase-less, so no pinentry is needed.
-          export GNUPGHOME="$(mktemp -d)"
-          chmod 700 "$GNUPGHOME"
-          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
-
-          git config user.name       "$COMMITTER_NAME"
-          git config user.email      "$COMMITTER_EMAIL"
-          git config user.signingkey "$GPG_KEY_ID"
-          git config commit.gpgsign  true
-
           git add Formula/cocker.rb
-          git commit -S -m "chore(bottle): refresh sha256 for ${TAG}"
-          NEW_SHA="$(git rev-parse HEAD)"
-          git push origin main
-          echo "Signed commit pushed to main: $NEW_SHA"
 
-          # Guardrail: fail the release if GitHub did NOT mark the commit
-          # verified — that's the exact failure mode this step exists to
-          # fix, so we must never let it regress silently.
-          sleep 3
-          VERIFIED="$(curl -fsS \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${REPO}/commits/${NEW_SHA}" \
-            | jq -r '.commit.verification.verified')"
-          echo "verification.verified = $VERIFIED"
-          if [ "$VERIFIED" != "true" ]; then
-            echo "::error::Bottle commit ${NEW_SHA} is NOT GitHub-verified. Check that the public key is on ${COMMITTER_EMAIL}'s account and the key UID email matches."
-            exit 1
+          if [ -n "${GPG_PRIVATE_KEY:-}" ] && [ -n "${GPG_KEY_ID:-}" ]; then
+            # Signed path : import the (passphrase-less) key into a throwaway
+            # keyring and sign the commit ourselves — deterministic, unlike
+            # GitHub's web-flow signing which no-ops for fine-grained PATs.
+            export GNUPGHOME="$(mktemp -d)"
+            chmod 700 "$GNUPGHOME"
+            printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+            git config user.name       "$COMMITTER_NAME"
+            git config user.email      "$COMMITTER_EMAIL"
+            git config user.signingkey "$GPG_KEY_ID"
+            git commit -S -m "chore(bottle): refresh sha256 for ${TAG}"
+            NEW_SHA="$(git rev-parse HEAD)"
+            git push origin main
+            echo "Signed commit pushed to main: $NEW_SHA"
+
+            # Guardrail: fail the release if GitHub did NOT mark it verified
+            # — the exact failure mode this path exists to fix.
+            sleep 3
+            VERIFIED="$(curl -fsS \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${REPO}/commits/${NEW_SHA}" \
+              | jq -r '.commit.verification.verified')"
+            echo "verification.verified = $VERIFIED"
+            if [ "$VERIFIED" != "true" ]; then
+              echo "::error::Bottle commit ${NEW_SHA} is NOT GitHub-verified. Check the public key is on ${COMMITTER_EMAIL}'s account and its UID email matches."
+              exit 1
+            fi
+          else
+            # Fallback : GPG secrets not set yet. Commit UNSIGNED (same as
+            # before this fix) so releases keep working, but warn loudly —
+            # main->dev sync will need a one-time `--admin` merge until the
+            # BOTTLE_SIGNING_GPG_KEY[_ID] secrets are added.
+            echo "::warning::BOTTLE_SIGNING_GPG_KEY / _ID not set — committing UNSIGNED. main->dev sync will need an --admin merge. Add the GPG secrets to enable verified commits."
+            git config user.name  "$COMMITTER_NAME"
+            git config user.email "$COMMITTER_EMAIL"
+            git commit -m "chore(bottle): refresh sha256 for ${TAG}"
+            git push origin main
+            echo "Unsigned commit pushed to main: $(git rev-parse HEAD)"
           fi
