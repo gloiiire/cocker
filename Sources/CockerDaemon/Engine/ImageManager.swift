@@ -1040,7 +1040,23 @@ actor DockerfileBuilder {
                     // recursing into the context for each entry is the
                     // standard Docker semantics here.
                     let isWholeContextCopy = (src == "." || src == "./")
-                    let srcBasename: String? = isWholeContextCopy
+
+                    // Is the SOURCE a directory? Docker copies a directory's
+                    // CONTENTS into dst and never appends the dir's own name;
+                    // only a FILE source appends its basename when dst is a
+                    // directory. cocker used to append the basename for BOTH,
+                    // nesting directory copies one level too deep — e.g.
+                    // `COPY --from=b /app/.next/standalone ./` landed server.js
+                    // at /app/standalone/server.js instead of /app/server.js,
+                    // and `COPY webapp/api/ /app/webapp/api/` put app.py at
+                    // /app/webapp/api/api/app.py. Both then failed at runtime
+                    // with "module not found".
+                    var srcIsDirObjC: ObjCBool = false
+                    let srcExists = FileManager.default.fileExists(atPath: srcURL.path, isDirectory: &srcIsDirObjC)
+                    let srcIsDir = srcExists && srcIsDirObjC.boolValue
+
+                    // Append the basename ONLY for file sources.
+                    let srcBasename: String? = (isWholeContextCopy || srcIsDir)
                         ? nil
                         : srcURL.lastPathComponent
 
@@ -1090,8 +1106,10 @@ actor DockerfileBuilder {
 
                     try FileManager.default.createDirectory(at: dstURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
-                    if isWholeContextCopy {
-                        // Iterate context entries and copy each one INTO dst.
+                    if isWholeContextCopy || srcIsDir {
+                        // Directory source (the whole context `.` OR a named
+                        // directory): copy the source's CONTENTS into dst, the
+                        // source dir's own name never nested under dst.
                         // Mirrors `cp -r src/. dst/` (note the trailing dot).
                         try FileManager.default.createDirectory(at: dstURL, withIntermediateDirectories: true)
                         let rawEntries = (try? FileManager.default.contentsOfDirectory(at: srcURL, includingPropertiesForKeys: nil, options: [])) ?? []
@@ -1113,7 +1131,8 @@ actor DockerfileBuilder {
                         let skipped = rawEntries.count - entries.count
                         let skipNote = skipped > 0 ? " (\(skipped) ignored)" : ""
                         log(.stdout, " ---> COPY \(src) -> \(dstPath) (\(entries.count) entries)\(skipNote)\n")
-                    } else if FileManager.default.fileExists(atPath: srcURL.path) {
+                    } else if srcExists {
+                        // File source. (Directory sources are handled above.)
                         // Only remove the destination if it is an existing
                         // regular file we're about to overwrite — never a
                         // directory (would nuke unrelated files).
