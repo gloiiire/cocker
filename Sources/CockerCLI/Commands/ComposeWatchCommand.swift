@@ -54,6 +54,10 @@ struct ComposeWatchCommand: AsyncParsableCommand {
           help: "Tail the detached watch's log file (like `tail -f`).")
     var logs: Bool = false
 
+    @Flag(name: [.short, .customLong("attach")],
+          help: "Re-attach : stop the detached watch and resume in the foreground (interactive footer + d/q keys). Containers keep running.")
+    var attach: Bool = false
+
     mutating func run() async throws {
         let originalPath = resolveComposePath(file)
         guard FileManager.default.fileExists(atPath: originalPath) else {
@@ -80,8 +84,29 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         // so the user can `tail -f` it later. We funnel both the "up"
         // pre-step and the loop output into the same log so a single
         // tail captures everything from boot onward.
-        if detach {
+        // `--attach` : take over a detached background watch and resume in
+        // the foreground. We stop the background process (containers are
+        // untouched — the watcher just watches files) then fall through to
+        // the normal interactive loop below. Takes precedence over `-d`.
+        if attach {
+            if let stopped = Self.stopDetached(projectDir: projectDir) {
+                print(" " + UX.TTY.paint("→ Re-attaching", .progress) + " " + UX.TTY.paint("(stopped background watch pid \(stopped))", .dim))
+            } else {
+                print(" " + UX.TTY.paint("→ Attaching", .progress) + " " + UX.TTY.paint("(no background watch was running — starting fresh)", .dim))
+            }
+        } else if detach {
             try Self.detachAndExit(projectDir: projectDir, originalArgs: CommandLine.arguments)
+            return
+        }
+
+        // A detached watch already owns this project — a second foreground
+        // watcher would race it (double rebuilds on every save). Point the
+        // user at --attach instead of silently starting a rival loop.
+        if !attach, let existing = Self.livePID(projectDir: projectDir) {
+            UX.Warning.emit(
+                "a detached watch is already running (pid \(existing))",
+                note: "re-attach with `cocker compose watch --attach`, or stop it with `cocker compose watch --stop`"
+            )
             return
         }
 
@@ -208,14 +233,14 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         return nil
     }
 
-    private func handleStop(projectDir: String) throws {
-        guard let pid = Self.livePID(projectDir: projectDir) else {
-            print(" " + UX.TTY.paint("no watch running for this project", .dim, [.italic]))
-            return
-        }
-        if kill(pid, SIGTERM) != 0 {
-            throw CockerError.requestFailed("kill \(pid): \(String(cString: strerror(errno)))")
-        }
+    /// Terminate a detached background watcher (SIGTERM, escalate to
+    /// SIGKILL after ~2s) and remove its pidfile. Returns the pid that was
+    /// stopped, or nil if none was running. Shared by `--stop` and
+    /// `--attach`.
+    @discardableResult
+    private static func stopDetached(projectDir: String) -> Int32? {
+        guard let pid = Self.livePID(projectDir: projectDir) else { return nil }
+        _ = kill(pid, SIGTERM)
         // Wait up to ~2s for it to actually exit, then SIGKILL if needed.
         for _ in 0..<20 {
             if kill(pid, 0) != 0 { break }
@@ -223,6 +248,14 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         }
         if kill(pid, 0) == 0 { _ = kill(pid, SIGKILL) }
         try? FileManager.default.removeItem(atPath: Self.pidFilePath(projectDir))
+        return pid
+    }
+
+    private func handleStop(projectDir: String) throws {
+        guard let pid = Self.stopDetached(projectDir: projectDir) else {
+            print(" " + UX.TTY.paint("no watch running for this project", .dim, [.italic]))
+            return
+        }
         print(UX.ActionLine(
             icon: .success, name: "watch",
             status: "Stopped", trailing: "pid \(pid)"
@@ -330,6 +363,7 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         print("   " + UX.TTY.paint("log     :", .dim) + " " + logPath)
         print("   " + UX.TTY.paint("status  :", .dim) + " cocker compose watch --status")
         print("   " + UX.TTY.paint("tail    :", .dim) + " cocker compose watch --logs")
+        print("   " + UX.TTY.paint("attach  :", .dim) + " cocker compose watch --attach")
         print("   " + UX.TTY.paint("stop    :", .dim) + " cocker compose watch --stop")
         return true
     }
