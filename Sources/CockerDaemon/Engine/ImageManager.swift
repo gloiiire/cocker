@@ -1220,14 +1220,11 @@ actor DockerfileBuilder {
                 log(.stdout, " ---> \(shortID())\n")
 
             case "ENV":
-                let raw = instruction.args
-                if let eqIdx = raw.firstIndex(of: "=") {
-                    let key = String(raw[..<eqIdx]).trimmingCharacters(in: .whitespaces)
-                    let val = resolveArg(String(raw[raw.index(after: eqIdx)...]).trimmingCharacters(in: .whitespaces), env: substEnv())
-                    env[key] = val
-                } else {
-                    let kv = raw.split(separator: " ", maxSplits: 1)
-                    if kv.count == 2 { env[String(kv[0])] = resolveArg(String(kv[1]), env: substEnv()) }
+                // All values in one ENV instruction expand against the state
+                // before that instruction, matching Docker semantics.
+                let expansionEnv = substEnv()
+                for assignment in parseDockerfileEnv(instruction.args) {
+                    env[assignment.key] = resolveArg(assignment.value, env: expansionEnv)
                 }
                 log(.stdout, " ---> \(shortID())\n")
 
