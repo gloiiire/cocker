@@ -131,7 +131,7 @@ struct ComposeWatchCommand: AsyncParsableCommand {
                 header: [" " + UX.TTY.paint("→ Watching", .progress) + " " + UX.TTY.paint(dir, .accent)],
                 services: urls.snapshot(),
                 status: ["   " + UX.TTY.paint("FSEvents", .dim) + "   " + UX.TTY.paint("listening (debounce \(db)ms)", .dim)],
-                detachable: true)
+                detach: true, quit: true)
         }
         print("")
         let footer = InteractiveFooter()

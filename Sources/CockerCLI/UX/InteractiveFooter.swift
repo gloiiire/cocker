@@ -102,7 +102,8 @@ final class ServiceURLs: @unchecked Sendable {
 func footerLines(header: [String] = [],
                  services: [(name: String, url: String)] = [],
                  status: [String] = [],
-                 detachable: Bool) -> [String] {
+                 detach: Bool = false,
+                 quit: Bool = false) -> [String] {
     var lines = header
     let width = services.map { $0.name.count }.max() ?? 0
     for s in services {
@@ -110,15 +111,17 @@ func footerLines(header: [String] = [],
         lines.append("   " + padded + "   " + UX.TTY.paint(s.url, .accent))
     }
     lines.append(contentsOf: status)
-    var hint = "   " + UX.TTY.paint("press", .dim) + " "
-    if detachable {
-        hint += UX.TTY.paint("d", .accent) + " " + UX.TTY.paint("detach", .dim)
-              + UX.TTY.paint("   ·   ", .dim)
-              + UX.TTY.paint("q", .accent) + " " + UX.TTY.paint("quit", .dim)
-    } else {
-        hint += UX.TTY.paint("q", .accent) + " " + UX.TTY.paint("quit", .dim)
+    // Only the keys that actually do something are shown. `d` (detach —
+    // leave running) is offered wherever the command holds the terminal ; `q`
+    // (quit for real — tear down) only where this command STARTED something.
+    // A pure viewer (logs / events) started nothing, so it shows `d` alone.
+    var parts: [String] = []
+    if detach { parts.append(UX.TTY.paint("d", .accent) + " " + UX.TTY.paint("detach", .dim)) }
+    if quit   { parts.append(UX.TTY.paint("q", .accent) + " " + UX.TTY.paint("quit", .dim)) }
+    if !parts.isEmpty {
+        lines.append("   " + UX.TTY.paint("press", .dim) + " "
+            + parts.joined(separator: UX.TTY.paint("   ·   ", .dim)))
     }
-    lines.append(hint)
     return lines
 }
 
