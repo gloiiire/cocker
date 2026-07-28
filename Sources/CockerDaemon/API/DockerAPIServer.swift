@@ -89,9 +89,10 @@ final class DockerAPIServer {
 
     private func acceptLoop() async {
         while isRunning {
-            let clientFD = await Task.detached(priority: .userInitiated) { [fd = serverFD] in
-                accept(fd, nil, nil)
-            }.value
+            // accept(2) is blocking. Run it on GCD, not Task.detached :
+            // detached tasks still consume Swift's cooperative executor
+            // and idle sockets could starve every async daemon task.
+            let clientFD = await Self.acceptConnection(on: serverFD)
             guard clientFD >= 0 else { continue }
 
             Task { await self.handleConnection(fd: clientFD) }
@@ -102,10 +103,39 @@ final class DockerAPIServer {
         defer { close(fd) }
         // Docker clients may pipeline multiple requests on one connection
         while true {
-            guard let request = try? parseHTTPRequest(from: fd), !request.path.isEmpty else { break }
+            // HTTP parsing performs blocking read(2). Bridge it through GCD
+            // so a keep-alive client waiting between requests doesn't park
+            // a cooperative-executor thread.
+            let parsed: HTTPRequest?
+            do {
+                parsed = try await Self.readHTTPRequest(from: fd)
+            } catch {
+                break
+            }
+            guard let request = parsed, !request.path.isEmpty else { break }
             let keepAlive = request.headers["connection"]?.lowercased() != "close"
             await routeRequest(request, fd: fd)
             if !keepAlive { break }
+        }
+    }
+
+    private nonisolated static func acceptConnection(on fd: Int32) async -> Int32 {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: accept(fd, nil, nil))
+            }
+        }
+    }
+
+    private nonisolated static func readHTTPRequest(from fd: Int32) async throws -> HTTPRequest? {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    continuation.resume(returning: try parseHTTPRequest(from: fd))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 

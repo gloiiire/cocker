@@ -38,6 +38,65 @@ struct IPCRoundtripTests {
         #expect(decoded.all == false)
     }
 
+    @Test func saveLoadExportImportV2PathHandoffRoundtrips() throws {
+        let save = try dec.decode(SaveRequest.self, from: enc.encode(
+            SaveRequest(image: "alpine:latest", outputPath: "/tmp/image.tar")))
+        #expect(save.image == "alpine:latest")
+        #expect(save.outputPath == "/tmp/image.tar")
+
+        let saveResponse = try dec.decode(SaveResponse.self, from: enc.encode(
+            SaveResponse(tarData: Data(), filePath: "/tmp/image.tar", byteCount: 123)))
+        #expect(saveResponse.tarData.isEmpty)
+        #expect(saveResponse.filePath == "/tmp/image.tar")
+        #expect(saveResponse.byteCount == 123)
+
+        let load = try dec.decode(LoadRequest.self, from: enc.encode(
+            LoadRequest(tarData: Data(), inputPath: "/tmp/image.tar")))
+        #expect(load.tarData.isEmpty)
+        #expect(load.inputPath == "/tmp/image.tar")
+
+        let export = try dec.decode(ExportRequest.self, from: enc.encode(
+            ExportRequest(containerID: "abc", outputPath: "/tmp/rootfs.tar")))
+        #expect(export.containerID == "abc")
+        #expect(export.outputPath == "/tmp/rootfs.tar")
+
+        let imp = try dec.decode(ContainerImportRequest.self, from: enc.encode(
+            ContainerImportRequest(tarData: Data(), tag: "repo:tag", inputPath: "/tmp/rootfs.tar")))
+        #expect(imp.tarData.isEmpty)
+        #expect(imp.tag == "repo:tag")
+        #expect(imp.inputPath == "/tmp/rootfs.tar")
+    }
+
+    @Test func v2PayloadsDecodeLegacyShapes() throws {
+        // Older peers omit every path/metadata field. The v2 decoder must
+        // default them instead of breaking mixed-version CLI/daemon pairs.
+        let legacySave = try dec.decode(SaveRequest.self, from: Data(#"{"image":"alpine"}"#.utf8))
+        #expect(legacySave.outputPath == nil)
+
+        let bytes = Data("tar".utf8)
+        let legacyResponse = try dec.decode(SaveResponse.self, from: enc.encode(["tarData": bytes]))
+        #expect(legacyResponse.tarData == bytes)
+        #expect(legacyResponse.filePath == nil)
+
+        let legacyLoad = try dec.decode(LoadRequest.self, from: enc.encode(["tarData": bytes]))
+        #expect(legacyLoad.tarData == bytes)
+        #expect(legacyLoad.inputPath == nil)
+
+        let legacyExport = try dec.decode(ExportRequest.self,
+            from: Data(#"{"containerID":"abc"}"#.utf8))
+        #expect(legacyExport.outputPath == nil)
+
+        let legacyImport = try dec.decode(ContainerImportRequest.self,
+            from: enc.encode(LegacyImport(tarData: bytes, tag: "repo:tag")))
+        #expect(legacyImport.tarData == bytes)
+        #expect(legacyImport.inputPath == nil)
+    }
+
+    private struct LegacyImport: Codable {
+        let tarData: Data
+        let tag: String
+    }
+
     @Test func pingResponseCarriesVersion() throws {
         let p = PingResponse()
         let back = try dec.decode(PingResponse.self, from: enc.encode(p))

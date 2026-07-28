@@ -420,17 +420,64 @@ public struct ImageHistoryResponse: Codable, Sendable {
 
 public struct SaveRequest: Codable, Sendable {
     public let image: String
-    public init(image: String) { self.image = image }
+    /// **IPC v2** : when set, the daemon writes the tar archive directly to
+    /// this absolute path instead of embedding the bytes in the JSON
+    /// response. CLI and daemon share a host (Unix socket) and run as the
+    /// same user, so a filesystem handoff is safe — and it lifts the
+    /// 100 MB frame cap + base64 +33 % + full-buffer-in-RAM cost that made
+    /// `cocker save` fail on any real image. nil = legacy in-band bytes.
+    public let outputPath: String?
+    public init(image: String, outputPath: String? = nil) {
+        self.image = image
+        self.outputPath = outputPath
+    }
+    enum CodingKeys: String, CodingKey { case image, outputPath }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.image = try c.decode(String.self, forKey: .image)
+        self.outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
+    }
 }
 
 public struct SaveResponse: Codable, Sendable {
+    /// Legacy in-band payload. Empty when the daemon honoured
+    /// `outputPath` (v2 path handoff) — check `filePath` instead.
     public let tarData: Data
-    public init(tarData: Data) { self.tarData = tarData }
+    /// v2 : where the daemon wrote the archive (== the requested
+    /// outputPath). nil for legacy in-band responses.
+    public let filePath: String?
+    /// v2 : size of the archive on disk, for CLI display.
+    public let byteCount: UInt64?
+    public init(tarData: Data, filePath: String? = nil, byteCount: UInt64? = nil) {
+        self.tarData = tarData
+        self.filePath = filePath
+        self.byteCount = byteCount
+    }
+    enum CodingKeys: String, CodingKey { case tarData, filePath, byteCount }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.tarData = try c.decodeIfPresent(Data.self, forKey: .tarData) ?? Data()
+        self.filePath = try c.decodeIfPresent(String.self, forKey: .filePath)
+        self.byteCount = try c.decodeIfPresent(UInt64.self, forKey: .byteCount)
+    }
 }
 
 public struct LoadRequest: Codable, Sendable {
+    /// Legacy in-band payload. Empty when `inputPath` is set.
     public let tarData: Data
-    public init(tarData: Data) { self.tarData = tarData }
+    /// **IPC v2** : absolute path of a tar the daemon should read directly
+    /// (same-host filesystem handoff, see SaveRequest.outputPath).
+    public let inputPath: String?
+    public init(tarData: Data, inputPath: String? = nil) {
+        self.tarData = tarData
+        self.inputPath = inputPath
+    }
+    enum CodingKeys: String, CodingKey { case tarData, inputPath }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.tarData = try c.decodeIfPresent(Data.self, forKey: .tarData) ?? Data()
+        self.inputPath = try c.decodeIfPresent(String.self, forKey: .inputPath)
+    }
 }
 
 public struct SystemDfResponse: Codable, Sendable {
@@ -475,13 +522,40 @@ public struct CommitRequest: Codable, Sendable {
 
 public struct ExportRequest: Codable, Sendable {
     public let containerID: String
-    public init(containerID: String) { self.containerID = containerID }
+    /// **IPC v2** : same-host filesystem handoff (see SaveRequest).
+    /// nil = legacy in-band bytes (still used for stdout streaming).
+    public let outputPath: String?
+    public init(containerID: String, outputPath: String? = nil) {
+        self.containerID = containerID
+        self.outputPath = outputPath
+    }
+    enum CodingKeys: String, CodingKey { case containerID, outputPath }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.containerID = try c.decode(String.self, forKey: .containerID)
+        self.outputPath = try c.decodeIfPresent(String.self, forKey: .outputPath)
+    }
 }
 
 public struct ContainerImportRequest: Codable, Sendable {
+    /// Legacy in-band payload. Empty when `inputPath` is set. Kept for
+    /// stdin imports (`cocker import -`) where no file exists.
     public let tarData: Data
     public let tag: String
-    public init(tarData: Data, tag: String) { self.tarData = tarData; self.tag = tag }
+    /// **IPC v2** : same-host filesystem handoff (see SaveRequest).
+    public let inputPath: String?
+    public init(tarData: Data, tag: String, inputPath: String? = nil) {
+        self.tarData = tarData
+        self.tag = tag
+        self.inputPath = inputPath
+    }
+    enum CodingKeys: String, CodingKey { case tarData, tag, inputPath }
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.tarData = try c.decodeIfPresent(Data.self, forKey: .tarData) ?? Data()
+        self.tag = try c.decode(String.self, forKey: .tag)
+        self.inputPath = try c.decodeIfPresent(String.self, forKey: .inputPath)
+    }
 }
 
 public struct UpdateRequest: Codable, Sendable {
@@ -506,9 +580,13 @@ public enum CockerVersion {
     /// **A10 — IPC protocol version**. v1 = post-audit shape (the
     /// `protocolVersion` field exists on `IPCRequest`, kill / inspect
     /// surfaces honour the post-audit invariants). v0 = pre-0.6.0 daemons
-    /// that don't send the field. The daemon rejects any client claiming
-    /// a version higher than what it implements.
-    public static let ipcProtocolVersion: Int = 1
+    /// that don't send the field. v2 = save/load/export/import gained
+    /// same-host filesystem handoff (outputPath/inputPath) so tarballs
+    /// no longer ride base64-encoded inside JSON frames. The daemon
+    /// rejects any client claiming a version higher than what it
+    /// implements ; older clients keep working (in-band bytes remain
+    /// accepted).
+    public static let ipcProtocolVersion: Int = 2
 }
 
 /// **C3 — InspectResponse**. The legacy `case .inspect` path returns a

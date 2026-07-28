@@ -31,8 +31,7 @@ public actor PortForwarder {
         var procs: [Process] = []
         for port in mappings {
             guard port.proto == .tcp else {
-                fputs("[portfwd] skip \(port.hostPort)/\(port.proto.rawValue) (TCP only)\n", stderr)
-                fflush(stderr)
+                CockerLog.shared.debug("portfwd", "skip \(port.hostPort)/\(port.proto.rawValue) (TCP only)")
                 continue
             }
             do {
@@ -42,12 +41,11 @@ public actor PortForwarder {
                     containerPort: port.containerPort
                 )
                 procs.append(proc)
-                fputs("[portfwd] 0.0.0.0:\(port.hostPort) → \(containerIP):\(port.containerPort) " +
-                      "(pid \(proc.processIdentifier), container \(String(containerID.prefix(12))))\n", stderr)
-                fflush(stderr)
+                CockerLog.shared.info("portfwd",
+                    "0.0.0.0:\(port.hostPort) → \(containerIP):\(port.containerPort) " +
+                    "(pid \(proc.processIdentifier), container \(String(containerID.prefix(12))))")
             } catch {
-                fputs("[portfwd] error spawning forwarder for \(port.hostPort): \(error)\n", stderr)
-                fflush(stderr)
+                CockerLog.shared.error("portfwd", "error spawning forwarder for \(port.hostPort): \(error)")
             }
         }
         if !procs.isEmpty {
@@ -64,8 +62,7 @@ public actor PortForwarder {
             }
         }
         processes.removeValue(forKey: containerID)
-        fputs("[portfwd] stopped all forwarders for container \(String(containerID.prefix(12)))\n", stderr)
-        fflush(stderr)
+        CockerLog.shared.debug("portfwd", "stopped all forwarders for container \(String(containerID.prefix(12)))")
     }
 
     /// Cleanup au shutdown du daemon.

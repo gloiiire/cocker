@@ -157,6 +157,34 @@ struct StateStoreContainersTests {
         let got = await s2.container(id: "abcd1234")
         #expect(got?.name == "persistent")
     }
+
+    @Test func coalescedUpdateIsDeferredThenFlushed() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cocker-state-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let s = try StateStore(rootDir: dir)
+        try await s.store(container: Container(id: "abcd1234abcd", name: "hc", image: "alpine", command: ["sh"]))
+
+        // A `.coalesced` mutation must NOT hit disk synchronously…
+        try await s.updateContainer(id: "abcd1234abcd", durability: .coalesced) { c in
+            c.healthFailingStreak = 7
+        }
+        let onDiskBefore = try StateStore(rootDir: dir)
+        let staleStreak = await onDiskBefore.container(id: "abcd1234abcd")?.healthFailingStreak
+        #expect(staleStreak == 0, "coalesced write should be debounced, not synchronous")
+
+        // …but it must be visible in memory immediately…
+        let inMemory = await s.container(id: "abcd1234abcd")?.healthFailingStreak
+        #expect(inMemory == 7)
+
+        // …and flushPending() must force it to disk deterministically.
+        await s.flushPending()
+        let onDiskAfter = try StateStore(rootDir: dir)
+        let flushed = await onDiskAfter.container(id: "abcd1234abcd")?.healthFailingStreak
+        #expect(flushed == 7)
+    }
 }
 
 @Suite("StateStore — networks")

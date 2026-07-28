@@ -66,7 +66,7 @@ public enum LeasePoolMonitor {
         let trigger = URL(fileURLWithPath: triggerPath)
         guard !FileManager.default.fileExists(atPath: trigger.path) else { return }
         _ = try? Data().write(to: trigger)
-        fputs("[lease-gc] pool at \(c) — touched helper trigger\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("lease-gc", "pool at \(c) — touched helper trigger")
     }
 
     /// Hard pre-flight gate. Called from `ContainerEngine.run()` before any

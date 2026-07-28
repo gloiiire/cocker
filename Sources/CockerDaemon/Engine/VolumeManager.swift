@@ -89,12 +89,10 @@ actor VolumeManager {
                 )
             }
         } else {
-            fputs(
-                "[volumes] warning: mke2fs not found on host (brew install e2fsprogs) — " +
+            CockerLog.shared.warn("volumes",
+                "mke2fs not found on host (brew install e2fsprogs) — " +
                 "volume \(request.name) will be formatted on first container attach " +
-                "if its image bundles mkfs.ext4 (Alpine: apk add e2fsprogs)\n",
-                stderr
-            )
+                "if its image bundles mkfs.ext4 (Alpine: apk add e2fsprogs)")
         }
 
         let volume = VolumeInfo(

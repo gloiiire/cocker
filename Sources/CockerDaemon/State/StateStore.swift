@@ -77,16 +77,21 @@ actor StateStore {
         guard let loaded = try? Self.decoder.decode(State.self, from: data) else {
             let backup = stateFile.appendingPathExtension("corrupted.\(Int(Date().timeIntervalSince1970))")
             try? FileManager.default.copyItem(at: stateFile, to: backup)
-            fputs("[state] WARN : state.json failed to decode ; preserved as \(backup.path) and starting empty\n", stderr)
+            CockerLog.shared.warn("state", "state.json failed to decode ; preserved as \(backup.path) and starting empty")
             return State()
         }
         if loaded.schemaVersion > Self.currentSchemaVersion {
-            fputs("[state] FATAL : state.json schemaVersion=\(loaded.schemaVersion) exceeds this cockerd's max (\(Self.currentSchemaVersion)). Upgrade cockerd or roll back the file.\n", stderr)
-            exit(64)  // EX_USAGE — operator must intervene
+            // Refuse to load a file written by a newer cockerd — but by
+            // THROWING, not by exit()ing. A persistence layer must never
+            // decide process death : main() catches this, prints the
+            // actionable message and exits with EX_USAGE itself. Keeps
+            // the store testable and embeddable.
+            throw CockerError.stateSchemaTooNew(found: loaded.schemaVersion,
+                                                supported: Self.currentSchemaVersion)
         }
         var migrated = loaded
         if migrated.schemaVersion < Self.currentSchemaVersion {
-            fputs("[state] migrating state.json from v\(migrated.schemaVersion) → v\(Self.currentSchemaVersion)\n", stderr)
+            CockerLog.shared.debug("state", "migrating state.json from v\(migrated.schemaVersion) → v\(Self.currentSchemaVersion)")
             migrated.schemaVersion = Self.currentSchemaVersion
         }
         return migrated
@@ -126,6 +131,57 @@ actor StateStore {
     }
 
     // MARK: - Persistence
+
+    /// How urgently a mutation must reach disk.
+    ///
+    /// `state.json` is a single file rewritten IN FULL on every save —
+    /// classic write amplification. That's fine for rare lifecycle events
+    /// (create/remove/start/stop) but the healthcheck loop mutates state
+    /// 3-4× per probe per container ; with N probed containers that used
+    /// to mean hundreds of full-file rewrites per minute, most of them
+    /// carrying nothing an operator would miss after a crash.
+    enum Durability {
+        /// Flush before returning. For state a crash must not lose :
+        /// container existence, status transitions, names, networks…
+        case immediate
+        /// Mark dirty and let the debounce task flush within
+        /// `coalesceWindowNanos`. For high-frequency low-value churn
+        /// (healthLog ring buffer, failing-streak counters). Worst case
+        /// a crash loses <1 s of probe history — which
+        /// `reconcileAfterRestart` resets anyway.
+        case coalesced
+    }
+
+    /// Debounce window for `.coalesced` saves. 500 ms folds a healthcheck
+    /// burst (log append + streak + status for several containers landing
+    /// together) into one disk write without letting the on-disk view go
+    /// meaningfully stale.
+    private static let coalesceWindowNanos: UInt64 = 500_000_000
+    private var flushTask: Task<Void, Never>?
+
+    /// Coalesced-save scheduler : first `.coalesced` mutation arms a
+    /// single timer ; every further mutation inside the window rides
+    /// along for free. The actor guarantees `flushTask` accesses are
+    /// serialized.
+    private func scheduleFlush() {
+        guard flushTask == nil else { return }
+        flushTask = Task {
+            try? await Task.sleep(nanoseconds: Self.coalesceWindowNanos)
+            guard !Task.isCancelled else { return }
+            self.flushTask = nil
+            try? self.save()
+        }
+    }
+
+    /// Force any pending coalesced write to disk NOW. Called on daemon
+    /// shutdown so the last probe results aren't lost, and available to
+    /// tests that need deterministic on-disk state.
+    func flushPending() {
+        guard let task = flushTask else { return }
+        task.cancel()
+        flushTask = nil
+        try? save()
+    }
 
     func save() throws {
         let data = try Self.encoder.encode(state)
@@ -185,11 +241,16 @@ actor StateStore {
         try save()
     }
 
-    func updateContainer(id: String, update: (inout Container) -> Void) throws {
+    func updateContainer(id: String,
+                         durability: Durability = .immediate,
+                         update: (inout Container) -> Void) throws {
         guard var container = container(id: id) else { throw CockerError.containerNotFound(id) }
         update(&container)
         state.containers[container.id] = container
-        try save()
+        switch durability {
+        case .immediate: try save()
+        case .coalesced: scheduleFlush()
+        }
     }
 
     func removeContainer(id: String) throws {

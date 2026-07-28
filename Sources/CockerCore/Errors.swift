@@ -62,6 +62,13 @@ public enum CockerError: Error, CustomStringConvertible {
     case diskFull
     case unsupportedPlatform(String)
     case internalError(String)
+    /// state.json was written by a NEWER cockerd (schemaVersion > what this
+    /// binary understands). Loading it would violate invariants we don't
+    /// know about, so the daemon must refuse to start. Thrown from
+    /// StateStore's loader ; main() surfaces it and exits — the store
+    /// itself never calls exit() (library code must stay embeddable and
+    /// testable).
+    case stateSchemaTooNew(found: Int, supported: Int)
 
     public var description: String {
         switch self {
@@ -106,6 +113,8 @@ public enum CockerError: Error, CustomStringConvertible {
         case .diskFull: return "No space left on device"
         case .unsupportedPlatform(let p): return "Unsupported platform: \(p)"
         case .internalError(let msg): return "Internal error: \(msg)"
+        case .stateSchemaTooNew(let found, let supported):
+            return "state.json schemaVersion=\(found) exceeds this cockerd's max (\(supported)). Upgrade cockerd or roll back the file."
         }
     }
 
