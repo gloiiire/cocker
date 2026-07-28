@@ -203,9 +203,13 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         let stream = watcher.events()
 
         for await batch in stream {
+            let relevant = batch.filter { path in
+                !path.contains("/.cocker/") && !path.hasSuffix("/.cocker")
+            }
+            guard !relevant.isEmpty else { continue }
             footer.clear()
             let head = UX.TTY.paint(UX.Icon.restart.rawValue, .restart)
-            print(" \(head) " + UX.TTY.paint("Change detected", .restart) + " " + UX.TTY.paint("(\(batch.count) file\(batch.count > 1 ? "s" : ""))", .dim))
+            print(" \(head) " + UX.TTY.paint("Change detected", .restart) + " " + UX.TTY.paint("(\(relevant.count) file\(relevant.count > 1 ? "s" : ""))", .dim))
             let start = Date()
             do {
                 try await composeUp(originalPath: originalPath, projectName: effectiveProjectName, withBuild: true, urls: urls)
@@ -499,7 +503,8 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             composePath: stage.path,
             projectName: projectName,
             services: [],
-            detach: true
+            detach: true,
+            forceBuild: withBuild
         )
         let request = try IPCRequest(type: .composeUp, payload: payload)
         let fail = UX.FailFlag()

@@ -1212,7 +1212,8 @@ final class VMRuntime: NSObject {
 
     // MARK: - Exec via vsock
 
-    func exec(containerID: String, command: [String], env: [String: String], tty: Bool = false, stdin: Data? = nil) async throws -> AsyncStream<StreamEvent> {
+    func exec(containerID: String, command: [String], env: [String: String], tty: Bool = false,
+              stdin: Data? = nil, workdir: String? = nil, user: String? = nil) async throws -> AsyncStream<StreamEvent> {
         guard let running = runningVMs[containerID] else {
             throw CockerError.containerNotRunning(containerID)
         }
@@ -1239,8 +1240,11 @@ final class VMRuntime: NSObject {
                         let cmd: [String]
                         let env: [String: String]
                         let tty: Bool
+                        let workdir: String?
+                        let user: String?
                     }
-                    let req = ExecReq(cmd: command, env: env, tty: tty)
+                    let req = ExecReq(cmd: command, env: env, tty: tty,
+                                      workdir: workdir, user: user)
                     // `.sortedKeys` gives a deterministic wire order. The in-VM
                     // parser is now key-order independent either way, but a
                     // stable byte stream keeps logs and the exec-parser tests
