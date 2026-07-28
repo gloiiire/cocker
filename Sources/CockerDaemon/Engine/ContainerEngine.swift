@@ -78,6 +78,7 @@ final class ContainerEngine {
     }
     private var watcherTasks: [String: TaskRecord] = [:]
     private var healthTasks: [String: TaskRecord] = [:]
+    private var portForwardTasks: [String: (id: UUID, task: Task<Void, Never>)] = [:]
     /// Per-container monotonic probe sequence. Replaces the previous
     /// process-global `struct Seq { static var next }` that collided
     /// across daemon restarts and across containers sharing the same
@@ -332,60 +333,7 @@ final class ContainerEngine {
         // cocker-init écrit l'IP DHCP réelle du container dans /cocker-ip
         // du rootfs (visible via virtiofs côté host). On poll ce fichier
         // pour récupérer l'IP — placeholder "127.0.0.1" si non dispo.
-        if !ports.isEmpty {
-            CockerLog.shared.debug("eng", "scheduling IP discovery task for ports: \(ports.map { $0.description }.joined(separator: ","))")
-            let natMAC = container.natMAC
-            Task { [rootfsPath, ports, id, natMAC] in
-                CockerLog.shared.debug("eng", "IP discovery task started for \(id)")
-                let ipFile = rootfsPath.appendingPathComponent("cocker-ip")
-                CockerLog.shared.debug("eng", "polling \(ipFile.path)")
-                var realIP: String? = nil
-                for attempt in 0..<150 {  // 15s timeout (100ms × 150)
-                    if FileManager.default.fileExists(atPath: ipFile.path),
-                       let data = try? Data(contentsOf: ipFile),
-                       let ip = String(data: data, encoding: .utf8)?
-                                    .trimmingCharacters(in: .whitespacesAndNewlines),
-                       !ip.isEmpty {
-                        realIP = ip
-                        CockerLog.shared.debug("eng", "IP read on attempt \(attempt): \(ip)")
-                        break
-                    }
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                }
-                // /cocker-ip (written by cocker-init once eth0 is actually
-                // configured) is AUTHORITATIVE — it is the container's real
-                // leased IP. Only if it never appears do we fall back to the
-                // host's vmnet lease table, and only AFTER the full poll
-                // window. Previously this fallback ran INSIDE the loop from
-                // 2 s on: a slow embedded DHCP client (dhcp-min, used when the
-                // image ships no udhcpc/dhclient) let a stale/tentative lease
-                // (e.g. .210) win before the real IP (e.g. .248) landed in
-                // /cocker-ip — pinning the port-forward to a dead IP so the
-                // published port was unreachable. images WITH udhcpc were fine
-                // only because /cocker-ip appeared before the fallback fired.
-                if realIP == nil, let mac = natMAC,
-                   let leased = ContainerEngine.lookupLeasedIP(forMAC: mac) {
-                    realIP = leased
-                    CockerLog.shared.debug("eng", "/cocker-ip never appeared; recovered from /var/db/dhcpd_leases: \(leased) (mac=\(mac))")
-                }
-                let finalIP = realIP ?? "127.0.0.1"
-                if realIP == nil {
-                    let pool = ContainerEngine.leasePoolCount()
-                    let helper = ContainerEngine.leasePoolHelperInstalled() ? "yes" : "no"
-                    CockerLog.shared.warn("eng",
-                        "container \(id) got no DHCP IP after 15s — port-forwarding will route to 127.0.0.1 (broken). " +
-                        "Lease pool=\(pool)/256, helper installed=\(helper). " +
-                        "Run `cocker daemon clear-leases` (one-shot) or `cocker daemon helper-install` (permanent).")
-                } else {
-                    CockerLog.shared.debug("eng", "container IP discovered: \(finalIP) (ports: \(ports.map { $0.description }.joined(separator: ", ")))")
-                }
-                // Update state with real IP
-                try? await self.state.updateContainer(id: id) { c in c.ip = finalIP }
-                CockerLog.shared.debug("eng", "state updated, calling portForwarder.start")
-                await self.portForwarder.start(containerID: id, containerIP: finalIP, mappings: ports)
-                CockerLog.shared.debug("eng", "portForwarder.start returned")
-            }
-        }
+        schedulePortForwarding(container: container, rootfsPath: rootfsPath)
 
         await cleanHealthcheckDir(containerID: id)
         spawnWatcherIfNeeded(id: id, rm: config.rm)
@@ -815,6 +763,10 @@ final class ContainerEngine {
             _ = try await images.rootfsPath(for: container.image)
             rootfsPath = try await images.cloneRootfs(for: container.image, containerID: canonicalID)
         }
+        // The previous VM's DHCP result lives on the persistent rootfs. Remove
+        // it before boot so the new forwarder cannot bind to a stale address.
+        try? FileManager.default.removeItem(at: rootfsPath.appendingPathComponent("cocker-ip"))
+        try? await state.updateContainer(id: canonicalID) { $0.ip = nil }
         do {
             try await vmRuntime.start(container: container, rootfsPath: rootfsPath)
         } catch {
@@ -826,6 +778,7 @@ final class ContainerEngine {
             c.startedAt = Date()
             c.finishedAt = nil
         }
+        schedulePortForwarding(container: container, rootfsPath: rootfsPath)
         // Respawn watcher + healthcheck loop if they're not already alive.
         // After a normal `cocker stop` the watcher exits via its truly-stopped
         // branch and we need a fresh one. After a daemon restart no Task
@@ -864,6 +817,7 @@ final class ContainerEngine {
             status = .error; span.setAttribute("error", "\(error)")
             throw error
         }
+        portForwardTasks.removeValue(forKey: container.id)?.task.cancel()
         await portForwarder.stop(containerID: container.id)
         try await state.updateContainer(id: id) { c in
             c.status = .stopped
@@ -896,6 +850,7 @@ final class ContainerEngine {
         let detected = try? await vmRuntime.stop(
             containerID: container.id, timeout: 0, stopSignal: signal
         )
+        portForwardTasks.removeValue(forKey: container.id)?.task.cancel()
         await portForwarder.stop(containerID: container.id)
         // Docker maps a signal-terminated container to exit code 128 + signum.
         // If we observed an explicit exit code on the wire prefer it, otherwise
@@ -961,6 +916,59 @@ final class ContainerEngine {
         emitEvent("container", action: "restart", id: canonical)
     }
 
+    private func schedulePortForwarding(container: Container, rootfsPath: URL) {
+        let id = container.id
+        let ports = container.ports
+        portForwardTasks.removeValue(forKey: id)?.task.cancel()
+        guard !ports.isEmpty else { return }
+        let natMAC = container.natMAC
+        let taskID = UUID()
+        let task = Task { [weak self, rootfsPath, ports, id, natMAC, taskID] in
+            guard let self else { return }
+            let ipFile = rootfsPath.appendingPathComponent("cocker-ip")
+            var realIP: String?
+            for _ in 0..<150 {
+                if Task.isCancelled { return }
+                if FileManager.default.fileExists(atPath: ipFile.path),
+                   let data = try? Data(contentsOf: ipFile),
+                   let ip = String(data: data, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !ip.isEmpty {
+                    realIP = ip
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+            if Task.isCancelled { return }
+            if realIP == nil, let mac = natMAC {
+                realIP = ContainerEngine.lookupLeasedIP(forMAC: mac)
+            }
+            guard let finalIP = realIP else {
+                CockerLog.shared.error("portfwd",
+                    "container \(id) has no DHCP IP; refusing unsafe 127.0.0.1 fallback")
+                return
+            }
+            try? await self.state.updateContainer(id: id) { $0.ip = finalIP }
+            if Task.isCancelled { return }
+            await self.activatePortForwarding(
+                taskID: taskID, containerID: id,
+                containerIP: finalIP, mappings: ports)
+        }
+        portForwardTasks[id] = (taskID, task)
+    }
+
+    private func activatePortForwarding(
+        taskID: UUID, containerID: String, containerIP: String,
+        mappings: [PortMapping]
+    ) async {
+        guard portForwardTasks[containerID]?.id == taskID else { return }
+        await portForwarder.start(
+            containerID: containerID, containerIP: containerIP, mappings: mappings)
+        if portForwardTasks[containerID]?.id == taskID {
+            portForwardTasks.removeValue(forKey: containerID)
+        }
+    }
+
     func pause(id: String) async throws {
         guard let container = await state.container(id: id) else {
             throw CockerError.containerNotFound(id)
@@ -999,6 +1007,7 @@ final class ContainerEngine {
         // for an id that no longer exists).
         cancelBackgroundTasks(id: container.id)
         await networks.releaseIP(for: container.id)
+        portForwardTasks.removeValue(forKey: container.id)?.task.cancel()
         await portForwarder.stop(containerID: container.id)
         // Supprime aussi le rootfs cloné du container (libère l'espace
         // disque pris par les modifications post-clonefile).
@@ -1087,7 +1096,10 @@ final class ContainerEngine {
         guard container.status == .running else {
             throw CockerError.containerNotRunning(config.containerID)
         }
-        return try await vmRuntime.exec(containerID: container.id, command: config.command, env: config.env, tty: config.tty, stdin: config.stdin)
+        return try await vmRuntime.exec(
+            containerID: container.id, command: config.command, env: config.env,
+            tty: config.tty, stdin: config.stdin,
+            workdir: config.workdir, user: config.user)
     }
 
     // MARK: - System info

@@ -1,5 +1,6 @@
 import Foundation
 import CockerCore
+import Darwin
 
 /// Port forwarding TCP host → container.
 ///
@@ -28,6 +29,9 @@ public actor PortForwarder {
         containerIP: String,
         mappings: [PortMapping]
     ) async {
+        // Replacement is atomic from the listener's point of view: stop and
+        // reap the previous processes before trying to bind the same ports.
+        await stop(containerID: containerID)
         var procs: [Process] = []
         for port in mappings {
             guard port.proto == .tcp else {
@@ -59,6 +63,14 @@ public actor PortForwarder {
         for proc in procs {
             if proc.isRunning {
                 proc.terminate()
+            }
+            let deadline = Date().addingTimeInterval(2)
+            while proc.isRunning, Date() < deadline {
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+            if proc.isRunning {
+                Darwin.kill(proc.processIdentifier, SIGKILL)
+                while proc.isRunning { try? await Task.sleep(nanoseconds: 10_000_000) }
             }
         }
         processes.removeValue(forKey: containerID)

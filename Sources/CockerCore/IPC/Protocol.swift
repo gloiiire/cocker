@@ -319,10 +319,13 @@ public struct ComposeRequest: Codable, Sendable {
     /// PRO-51. Old CLIs don't send the field → daemon falls back to
     /// the historical "build only when missing" behaviour.
     public let forceBuild: Bool
+    /// `compose build --no-cache`: execute every RUN instruction instead of
+    /// consulting the on-disk layer cache.
+    public let noCache: Bool
     public init(composePath: String, projectName: String? = nil, services: [String] = [],
                 detach: Bool = false, activeProfiles: [String]? = nil,
                 removeVolumes: Bool = false, follow: Bool = false, tail: Int = 50,
-                forceBuild: Bool = false) {
+                forceBuild: Bool = false, noCache: Bool = false) {
         self.composePath = composePath; self.projectName = projectName
         self.services = services; self.detach = detach
         self.activeProfiles = activeProfiles
@@ -330,10 +333,11 @@ public struct ComposeRequest: Codable, Sendable {
         self.follow = follow
         self.tail = tail
         self.forceBuild = forceBuild
+        self.noCache = noCache
     }
 
     enum CodingKeys: String, CodingKey {
-        case composePath, projectName, services, detach, activeProfiles, removeVolumes, follow, tail, forceBuild
+        case composePath, projectName, services, detach, activeProfiles, removeVolumes, follow, tail, forceBuild, noCache
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -351,6 +355,7 @@ public struct ComposeRequest: Codable, Sendable {
         // PRO-51 : default false so a pre-v0.7.10 CLI keeps the historical
         // "skip rebuild when image already exists" behaviour.
         self.forceBuild     = try c.decodeIfPresent(Bool.self, forKey: .forceBuild) ?? false
+        self.noCache        = try c.decodeIfPresent(Bool.self, forKey: .noCache) ?? false
     }
 }
 

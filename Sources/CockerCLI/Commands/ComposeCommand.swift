@@ -80,9 +80,8 @@ struct ComposeUpCommand: AsyncParsableCommand {
         // `cocker-compose-stage-<UUID>`). Pin the project name to the
         // ORIGINAL compose-file dir basename so containers/networks land
         // under the user-recognizable name.
-        let effectiveProjectName = projectName ?? (stage.stagingRoot != nil
-            ? URL(fileURLWithPath: originalPath).deletingLastPathComponent().lastPathComponent
-            : nil)
+        let effectiveProjectName = ProjectName.normalize(projectName
+            ?? URL(fileURLWithPath: originalPath).deletingLastPathComponent().lastPathComponent)
 
         let client = IPCClient()
         let payload = ComposeRequest(
@@ -152,7 +151,7 @@ struct ComposeUpCommand: AsyncParsableCommand {
         view?.finalize()
         try fail.throwIfTripped()
 
-        let proj = effectiveProjectName ?? "compose"
+        let proj = effectiveProjectName
         let downPath = stage.path
         let downProj = effectiveProjectName
         let footer = InteractiveFooter()
@@ -297,8 +296,8 @@ struct ComposeLogsCommand: AsyncParsableCommand {
         // Default project name to the cwd basename when --project-name is
         // omitted, so `cocker compose logs` from the project dir Just
         // Works without arguments — matches docker compose's behavior.
-        let effectiveProjectName = projectName
-            ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent
+        let effectiveProjectName = ProjectName.normalize(projectName
+            ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent)
 
         let client = IPCClient()
         let payload = ComposeRequest(
@@ -334,8 +333,8 @@ struct ComposePsCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         // Détermine le project name : argument explicite, ou dossier du compose file
-        let project = projectName ?? URL(fileURLWithPath: resolvePath(file))
-            .deletingLastPathComponent().lastPathComponent
+        let project = ProjectName.normalize(projectName ?? URL(fileURLWithPath: resolvePath(file))
+            .deletingLastPathComponent().lastPathComponent)
 
         let client = IPCClient()
         // Utilise `ps` avec filter label pour récupérer les containers du projet
@@ -386,12 +385,12 @@ struct ComposeExecCommand: AsyncParsableCommand {
     @Argument(help: "Service name")
     var service: String
 
-    @Argument(parsing: .remaining, help: "Command to execute")
+    @Argument(parsing: .captureForPassthrough, help: "Command to execute")
     var command: [String]
 
     mutating func run() async throws {
         let composePath = resolvePath(file)
-        let pName = projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent
+        let pName = ProjectName.normalize(projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent)
         let containerName = "\(pName)_\(service)_1"
 
         let client = IPCClient()
@@ -412,6 +411,9 @@ struct ComposeExecCommand: AsyncParsableCommand {
 
         var config = ExecConfig(containerID: container.id, command: command)
         config.tty = !noTTY
+        config.env = container.env
+        config.workdir = container.env["WORKDIR"]
+        config.user = container.env["USER"]
         let payload = ExecRequest(config: config)
         let request = try IPCRequest(type: .exec, payload: payload)
 
@@ -483,7 +485,8 @@ struct ComposeBuildCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let composePath = resolvePath(file)
         let client = IPCClient()
-        let payload = ComposeRequest(composePath: composePath, projectName: projectName, services: services)
+        let payload = ComposeRequest(composePath: composePath, projectName: projectName,
+                                     services: services, noCache: noCache)
         let request = try IPCRequest(type: .composeBuild, payload: payload)
 
         let fail = UX.FailFlag()
@@ -566,7 +569,7 @@ struct ComposePauseCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let composePath = resolvePath(file)
-        let pName = projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent
+        let pName = ProjectName.normalize(projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent)
         let client = IPCClient()
 
         let svcNames = services.isEmpty ? nil : services
@@ -604,7 +607,7 @@ struct ComposeUnpauseCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let composePath = resolvePath(file)
-        let pName = projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent
+        let pName = ProjectName.normalize(projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent)
         let client = IPCClient()
 
         let svcNames = services.isEmpty ? nil : services
@@ -675,7 +678,7 @@ struct ComposeKillCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let composePath = resolvePath(file)
-        let pName = projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent
+        let pName = ProjectName.normalize(projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent)
         let client = IPCClient()
 
         let psPayload = PSRequest(all: true)
@@ -711,7 +714,7 @@ struct ComposeTopCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let composePath = resolvePath(file)
-        let pName = projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent
+        let pName = ProjectName.normalize(projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent)
         let client = IPCClient()
 
         let psPayload = PSRequest(all: false)
@@ -756,7 +759,7 @@ struct ComposePortCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let composePath = resolvePath(file)
-        let pName = projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent
+        let pName = ProjectName.normalize(projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent)
         let client = IPCClient()
 
         let psPayload = PSRequest(all: false, filter: ["label": "com.cocker.project=\(pName)"])
@@ -808,7 +811,7 @@ struct ComposeImagesCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let composePath = resolvePath(file)
-        let pName = projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent
+        let pName = ProjectName.normalize(projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent)
         let client = IPCClient()
 
         let psPayload = PSRequest(all: true, filter: ["label": "com.cocker.project=\(pName)"])
@@ -858,7 +861,7 @@ struct ComposeEventsCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let composePath = resolvePath(file)
-        let pName = projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent
+        let pName = ProjectName.normalize(projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent)
         let client = IPCClient()
         let request = try IPCRequest(type: .events, payload: EmptyPayload())
         let outputJSON = json

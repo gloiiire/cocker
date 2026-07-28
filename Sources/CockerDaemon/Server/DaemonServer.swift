@@ -8,6 +8,7 @@ final class DaemonServer {
     private let socketPath: String
     private let engine: ContainerEngine
     private let compose: ComposeEngine
+    private let composeProjectGate = ComposeProjectGate()
     // Both are only ever read/written from the MainActor : `acceptLoop`
     // stays actor-isolated and only the blocking accept(2) syscall runs
     // off-actor in a detached Task (the `await` suspends without blocking
@@ -336,12 +337,16 @@ final class DaemonServer {
             case .composeUp:
                 let req = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
                 try await sendStreamingOperation(requestId: request.id, to: fd) { send in
-                    try await self.compose.up(request: req, progressHandler: send)
+                    try await self.composeProjectGate.withLock(project: Self.composeProject(req)) {
+                        try await self.compose.up(request: req, progressHandler: send)
+                    }
                 }
 
             case .composeDown:
                 let req = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
-                try await compose.down(request: req)
+                try await composeProjectGate.withLock(project: Self.composeProject(req)) {
+                    try await self.compose.down(request: req)
+                }
                 try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
 
             case .cp:
@@ -420,7 +425,9 @@ final class DaemonServer {
             case .composeBuild:
                 let req = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
                 try await sendStreamingOperation(requestId: request.id, to: fd) { send in
-                    try await self.compose.build(request: req, progressHandler: send)
+                    try await self.composeProjectGate.withLock(project: Self.composeProject(req)) {
+                        try await self.compose.build(request: req, progressHandler: send)
+                    }
                 }
 
             case .composePull:
@@ -437,7 +444,9 @@ final class DaemonServer {
 
             case .composeRestart:
                 let req = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
-                try await handleComposeRestart(req)
+                try await composeProjectGate.withLock(project: Self.composeProject(req)) {
+                    try await self.handleComposeRestart(req)
+                }
                 try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
 
             case .info:
@@ -737,6 +746,11 @@ final class DaemonServer {
         for c in containers {
             try? await engine.restart(id: c.id)
         }
+    }
+
+    private nonisolated static func composeProject(_ req: ComposeRequest) -> String {
+        ProjectName.normalize(req.projectName ?? URL(fileURLWithPath: req.composePath)
+            .deletingLastPathComponent().lastPathComponent)
     }
 
     // MARK: - Setup
