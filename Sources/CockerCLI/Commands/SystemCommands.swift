@@ -280,6 +280,8 @@ struct SystemEventsCommand: AsyncParsableCommand {
         let allowedTypes = types
         let allowedIDs = ids
 
+        let footer = InteractiveFooter()
+        footer.armStreaming(footerLines(detachable: false))
         try await client.sendStreaming(request) { event in
             // Wire format engine→client : "<type>\t<action>\t<id>".
             let parts = event.data.split(separator: "\t", maxSplits: 2,
@@ -298,5 +300,6 @@ struct SystemEventsCommand: AsyncParsableCommand {
             let ts = ISO8601DateFormatter().string(from: event.timestamp)
             print("\(ts) \(type) \(action)\(id.isEmpty ? "" : " " + id)")
         }
+        footer.restore()
     }
 }
