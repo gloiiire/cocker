@@ -102,7 +102,8 @@ final class ServiceURLs: @unchecked Sendable {
 func footerLines(header: [String] = [],
                  services: [(name: String, url: String)] = [],
                  status: [String] = [],
-                 detachable: Bool) -> [String] {
+                 detach: Bool = false,
+                 quit: Bool = false) -> [String] {
     var lines = header
     let width = services.map { $0.name.count }.max() ?? 0
     for s in services {
@@ -110,15 +111,17 @@ func footerLines(header: [String] = [],
         lines.append("   " + padded + "   " + UX.TTY.paint(s.url, .accent))
     }
     lines.append(contentsOf: status)
-    var hint = "   " + UX.TTY.paint("press", .dim) + " "
-    if detachable {
-        hint += UX.TTY.paint("d", .accent) + " " + UX.TTY.paint("detach", .dim)
-              + UX.TTY.paint("   ·   ", .dim)
-              + UX.TTY.paint("q", .accent) + " " + UX.TTY.paint("quit", .dim)
-    } else {
-        hint += UX.TTY.paint("q", .accent) + " " + UX.TTY.paint("quit", .dim)
+    // Only the keys that actually do something are shown. `d` (detach —
+    // leave running) is offered wherever the command holds the terminal ; `q`
+    // (quit for real — tear down) only where this command STARTED something.
+    // A pure viewer (logs / events) started nothing, so it shows `d` alone.
+    var parts: [String] = []
+    if detach { parts.append(UX.TTY.paint("d", .accent) + " " + UX.TTY.paint("detach", .dim)) }
+    if quit   { parts.append(UX.TTY.paint("q", .accent) + " " + UX.TTY.paint("quit", .dim)) }
+    if !parts.isEmpty {
+        lines.append("   " + UX.TTY.paint("press", .dim) + " "
+            + parts.joined(separator: UX.TTY.paint("   ·   ", .dim)))
     }
-    lines.append(hint)
     return lines
 }
 
@@ -154,7 +157,7 @@ final class InteractiveFooter: @unchecked Sendable {
     /// before the process exits.
     func start(footer: @escaping @Sendable () -> [String],
                onDetach: (@Sendable () -> Bool)? = nil,
-               onQuit: (@Sendable () -> Void)? = nil) {
+               onQuit: (@Sendable () async -> Void)? = nil) {
         lock.lock(); builder = footer; lock.unlock()
 
         guard animated else {
@@ -169,10 +172,17 @@ final class InteractiveFooter: @unchecked Sendable {
         let sticky = self.sticky
         let build: @Sendable () -> [String] = { [weak self] in self?.currentFooter() ?? [] }
 
-        // Ctrl-C: restore cooked mode BEFORE exit (Darwin.exit skips defers).
+        // Ctrl-C = quit for real (same as `q`): restore cooked mode, run the
+        // teardown, then exit. Darwin.exit skips defers, so restore here too.
         let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         signal(SIGINT, SIG_IGN)
-        sig.setEventHandler { raw.restore(); print(""); Darwin.exit(0) }
+        sig.setEventHandler {
+            raw.restore(); sticky.abandon()
+            Task.detached(priority: .userInitiated) {
+                if let onQuit { await onQuit() }
+                Darwin.exit(0)
+            }
+        }
         sig.resume()
 
         Task.detached(priority: .userInitiated) {
@@ -182,7 +192,7 @@ final class InteractiveFooter: @unchecked Sendable {
                 switch b[0] {
                 case UInt8(ascii: "q"), UInt8(ascii: "Q"):
                     raw.restore(); sticky.abandon()
-                    onQuit?()
+                    if let onQuit { await onQuit() }
                     Darwin.exit(0)
                 case UInt8(ascii: "d"), UInt8(ascii: "D"):
                     guard let onDetach else { break }  // d not offered
@@ -203,23 +213,42 @@ final class InteractiveFooter: @unchecked Sendable {
     /// bottom-pinned footer would fight a fast, unbounded log stream. `q` (and
     /// Ctrl-C) restore the terminal and exit; the container/daemon keeps
     /// running (we only detach the viewer). Off-TTY: print once, no keys.
-    func armStreaming(_ lines: [String], onQuit: @escaping @Sendable () -> Void = {}) {
+    func armStreaming(_ lines: [String],
+                      onDetach: (@Sendable () -> Bool)? = nil,
+                      onQuit: (@Sendable () async -> Void)? = nil) {
         // Off-TTY (piped / CI) this is a total no-op — no hint line, no keys —
         // so `logs -f | grep` stays clean.
         guard animated else { return }
         for l in lines { print(l) }
         raw.enter()
         let raw = self.raw
+        // Ctrl-C = quit for real (same as `q`): teardown then exit.
         let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         signal(SIGINT, SIG_IGN)
-        sig.setEventHandler { raw.restore(); print(""); Darwin.exit(0) }
+        sig.setEventHandler {
+            raw.restore()
+            Task.detached(priority: .userInitiated) {
+                if let onQuit { await onQuit() }
+                Darwin.exit(0)
+            }
+        }
         sig.resume()
         Task.detached(priority: .userInitiated) {
             let fd = fileno(stdin)
             var b = [UInt8](repeating: 0, count: 1)
             while read(fd, &b, 1) == 1 {
-                if b[0] == UInt8(ascii: "q") || b[0] == UInt8(ascii: "Q") {
-                    raw.restore(); onQuit(); Darwin.exit(0)
+                switch b[0] {
+                case UInt8(ascii: "q"), UInt8(ascii: "Q"):
+                    raw.restore()
+                    if let onQuit { await onQuit() }
+                    Darwin.exit(0)
+                case UInt8(ascii: "d"), UInt8(ascii: "D"):
+                    guard let onDetach else { break }  // d not offered
+                    raw.restore(); print("")
+                    if onDetach() { Darwin.exit(0) }
+                    raw.enter()  // refused → keep reading keys
+                default:
+                    break
                 }
             }
         }

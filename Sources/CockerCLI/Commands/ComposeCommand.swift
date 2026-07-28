@@ -153,17 +153,29 @@ struct ComposeUpCommand: AsyncParsableCommand {
         try fail.throwIfTripped()
 
         let proj = effectiveProjectName ?? "compose"
+        let downPath = stage.path
+        let downProj = effectiveProjectName
         let footer = InteractiveFooter()
         footer.start(
             footer: {
                 footerLines(
                     header: [" " + UX.TTY.paint("→ Running", .progress) + " " + UX.TTY.paint(proj, .accent)],
                     services: urls.snapshot(),
-                    detachable: false)
+                    detach: true, quit: true)
+            },
+            onDetach: {
+                // `d` = detach : leave the containers running, return the shell.
+                print(UX.TTY.paint("Detached.", .dim) + " "
+                    + UX.TTY.paint("Containers keep running — `cocker compose logs -f` to follow, `cocker compose down` to stop.", .dim))
+                return true
             },
             onQuit: {
-                print("\n" + UX.TTY.paint("Detached.", .dim) + " "
-                    + UX.TTY.paint("Containers keep running — `cocker compose logs -f` to follow, `cocker compose down` to stop.", .dim))
+                // `q` / Ctrl-C = quit for real : tear the project down.
+                if let req = try? IPCRequest(type: .composeDown,
+                                             payload: ComposeRequest(composePath: downPath, projectName: downProj)) {
+                    _ = try? await IPCClient().send(req)
+                }
+                print("\n" + UX.TTY.paint("Stopped and removed the project.", .dim))
             })
         // Hold the terminal so the footer stays attached ; the key task exits
         // the process on `q` / Ctrl-C. Off-TTY we don't hold.
@@ -299,7 +311,7 @@ struct ComposeLogsCommand: AsyncParsableCommand {
         let request = try IPCRequest(type: .composeLogs, payload: payload)
 
         let footer = InteractiveFooter()
-        if follow { footer.armStreaming(footerLines(detachable: false)) }
+        if follow { footer.armStreaming(footerLines(detach: true), onDetach: { true }) }
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
@@ -852,7 +864,7 @@ struct ComposeEventsCommand: AsyncParsableCommand {
         let outputJSON = json
 
         let footer = InteractiveFooter()
-        if !outputJSON { footer.armStreaming(footerLines(detachable: false)) }
+        if !outputJSON { footer.armStreaming(footerLines(detach: true), onDetach: { true }) }
         try await client.sendStreaming(request) { event in
             let ts = ISO8601DateFormatter().string(from: event.timestamp)
             // Filter events relevant to this project

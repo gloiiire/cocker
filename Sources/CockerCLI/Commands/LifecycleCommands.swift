@@ -272,7 +272,7 @@ struct LogsCommand: AsyncParsableCommand {
         // Uniform interactive hint : while following, `q` (or Ctrl-C) quits
         // the viewer and restores the terminal ; the container keeps running.
         let footer = InteractiveFooter()
-        if follow { footer.armStreaming(footerLines(detachable: false)) }
+        if follow { footer.armStreaming(footerLines(detach: true), onDetach: { true }) }
         try await client.sendStreaming(request) { event in
             // stderr is painted dim red so the eye separates streams without
             // forcing the user to pipe to grep. Goes through UX.TTY.paint so

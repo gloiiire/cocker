@@ -124,12 +124,14 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         // run / logs via UX.InteractiveFooter. Off-TTY it degrades to plain.
         let dir = projectDir
         let db = debounceMs
+        let downPath = originalPath
+        let downProj = effectiveProjectName
         let footerContent: @Sendable () -> [String] = {
             footerLines(
                 header: [" " + UX.TTY.paint("→ Watching", .progress) + " " + UX.TTY.paint(dir, .accent)],
                 services: urls.snapshot(),
                 status: ["   " + UX.TTY.paint("FSEvents", .dim) + "   " + UX.TTY.paint("listening (debounce \(db)ms)", .dim)],
-                detachable: true)
+                detach: true, quit: true)
         }
         print("")
         let footer = InteractiveFooter()
@@ -142,8 +144,13 @@ struct ComposeWatchCommand: AsyncParsableCommand {
                 (try? Self.detachAndExit(projectDir: dir, originalArgs: CommandLine.arguments)) ?? false
             },
             onQuit: {
-                print("\n" + UX.TTY.paint("Stopped watching.", .dim) + " "
-                    + UX.TTY.paint("Containers keep running — `cocker compose down` to stop them.", .dim))
+                // `q` / Ctrl-C = quit for real : stop watching AND tear the
+                // project down. (`d` above keeps it running in the background.)
+                if let req = try? IPCRequest(type: .composeDown,
+                                             payload: ComposeRequest(composePath: downPath, projectName: downProj)) {
+                    _ = try? await IPCClient().send(req)
+                }
+                print("\n" + UX.TTY.paint("Stopped watching and tore the project down.", .dim))
             })
 
         let watcher = FSEventWatcher(path: projectDir, debounceMs: debounceMs)

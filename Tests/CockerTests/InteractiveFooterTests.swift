@@ -9,19 +9,23 @@ import Foundation
 
 @Suite("footerLines — builder")
 struct FooterLinesTests {
-    @Test func quitOnlyHintWhenNotDetachable() {
-        let lines = footerLines(detachable: false)
+    @Test func detachOnlyHintForViewers() {
+        // Pure viewers (logs/events) started nothing → `d` (detach) only.
+        let lines = footerLines(detach: true)
         #expect(lines.count == 1)
-        #expect(lines[0].contains("q"))
-        #expect(lines[0].contains("quit"))
-        #expect(!lines[0].contains("detach"))
+        #expect(lines[0].contains("detach"))
+        #expect(!lines[0].contains("quit"))
     }
 
-    @Test func detachAndQuitHintWhenDetachable() {
-        let lines = footerLines(detachable: true)
+    @Test func detachAndQuitHintForStartCommands() {
+        let lines = footerLines(detach: true, quit: true)
         #expect(lines.count == 1)
         #expect(lines[0].contains("detach"))
         #expect(lines[0].contains("quit"))
+    }
+
+    @Test func noHintWhenNeitherKey() {
+        #expect(footerLines().isEmpty)
     }
 
     @Test func headerAndStatusAndServicesRendered() {
@@ -30,7 +34,7 @@ struct FooterLinesTests {
             services: [(name: "api", url: "http://localhost:8000"),
                        (name: "web_1", url: "http://localhost:3000")],
             status: ["STAT"],
-            detachable: false)
+            detach: true, quit: true)
         // header + 2 service rows + status + hint
         #expect(lines.count == 5)
         #expect(lines[0] == "HEAD")
@@ -45,7 +49,7 @@ struct FooterLinesTests {
     @Test func serviceNamesPaddedToLongest() {
         let lines = footerLines(
             services: [(name: "a", url: "u1"), (name: "longname", url: "u2")],
-            detachable: false)
+            detach: true)
         // Both service rows should align the URL at the same column: the
         // short name is padded to the longest name's width.
         let row1 = lines[0]
@@ -121,8 +125,8 @@ struct InteractiveFooterNonTTYTests {
         // is false; guard so a local TTY run doesn't put the terminal in raw
         // mode or spawn a stdin reader.
         if !f.animated {
-            f.start(footer: { footerLines(detachable: true) })
-            f.armStreaming(footerLines(detachable: false))
+            f.start(footer: { footerLines(detach: true, quit: true) })
+            f.armStreaming(footerLines(detach: true))
             f.clear()
             f.refresh()
             f.restore()
