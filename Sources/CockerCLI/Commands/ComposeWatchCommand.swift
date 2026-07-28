@@ -103,15 +103,13 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         // watcher would race it (double rebuilds on every save). Point the
         // user at --attach instead of silently starting a rival loop.
         //
-        // Subtlety : the detached child we spawn (see detachAndExit) re-runs
-        // this exact command, and its parent writes the pidfile with the
-        // *child's* pid. So the child legitimately finds its OWN pid here and
-        // must NOT treat that as a rival and bail (that race silently killed
-        // the background watch the instant it started). We bypass the guard
-        // only when the recorded pid is our own — a pidfile holding any OTHER
-        // live pid (including a rival detached child) still stops us, so two
-        // concurrent `--detach` invocations can't both survive.
-        if !attach, let existing = Self.livePID(projectDir: projectDir), existing != getpid() {
+        // The detached child we spawn (see detachAndExit) re-runs this exact
+        // command ; its parent already claimed the pidfile atomically, making
+        // it the one legitimate watcher, so it must skip this guard entirely.
+        // A plain foreground watch (no marker) still honours it — refusing to
+        // race a detached watch that owns the project.
+        let isDetachedChild = ProcessInfo.processInfo.environment["COCKER_WATCH_DETACHED_CHILD"] == "1"
+        if !attach, !isDetachedChild, let existing = Self.livePID(projectDir: projectDir) {
             UX.Warning.emit(
                 "a detached watch is already running (pid \(existing))",
                 note: "re-attach with `cocker compose watch --attach`, or stop it with `cocker compose watch --stop`"
@@ -209,6 +207,34 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         return nil
     }
 
+    /// Atomically claim the pidfile so two near-simultaneous `--detach`
+    /// invocations can't both spawn a watcher for the same project. `O_EXCL`
+    /// means exactly one racer wins the create ; a loser refuses when a live
+    /// watch already owns the file, or clears a stale file (via livePID) and
+    /// retries the create once. Returns true iff we now own the pidfile
+    /// (holding our own pid as a placeholder until the real child pid is
+    /// written). The single winner serializes detach registration, which the
+    /// pid-equality guard in run() alone could not (both parents pass their
+    /// initial check before either writes the file).
+    private static func claimPidfile(projectDir: String) -> Bool {
+        let path = pidFilePath(projectDir)
+        try? FileManager.default.createDirectory(
+            atPath: projectDir + "/.cocker", withIntermediateDirectories: true)
+        for _ in 0..<2 {
+            let fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0o644)
+            if fd >= 0 {
+                let claim = "\(getpid())\n"
+                _ = claim.withCString { write(fd, $0, strlen($0)) }
+                close(fd)
+                return true
+            }
+            // File exists : a live owner blocks us ; a stale one gets removed
+            // by livePID, after which we loop and retry the exclusive create.
+            if livePID(projectDir: projectDir) != nil { return false }
+        }
+        return false
+    }
+
     /// Terminate a detached background watcher (SIGTERM, escalate to
     /// SIGKILL after ~2s) and remove its pidfile. Returns the pid that was
     /// stopped, or nil if none was running. Shared by `--stop` and
@@ -291,14 +317,18 @@ struct ComposeWatchCommand: AsyncParsableCommand {
     /// `false` if it refused because a watch is already running.
     @discardableResult
     private static func detachAndExit(projectDir: String, originalArgs: [String]) throws -> Bool {
-        // Refuse to start a second watch loop for the same project —
-        // two foreground watchers both calling `compose up --build` in
-        // response to the same events would race and double-rebuild.
-        if let existing = Self.livePID(projectDir: projectDir) {
-            UX.Warning.emit(
-                "watch is already running (pid \(existing))",
-                note: "stop with `cocker compose watch --stop` or follow with `cocker compose watch --logs`"
-            )
+        // Refuse to start a second watch loop for the same project — two
+        // watchers both calling `compose up --build` on the same events would
+        // race and double-rebuild. Claiming the pidfile ATOMICALLY (not just
+        // an livePID check) is what serializes two concurrent `--detach`
+        // calls : without it both pass the check before either registers.
+        guard Self.claimPidfile(projectDir: projectDir) else {
+            if let existing = Self.livePID(projectDir: projectDir) {
+                UX.Warning.emit(
+                    "watch is already running (pid \(existing))",
+                    note: "stop with `cocker compose watch --stop` or follow with `cocker compose watch --logs`"
+                )
+            }
             return false
         }
 
@@ -336,12 +366,24 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         proc.standardInput = FileHandle.nullDevice
         proc.standardOutput = logHandle
         proc.standardError = logHandle
+        // Mark the child : we've already claimed ownership atomically above,
+        // so it is the one legitimate watcher and must skip the "already
+        // running" guard entirely (the pidfile transiently holds our parent
+        // pid until we overwrite it below — a pid-equality check would make
+        // the child bail during that window).
+        var childEnv = ProcessInfo.processInfo.environment
+        childEnv["COCKER_WATCH_DETACHED_CHILD"] = "1"
+        proc.environment = childEnv
 
-        try proc.run()
+        do {
+            try proc.run()
+        } catch {
+            // Spawn failed — release the claim so the project isn't wedged.
+            try? FileManager.default.removeItem(atPath: pidPath)
+            throw error
+        }
         let pid = proc.processIdentifier
-        // The child recognises this pid as its own (getpid()) and so skips the
-        // "already running" guard for it — while still bailing on any other
-        // live pid. See the guard in run().
+        // Replace our placeholder claim with the real child pid.
         try? "\(pid)\n".write(toFile: pidPath, atomically: true, encoding: .utf8)
 
         print(UX.ActionLine(
