@@ -6,12 +6,19 @@ import CockerCore
 
 enum HTTPLimits {
     /// Largest request body we will buffer, in bytes (100 MiB) — matches the
-    /// IPC framer's cap. Headers are already bounded to 64 KiB ; without this
-    /// a client advertising `Content-Length: 9999999999` would make the
-    /// daemon allocate gigabytes and stall. Over the TLS/TCP surface that is
-    /// a cheap denial-of-service, so we refuse the request outright once the
-    /// declared length exceeds the cap.
+    /// IPC framer's cap. Without this a client advertising
+    /// `Content-Length: 9999999999` would make the daemon allocate gigabytes
+    /// and stall. Over the TLS/TCP surface that is a cheap denial-of-service,
+    /// so we refuse the request outright once the declared length exceeds the
+    /// cap.
     static let maxBodyBytes = 100 * 1024 * 1024
+
+    /// Largest header section (everything before the blank `\r\n\r\n` line) we
+    /// will accumulate, in bytes (64 KiB). A client that keeps sending header
+    /// bytes without ever terminating the section would otherwise grow the
+    /// receive buffer without bound. Both the Unix-socket fd parser and the
+    /// TLS listener enforce this same cap.
+    static let maxHeaderBytes = 64 * 1024
 }
 
 struct HTTPRequest {
@@ -147,7 +154,7 @@ func parseHTTPRequest(from fd: Int32) throws -> HTTPRequest? {
         if n <= 0 { return nil }
         headerData.append(byte[0])
         if headerData.suffix(4) == Data([0x0D, 0x0A, 0x0D, 0x0A]) { break }
-        if headerData.count > 65536 { return nil }  // Header too large
+        if headerData.count > HTTPLimits.maxHeaderBytes { return nil }  // Header too large
     }
 
     guard let rawHeaders = String(data: headerData, encoding: .utf8) else { return nil }

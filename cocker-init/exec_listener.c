@@ -50,8 +50,75 @@
 
 static volatile sig_atomic_t worker_count = 0;
 
+/* Return a pointer to the VALUE of the top-level object key `key` (e.g.
+ * "tty"), or NULL if that key is absent. Walks the outermost JSON object at
+ * brace-depth 1 only, honoring string escapes and nested object/array spans,
+ * so nothing inside a value is ever mistaken for a top-level key. This kills
+ * two whole classes of bug at once :
+ *   1. JSON key ordering — JSONEncoder guarantees none, so the old parser
+ *      (which searched `tty`/`env` relative to `cmd`) silently dropped the
+ *      PTY or the env whenever the order flipped. A structural top-level walk
+ *      is order-independent.
+ *   2. Same-named nested keys / values — an argument like `exec c tty`, OR an
+ *      environment variable literally named `tty` (`{"env":{"tty":"x"},...}`),
+ *      would otherwise be read as the top-level `tty` field. Because we only
+ *      match keys at depth 1 and skip each value wholesale, nested `"tty"` /
+ *      `"env"` text can never be picked up.
+ * Runs on the pristine buffer, before the argv loop plants NUL terminators. */
+static char *top_level_value(char *buf, const char *key) {
+    char *p = strchr(buf, '{');
+    if (!p) return NULL;
+    p++;  /* now inside the top object, depth 1 */
+    size_t keylen = strlen(key);
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p == '}' || *p == '\0') return NULL;   /* end of top object */
+        if (*p != '"') return NULL;                 /* malformed */
+        char *k = p + 1;
+        char *ke = k;
+        while (*ke && *ke != '"') { if (*ke == '\\' && ke[1]) ke += 2; else ke++; }
+        if (*ke != '"') return NULL;
+        size_t klen = (size_t)(ke - k);
+        p = ke + 1;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p != ':') return NULL;
+        p++;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        char *value = p;
+        if (klen == keylen && strncmp(k, key, keylen) == 0) return value;
+        /* Not our key — skip its value wholesale so nested braces/brackets,
+         * strings and escapes never leak into the depth-1 scan. */
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"') { if (*p == '\\' && p[1]) p += 2; else p++; }
+            if (*p == '"') p++;
+        } else if (*p == '{' || *p == '[') {
+            int depth = 0, in_str = 0;
+            for (; *p; p++) {
+                if (in_str) {
+                    if (*p == '\\' && p[1]) { p++; continue; }
+                    if (*p == '"') in_str = 0;
+                } else if (*p == '"') {
+                    in_str = 1;
+                } else if (*p == '{' || *p == '[') {
+                    depth++;
+                } else if (*p == '}' || *p == ']') {
+                    depth--;
+                    if (depth == 0) { p++; break; }
+                }
+            }
+        } else {
+            /* bare literal : true / false / null / number */
+            while (*p && *p != ',' && *p != '}' && *p != ']'
+                   && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+        }
+    }
+    return NULL;
+}
+
 /* Very small in-place JSON scanner — handles the two specific shapes
- * cockerd sends (`{"cmd":[...],"env":{...}}`). Not a general decoder.
+ * cockerd sends (`{"cmd":[...],"env":{...},"tty":bool}` in any key order).
+ * Not a general decoder.
  *
  * Returns the number of argv entries on success, 0 on parse error. argv and
  * env_out are filled with pointers into `buf`, which the caller owns. */
@@ -63,23 +130,27 @@ static int parse_exec_request(char *buf, size_t buf_len,
     if (buf_len >= EXEC_BUF_SIZE) buf_len = EXEC_BUF_SIZE - 1;
     buf[buf_len] = '\0';
 
-    /* --- argv ---
-     * Locate the colon that terminates the `"cmd"` key, then the *next*
-     * non-whitespace char must be a `[`. The pre-fix code used
-     * `strchr(p, '[')` which would also accept `"cmd":"[hack]"`, parsing
-     * it as an empty argv array (the next char after `[` is a `"` which
-     * we treat as the start of an item, then we read `hack]` and fail) —
-     * a harmless failure mode in practice but it ate the request buffer
-     * pointer for the env scan below. Constraining the scan to a literal
-     * `: WS* [` makes the parser closer to a real JSON peek. */
-    char *p = strstr(buf, "\"cmd\"");
-    if (!p) return 0;
-    p = strchr(p, ':');
-    if (!p) return 0;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != '[') return 0;
-    p++;
+    *tty_out = 0;
+    argv[0] = NULL;
+    env_out[0] = NULL;
+
+    /* --- locate cmd / tty / env as TOP-LEVEL keys --- on the pristine
+     * buffer, before the argv loop below mutates cmd's values. Using a
+     * depth-1 structural walk makes the parser independent of JSON key order
+     * (JSONEncoder guarantees none) AND immune to same-named nested keys or
+     * values — e.g. an env var literally named `tty` no longer steals the
+     * top-level `tty` field. env is *parsed* further down, after argv; its
+     * region lies outside the cmd array, so the argv loop leaves it pristine. */
+    char *cmd_open = top_level_value(buf, "cmd");
+    if (!cmd_open || *cmd_open != '[') return 0;
+
+    char *t = top_level_value(buf, "tty");
+    if (t && *t == 't') *tty_out = 1;  /* value is the literal `true` */
+
+    char *env_field = top_level_value(buf, "env");
+
+    /* --- argv --- (mutates cmd's string values in place) */
+    char *p = cmd_open + 1;
     int argc = 0;
     while (*p && argc < argv_max - 1) {
         while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t') p++;
@@ -114,23 +185,9 @@ static int parse_exec_request(char *buf, size_t buf_len,
      * unhelpful 127. */
     if (argc == 0 || argv[0] == NULL || argv[0][0] == '\0') return 0;
 
-    /* --- tty --- search from the start of the buffer so we don't depend
-     * on field order in the JSON (Swift's JSONEncoder doesn't guarantee
-     * one). */
-    *tty_out = 0;
-    char *t = strstr(buf, "\"tty\"");
-    if (t) {
-        t = strchr(t, ':');
-        if (t) {
-            t++;
-            while (*t == ' ' || *t == '\t') t++;
-            if (*t == 't') *tty_out = 1;  /* "true" */
-        }
-    }
-
-    /* --- env --- */
+    /* --- env --- parse from the pre-located pointer (see note above). */
     int envc = 0;
-    char *e = strstr(p, "\"env\"");
+    char *e = env_field;
     if (e) {
         e = strchr(e, '{');
         if (e) {

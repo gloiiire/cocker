@@ -161,6 +161,16 @@ jobs:
           clang -g -O1 -fsanitize=address -Wall -Werror \
             tests/fuzz_exec_parser.c -o /tmp/fuzz_exec_parser_sanity
           echo "✅ fuzz harness builds clean with ASAN"
+      - name: Exec parser ordering test
+        # Correctness (not just crash-safety) : the exec JSON scanner must
+        # recover cmd / env / tty for ALL six key orderings — JSONEncoder's
+        # key order is randomized per daemon process, and an order-dependent
+        # parser silently dropped the PTY (`exec -it`) or the environment.
+        working-directory: cocker-init
+        run: |
+          clang -g -O1 -fsanitize=address -Wall -Werror \
+            tests/test_exec_parser_order.c -o /tmp/test_exec_parser_order
+          /tmp/test_exec_parser_order
 
   e2e-lint:
     name: e2e scripts syntax check

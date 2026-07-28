@@ -29,6 +29,13 @@ private final class UncheckedBox<T>: @unchecked Sendable {
     init(_ value: T) { self.value = value }
 }
 
+/// Outcome of one `conn.receive` raced against an idle-timeout sleep.
+private enum TLSRecvOutcome {
+    case data(Data)
+    case eof        // clean close, error, or empty complete
+    case timedOut   // no bytes for the idle window
+}
+
 @MainActor
 final class DockerAPITLSListener {
     private let port: NWEndpoint.Port
@@ -261,26 +268,73 @@ final class DockerAPITLSListener {
             // body (if any) is fully drained.
             var headerEnd: Int? = nil
             var contentLength = 0
-            while headerEnd == nil || buffer.count < headerEnd! + 4 + contentLength {
-                let chunk: Data? = await withCheckedContinuation { (k: CheckedContinuation<Data?, Never>) in
-                    conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
-                        if let error {
-                            CockerLog.shared.warn("docker-api-tls", "receive error: \(error)")
-                            k.resume(returning: nil)
-                            return
+            // Per-receive IDLE timeout, reset on every chunk. NWConnection.receive
+            // has no timeout of its own. A fixed whole-request deadline is wrong
+            // twice over : it kills a legitimately long transfer that is still
+            // making progress (a large image push over a slow link), and it
+            // never fires while the client is actually stalled inside receive()
+            // — only between chunks. Racing each receive against a sleep bounds
+            // a stalled / slowloris connection without capping honest big bodies.
+            let idleTimeoutNanos: UInt64 = 30 * 1_000_000_000
+            receiveLoop: while headerEnd == nil || buffer.count < headerEnd! + 4 + contentLength {
+                let outcome: TLSRecvOutcome = await withTaskGroup(of: TLSRecvOutcome.self) { group in
+                    group.addTask {
+                        await withCheckedContinuation { (k: CheckedContinuation<TLSRecvOutcome, Never>) in
+                            conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, _, error in
+                                if let error {
+                                    CockerLog.shared.warn("docker-api-tls", "receive error: \(error)")
+                                    k.resume(returning: .eof)
+                                    return
+                                }
+                                if let data, !data.isEmpty {
+                                    k.resume(returning: .data(data))
+                                } else {
+                                    k.resume(returning: .eof)  // isComplete / empty
+                                }
+                            }
                         }
-                        if isComplete && (data == nil || data!.isEmpty) {
-                            k.resume(returning: nil)
-                            return
-                        }
-                        k.resume(returning: data)
                     }
+                    group.addTask {
+                        try? await Task.sleep(nanoseconds: idleTimeoutNanos)
+                        return .timedOut
+                    }
+                    let first = await group.next() ?? .eof
+                    // If the idle timer won, cancel the connection NOW so the
+                    // still-pending receive callback fires and its child task
+                    // can finish — withTaskGroup awaits every child at scope
+                    // exit, so a stuck continuation would otherwise hang here.
+                    if case .timedOut = first { conn.cancel() }
+                    group.cancelAll()
+                    return first
                 }
-                guard let chunk, !chunk.isEmpty else { break }
+                let chunk: Data
+                switch outcome {
+                case .timedOut:
+                    CockerLog.shared.warn("docker-api-tls", "receive idle-timed out")
+                    return  // conn already cancelled inside the group
+                case .eof:
+                    break receiveLoop
+                case .data(let d):
+                    chunk = d
+                }
                 buffer.append(chunk)
-                // Find header terminator if we don't have it yet.
+                // Bound the HEADER section (everything before the blank
+                // \r\n\r\n line). Once the terminator is seen, measure against
+                // the ACTUAL header length — NOT raw buffer.count, which also
+                // counts body bytes that can arrive in the same receive (or
+                // when the terminator straddles chunks) and would wrongly
+                // reject a request whose headers are within the cap. While no
+                // terminator has appeared, buffer.count IS the header size, so
+                // the same cap guards the never-terminated case — a memory
+                // exhaustion attack, reachable unauthenticated when
+                // COCKER_TCP_TLS_NO_CLIENT_AUTH disables mTLS.
                 if headerEnd == nil {
                     if let r = buffer.range(of: Data([0x0D, 0x0A, 0x0D, 0x0A])) {
+                        if r.lowerBound > HTTPLimits.maxHeaderBytes {
+                            CockerLog.shared.warn("docker-api-tls", "header section exceeded \(HTTPLimits.maxHeaderBytes) bytes")
+                            conn.cancel()
+                            return
+                        }
                         headerEnd = r.lowerBound
                         // Parse Content-Length from headers.
                         if let head = String(data: buffer.subdata(in: 0..<r.lowerBound), encoding: .utf8) {
@@ -296,6 +350,12 @@ final class DockerAPITLSListener {
                             conn.cancel()
                             return
                         }
+                    } else if buffer.count > HTTPLimits.maxHeaderBytes {
+                        // No terminator yet and already over the cap → the
+                        // client is never going to end the header block.
+                        CockerLog.shared.warn("docker-api-tls", "header section exceeded \(HTTPLimits.maxHeaderBytes) bytes")
+                        conn.cancel()
+                        return
                     }
                 }
             }
