@@ -195,6 +195,22 @@ final class VMRuntime: NSObject {
         FileManager.default.fileExists(atPath: initrdPath.path)
     }
 
+    /// Identity of this runtime for the build cache.
+    ///
+    /// A `RUN` layer is only replayable under the runtime that captured
+    /// it : `cocker-init` decides what the guest filesystem looks like
+    /// (0.7.13.13 mounted a tmpfs over `/run` and swallowed writes there,
+    /// 0.7.13.14 does not). Folding the initrd and kernel digests in means
+    /// `brew upgrade` invalidates exactly the affected steps by itself,
+    /// with no `--no-cache` to remember.
+    func buildFingerprint() -> String {
+        BuildRuntimeFingerprint.forRuntime(
+            kernel: kernelPath,
+            initrd: initrdPath,
+            legacyBuildPath: ProcessInfo.processInfo.environment["COCKER_BUILD_LEGACY"] != nil
+        )
+    }
+
     // MARK: - VM creation
 
     func createVM(for container: Container, rootfsPath: URL, stdoutPipe: Pipe) async throws -> VZVirtualMachine {
