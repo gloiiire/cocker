@@ -517,12 +517,6 @@ actor DockerfileBuilder {
         let healthcheck: Healthcheck?
     }
 
-    /// Rolling cache key for the build state at the current step. Updated
-    /// after every RUN / COPY by hashing (previousKey || instruction).
-    /// Layer cache hits skip the expensive RUN; misses execute and store
-    /// the new state under this key.
-    private var stepCacheKey: String = "init"
-
     struct CreatedLayer {
         let digest: String
         let size: Int
@@ -821,7 +815,13 @@ actor DockerfileBuilder {
                 // key is rolled forward by hashing (previousKey || step)
                 // so a divergence at any step invalidates everything
                 // downstream — matches docker's behaviour.
-                let stepHash = self.advanceCacheKey("RUN " + command)
+                let stepHash = Self.runCacheKey(
+                    command: command,
+                    parentLayers: layers.map(\.digest),
+                    workdir: workdir,
+                    user: user,
+                    env: env
+                )
                 let buildRoot = await imageManager.daemonRootDir()
                 if config.noCache == false,
                    let cached = try await BuildCache.lookup(key: stepHash, root: buildRoot) {
@@ -1129,14 +1129,24 @@ actor DockerfileBuilder {
                         // `cocker build` (not via compose) and any non-iCloud
                         // build also honors the ignore file.
                         let entries: [URL] = applyIgnore
-                            ? rawEntries.filter { !Self.isIgnoredPath($0.lastPathComponent, patterns: ignorePatterns) }
+                            ? rawEntries.filter {
+                                !Self.isIgnoredPath(
+                                    Self.relativePath(of: $0, under: sourceRoot),
+                                    patterns: ignorePatterns)
+                            }
                             : rawEntries
                         for entry in entries {
                             let entryDst = dstURL.appendingPathComponent(entry.lastPathComponent)
                             if FileManager.default.fileExists(atPath: entryDst.path) {
                                 try? FileManager.default.removeItem(at: entryDst)
                             }
-                            try Self.copyTree(from: entry, to: entryDst)
+                            if applyIgnore {
+                                try Self.copyTreeRespectingIgnore(
+                                    from: entry, to: entryDst,
+                                    contextRoot: sourceRoot, patterns: ignorePatterns)
+                            } else {
+                                try Self.copyTree(from: entry, to: entryDst)
+                            }
                         }
                         let skipped = rawEntries.count - entries.count
                         let skipNote = skipped > 0 ? " (\(skipped) ignored)" : ""
@@ -1158,9 +1168,21 @@ actor DockerfileBuilder {
                             if FileManager.default.fileExists(atPath: merged.path) {
                                 try FileManager.default.removeItem(at: merged)
                             }
-                            try Self.copyTree(from: srcURL, to: merged)
+                            if applyIgnore {
+                                try Self.copyTreeRespectingIgnore(
+                                    from: srcURL, to: merged,
+                                    contextRoot: sourceRoot, patterns: ignorePatterns)
+                            } else {
+                                try Self.copyTree(from: srcURL, to: merged)
+                            }
                         } else {
-                            try Self.copyTree(from: srcURL, to: dstURL)
+                            if applyIgnore {
+                                try Self.copyTreeRespectingIgnore(
+                                    from: srcURL, to: dstURL,
+                                    contextRoot: sourceRoot, patterns: ignorePatterns)
+                            } else {
+                                try Self.copyTree(from: srcURL, to: dstURL)
+                            }
                         }
                         // No " ---> COPY src -> dst" echo here : the "Step N/M :
                         // COPY ..." header already announced this instruction, so
@@ -1461,6 +1483,35 @@ actor DockerfileBuilder {
         }
     }
 
+    private static func relativePath(of url: URL, under root: URL) -> String {
+        let normalizedRoot = root.standardizedFileURL.path
+        let prefix = normalizedRoot.hasSuffix("/") ? normalizedRoot : normalizedRoot + "/"
+        let path = url.standardizedFileURL.path
+        return path.hasPrefix(prefix) ? String(path.dropFirst(prefix.count)) : url.lastPathComponent
+    }
+
+    private static func copyTreeRespectingIgnore(
+        from src: URL, to dst: URL, contextRoot: URL, patterns: [String]
+    ) throws {
+        let rel = relativePath(of: src, under: contextRoot)
+        guard !isIgnoredPath(rel, patterns: patterns) else { return }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: src.path, isDirectory: &isDirectory) else { return }
+        if !isDirectory.boolValue {
+            try copyTree(from: src, to: dst)
+            return
+        }
+        try FileManager.default.createDirectory(at: dst, withIntermediateDirectories: true)
+        for child in try FileManager.default.contentsOfDirectory(
+            at: src, includingPropertiesForKeys: nil, options: []) {
+            try copyTreeRespectingIgnore(
+                from: child,
+                to: dst.appendingPathComponent(child.lastPathComponent),
+                contextRoot: contextRoot,
+                patterns: patterns)
+        }
+    }
+
     // MARK: - .dockerignore / .cockerignore support
 
     /// Parse `.cockerignore` (preferred) or `.dockerignore` at the build
@@ -1515,20 +1566,34 @@ actor DockerfileBuilder {
         // shouldn't require `**/node_modules` to match nested copies).
         let path = path.hasPrefix("/") ? String(path.dropFirst()) : path
 
-        // Direct match on full path
-        if fnmatchMatch(pat, path) { return true }
-        // Match as prefix (so `node_modules` excludes `node_modules/foo/bar`)
-        if fnmatchMatch(pat, path) || path.hasPrefix(pat + "/") { return true }
-        // Bare-basename anywhere : prepend `**/` if no slash in pattern
-        if !pat.contains("/") {
-            if fnmatchMatch("**/" + pat, path) { return true }
-            if path.hasSuffix("/" + pat) { return true }
-            // any segment equals pat
-            for seg in path.split(separator: "/") where String(seg) == pat {
-                return true
+        let rooted = pat.contains("/") ? pat : "**/" + pat
+        var regex = "^"
+        var index = rooted.startIndex
+        while index < rooted.endIndex {
+            let ch = rooted[index]
+            let next = rooted.index(after: index)
+            if ch == "*", next < rooted.endIndex, rooted[next] == "*" {
+                let afterDouble = rooted.index(after: next)
+                if afterDouble < rooted.endIndex, rooted[afterDouble] == "/" {
+                    regex += "(?:.*/)?"
+                    index = rooted.index(after: afterDouble)
+                } else {
+                    regex += ".*"
+                    index = afterDouble
+                }
+            } else if ch == "*" {
+                regex += "[^/]*"
+                index = next
+            } else if ch == "?" {
+                regex += "[^/]"
+                index = next
+            } else {
+                regex += NSRegularExpression.escapedPattern(for: String(ch))
+                index = next
             }
         }
-        return false
+        regex += "(?:/.*)?$"
+        return path.range(of: regex, options: .regularExpression) != nil
     }
 
     private static func fnmatchMatch(_ pattern: String, _ name: String) -> Bool {
@@ -1921,16 +1986,23 @@ actor DockerfileBuilder {
         return Double(trimmed)
     }
 
-    /// Roll the cache key forward by appending the current instruction's
-    /// textual form. Same input sequence → same SHA. Returns the new key
-    /// so the caller can use it as a one-shot.
-    func advanceCacheKey(_ step: String) -> String {
+    /// A RUN cache entry is valid only for the exact parent filesystem and
+    /// execution context. In particular, a changed COPY layer must invalidate
+    /// the following RUN even when the instruction text is unchanged.
+    nonisolated static func runCacheKey(
+        command: String, parentLayers: [String], workdir: String,
+        user: String, env: [String: String]
+    ) -> String {
         var hasher = SHA256()
-        hasher.update(data: Data(stepCacheKey.utf8))
-        hasher.update(data: Data(step.utf8))
-        let next = hasher.finalize().hexString
-        stepCacheKey = next
-        return next
+        for layer in parentLayers {
+            hasher.update(data: Data((layer + "\n").utf8))
+        }
+        hasher.update(data: Data(("RUN\n" + command + "\nWD\n" + workdir
+            + "\nUSER\n" + user + "\n").utf8))
+        for key in env.keys.sorted() {
+            hasher.update(data: Data((key + "=" + (env[key] ?? "") + "\n").utf8))
+        }
+        return hasher.finalize().hexString
     }
 }
 

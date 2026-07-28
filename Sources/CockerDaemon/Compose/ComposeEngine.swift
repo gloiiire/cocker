@@ -470,6 +470,7 @@ actor ComposeEngine {
             var config = BuildConfig(contextPath: context, tag: tag)
             config.dockerfile = dockerfile
             config.buildArgs = buildSpec.args ?? [:]
+            config.noCache = request.noCache
             _ = try await containerEngine.images.build(config: config, vmRuntime: containerEngine.vmRuntime) { event in
                 progressHandler(event)
             }

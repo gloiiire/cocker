@@ -116,6 +116,29 @@ static char *top_level_value(char *buf, const char *key) {
     return NULL;
 }
 
+static int top_level_string_copy(char *buf, const char *key,
+                                 char *out, size_t out_size) {
+    char *p = top_level_value(buf, key);
+    if (!p || *p != '"' || out_size == 0) return 0;
+    p++;
+    size_t n = 0;
+    while (*p && *p != '"' && n + 1 < out_size) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            if (*p == 'n') out[n++] = '\n';
+            else if (*p == 't') out[n++] = '\t';
+            else if (*p == 'r') out[n++] = '\r';
+            else out[n++] = *p;
+            p++;
+        } else {
+            out[n++] = *p++;
+        }
+    }
+    if (*p != '"') return 0;
+    out[n] = '\0';
+    return 1;
+}
+
 /* Very small in-place JSON scanner — handles the two specific shapes
  * cockerd sends (`{"cmd":[...],"env":{...},"tty":bool}` in any key order).
  * Not a general decoder.
@@ -341,7 +364,11 @@ static void handle_one(int client_fd) {
 
     char *argv[MAX_ARGV];
     char *env_out[MAX_ENV];
+    char workdir[4096] = "";
+    char user[256] = "";
     int tty = 0;
+    (void)top_level_string_copy(buf, "workdir", workdir, sizeof(workdir));
+    (void)top_level_string_copy(buf, "user", user, sizeof(user));
     int argc = parse_exec_request(buf, (size_t)r, argv, MAX_ARGV, env_out, MAX_ENV, &tty);
     if (argc == 0) {
         const char *err = "parse error\n__COCKER_EXIT__2\n";
@@ -404,6 +431,19 @@ static void handle_one(int client_fd) {
         }
 
         for (int i = 0; env_out[i]; i++) putenv(env_out[i]);
+
+        if (workdir[0] && chdir(workdir) != 0) {
+            fprintf(stderr, "[cocker-init] chdir %s: %s\n", workdir, strerror(errno));
+            _exit(126);
+        }
+        if (user[0]) {
+            unsigned int uid = 0, gid = 0;
+            if (spec_resolve_user(user, &uid, &gid) != 0
+                || setgid((gid_t)gid) != 0 || setuid((uid_t)uid) != 0) {
+                fprintf(stderr, "[cocker-init] user %s: %s\n", user, strerror(errno));
+                _exit(126);
+            }
+        }
 
         execvp(argv[0], argv);
         fprintf(stderr, "[cocker-init] exec %s: %s\n", argv[0], strerror(errno));
