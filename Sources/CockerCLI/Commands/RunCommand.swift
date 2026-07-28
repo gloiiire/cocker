@@ -196,12 +196,22 @@ struct RunCommand: AsyncParsableCommand {
             for p in config.ports {
                 header.append("   " + UX.TTY.paint("http://localhost:\(p.hostPort)", .accent))
             }
+            let cid = result.containerID
             let footer = InteractiveFooter()
             footer.armStreaming(
-                footerLines(header: header, detachable: false),
-                onQuit: {
-                    print("\n" + UX.TTY.paint("Detached.", .dim) + " "
+                footerLines(header: header, detachable: true),
+                onDetach: {
+                    // `d` = detach : leave the container running, return the shell.
+                    print(UX.TTY.paint("Detached.", .dim) + " "
                         + UX.TTY.paint("Container keeps running — `cocker logs -f \(name)` to follow, `cocker stop \(name)` to stop.", .dim))
+                    return true
+                },
+                onQuit: {
+                    // `q` / Ctrl-C = quit for real : stop the container.
+                    if let req = try? IPCRequest(type: .stop, payload: ContainerIDRequest(id: cid)) {
+                        _ = try? await IPCClient().send(req)
+                    }
+                    print("\n" + UX.TTY.paint("Stopped \(name).", .dim))
                 })
 
             let logsReq = LogsRequest(id: result.containerID, follow: true, tail: 0)

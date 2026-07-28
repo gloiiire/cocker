@@ -292,15 +292,17 @@ Every command that **holds the terminal** offers single-keypress controls (cbrea
 
 | Key | Meaning | Offered by |
 |-----|---------|------------|
-| `q` | **Quit** the foreground view and return to the shell. Whatever was started keeps running (containers stay up, the daemon keeps running) — you only detach the *viewer*. | every holding command |
-| `d` | **Detach** into a persistent background process you can re-attach to later. | only where a real re-attachable background exists — today just `compose watch` (`--attach` brings it back) |
+| `d` | **Detach** — leave everything you started **running** and return the shell. Containers stay up under the daemon ; `compose watch` additionally keeps a background watcher you re-attach to with `--attach`. | commands that **start** something : `compose up`, `run`, `compose watch` |
+| `q` | **Quit for real** — tear down what *this command* started, then return the shell. `compose up` / `watch` → `compose down` (stop + remove the project). `run` → stop the container. On a pure **viewer** (`logs`, `events`) there's nothing you started, so `q` just closes the view. | every holding command |
 | `Ctrl-C` | Same as `q` (kept working via `ISIG`). | every holding command |
+
+The crux : **`q` never surprises** — on a viewer it only closes the view ; on a start-command it does exactly what you'd expect "quit" to do (stop the thing). **`d` never stops anything** — it always leaves it running. The two are genuinely distinct actions, so both are shown (`press d detach · q quit`) on start-commands ; viewers show `press q quit` alone.
 
 Rules :
 - **Always restore the terminal** to cooked mode on *every* exit path (`q`, `d`, Ctrl-C, error, normal end). Never leave the shell in raw mode.
-- `d` is offered **only** when detaching means something distinct from quitting (a background process persists). Elsewhere, offer `q` alone — don't show two keys that do the same thing.
-- The hint row reads `press q quit` (or `press d detach · q quit` when detachable), `q`/`d` in `accent`, the rest `dim`.
-- **Off-TTY** (pipe, CI, redirected) : no raw mode, no hint row, no keys — see §10. `logs -f | grep` must stay clean.
+- `q` / Ctrl-C teardown runs **async** (an IPC round-trip to the daemon : `composeDown` / `stop`) *before* the process exits ; the footer is erased and a one-line result is printed.
+- The hint row reads `press q quit` (viewers) or `press d detach · q quit` (start-commands), `q`/`d` in `accent`, the rest `dim`.
+- **Off-TTY** (pipe, CI, redirected) : no raw mode, no hint row, no keys — see §10. `logs -f | grep` must stay clean, and a piped `compose up` never tears down on its own.
 - **Never** put stdin in cbreak for commands that forward stdin to a container (`exec -it`, an interactive `attach`) — it would steal the user's keystrokes.
 
 ---
