@@ -45,10 +45,15 @@ actor VolumeManager {
         let volDir = volumesRoot.appendingPathComponent(request.name)
         try FileManager.default.createDirectory(at: volDir, withIntermediateDirectories: true)
         let imgURL = volDir.appendingPathComponent("data.img")
-        let fd = open(imgURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        // 0600 : the image holds the container's raw filesystem (database
+        // files, secrets). `open()`'s mode argument IS masked by umask, so
+        // fchmod after a successful open guarantees owner-only regardless of
+        // the daemon's umask.
+        let fd = open(imgURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
         guard fd >= 0 else {
             throw CockerError.requestFailed("create volume \(request.name): \(String(cString: strerror(errno)))")
         }
+        _ = fchmod(fd, 0o600)
         let rc = ftruncate(fd, off_t(Self.defaultImgSize))
         close(fd)
         guard rc == 0 else {

@@ -19,14 +19,37 @@ public actor RegistryClient {
         credentials[registry] = (username, password)
     }
 
+    /// Whether `host` is a loopback or RFC1918 private-network address — i.e.
+    /// a registry we may reach over plain http.
+    ///
+    /// This must NOT be a string-prefix test. `host.hasPrefix("172.")` spans
+    /// all of 172.0.0.0/8, most of which is *public* internet (the private
+    /// block is only 172.16.0.0/12). The old prefix check let cocker classify
+    /// a public host as local and send it Bearer/Basic credentials over
+    /// cleartext http — a TLS-stripping credential leak. We parse the dotted
+    /// quad and match the actual RFC1918 / loopback ranges; any hostname or
+    /// IPv6 literal is treated as remote (https) to fail safe.
+    static func isLocalRegistry(_ host: String) -> Bool {
+        if host == "localhost" { return true }
+        let parts = host.split(separator: ".")
+        guard parts.count == 4,
+              let a = UInt8(parts[0]), let b = UInt8(parts[1]),
+              UInt8(parts[2]) != nil, UInt8(parts[3]) != nil else {
+            return false
+        }
+        if a == 127 { return true }                          // 127.0.0.0/8 loopback
+        if a == 10 { return true }                           // 10.0.0.0/8
+        if a == 192 && b == 168 { return true }              // 192.168.0.0/16
+        if a == 172 && (16...31).contains(b) { return true } // 172.16.0.0/12
+        return false
+    }
+
     /// Build a base v2 URL for `ref`. Local / private-network registries get
     /// plain http (they don't terminate TLS) ; everything else gets https.
     /// Centralises the rule so push / pull / blob fetches all agree.
     private func v2URL(ref: ImageReference, path: String) -> URL? {
         let host = ref.registry.split(separator: ":").first.map(String.init) ?? ref.registry
-        let scheme: String = (host == "localhost" || host == "127.0.0.1"
-            || host.hasPrefix("10.") || host.hasPrefix("192.168.") || host.hasPrefix("172."))
-            ? "http" : "https"
+        let scheme: String = Self.isLocalRegistry(host) ? "http" : "https"
         return URL(string: "\(scheme)://\(ref.registry)/v2/\(ref.repository)/\(path)")
     }
 
@@ -147,14 +170,17 @@ public actor RegistryClient {
         var req = URLRequest(url: url)
         req.httpMethod = "HEAD"
         if let token { req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        // Some registries (local registry:2) accept plain http on localhost ;
-        // upgrade transparently if the https scheme errors out.
         do {
             let (_, response) = try await session.data(for: req)
             return (response as? HTTPURLResponse)?.statusCode == 200
         } catch {
-            // Retry over http if https fails — important for `127.0.0.1:5000`
-            // style local registries.
+            // Fall back to plain http ONLY for a local / private registry
+            // (e.g. 127.0.0.1:5000 registry:2). NEVER downgrade — and never
+            // resend the bearer token in cleartext — for a public host: an
+            // on-path attacker who fails the https attempt would otherwise
+            // strip TLS and read the push credential off the wire.
+            let host = ref.registry.split(separator: ":").first.map(String.init) ?? ref.registry
+            guard Self.isLocalRegistry(host) else { throw error }
             guard let httpURL = URL(string: "http://\(ref.registry)/v2/\(ref.repository)/blobs/\(digest)") else { return false }
             var req2 = URLRequest(url: httpURL); req2.httpMethod = "HEAD"
             if let token { req2.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
@@ -213,14 +239,10 @@ public actor RegistryClient {
     /// Build the v2 base URL, trying https first and falling back to http for
     /// localhost-style registries that don't terminate TLS.
     private func pushURL(ref: ImageReference, path: String) throws -> URL {
-        // Local + bare-IP registries are typically plain-text http.
+        // Local + private-network registries are typically plain-text http.
         let scheme: String = {
             let host = ref.registry.split(separator: ":").first.map(String.init) ?? ref.registry
-            if host == "localhost" || host == "127.0.0.1" || host.hasPrefix("10.")
-                || host.hasPrefix("192.168.") || host.hasPrefix("172.") {
-                return "http"
-            }
-            return "https"
+            return Self.isLocalRegistry(host) ? "http" : "https"
         }()
         guard let url = URL(string: "\(scheme)://\(ref.registry)/v2/\(ref.repository)/\(path)") else {
             throw CockerError.layerDownloadFailed(ref.repository, "bad push URL for \(ref.fullName)")
@@ -286,11 +308,7 @@ public actor RegistryClient {
         // typically plain http ; everything else gets https.
         let scheme: String = {
             let host = registry.split(separator: ":").first.map(String.init) ?? registry
-            if host == "localhost" || host == "127.0.0.1" || host.hasPrefix("10.")
-                || host.hasPrefix("192.168.") || host.hasPrefix("172.") {
-                return "http"
-            }
-            return "https"
+            return Self.isLocalRegistry(host) ? "http" : "https"
         }()
         guard let url = URL(string: "\(scheme)://\(registry)/v2/") else { return nil }
         var req = URLRequest(url: url)

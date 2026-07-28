@@ -46,7 +46,12 @@ func main() async {
 
     let rootURL = URL(fileURLWithPath: rootDir)
 
-    // Create data directories
+    // Create data directories, owner-only (0700). These hold volume disk
+    // images (a container's raw database files + any secrets it writes),
+    // pulled layer blobs, and the kernel — none of it should be readable by
+    // other local accounts. `createDirectory`'s `attributes` are applied
+    // directly and are NOT masked by umask, unlike bare `open()`/`mkdir`,
+    // so this reliably yields 0700 even with a permissive umask.
     do {
         let dirs = [
             rootURL,
@@ -58,7 +63,29 @@ func main() async {
             rootURL.appendingPathComponent("tmp"),
         ]
         for dir in dirs {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: dir,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
+        }
+        // Migration for installs created before the 0700/0600 hardening :
+        // `attributes` above only affects freshly-created dirs, so tighten
+        // the existing tree and any world-readable volume images in place.
+        // Best-effort — a chmod failure must not stop the daemon booting.
+        for dir in dirs {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        }
+        let volumesRoot = rootURL.appendingPathComponent("volumes")
+        if let volDirs = try? FileManager.default.contentsOfDirectory(
+            at: volumesRoot, includingPropertiesForKeys: nil) {
+            for volDir in volDirs {
+                let img = volDir.appendingPathComponent("data.img")
+                if FileManager.default.fileExists(atPath: img.path) {
+                    try? FileManager.default.setAttributes(
+                        [.posixPermissions: 0o600], ofItemAtPath: img.path)
+                }
+            }
         }
     } catch {
         fputs("Failed to create data directories: \(error)\n", stderr)

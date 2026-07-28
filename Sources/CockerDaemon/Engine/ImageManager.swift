@@ -1653,10 +1653,22 @@ actor DockerfileBuilder {
 
         do {
             try proc.run()
+            // Drain BOTH pipes concurrently before waiting. A RUN step
+            // (verbose npm/pip install, compiler output) routinely prints far
+            // more than the ~64 KB pipe buffer across stdout+stderr; reading
+            // one fully before the other — or reading only after
+            // waitUntilExit() — would deadlock the daemon against the pipe
+            // nobody is reading yet. `async let` reads stdout in a child task
+            // while we read stderr here, then we join.
+            let outHandle = outPipe.fileHandleForReading
+            let errHandle = errPipe.fileHandleForReading
+            async let outBytesAsync: Data = outHandle.readDataToEndOfFile()
+            let errBytes = errHandle.readDataToEndOfFile()
+            let outBytes = await outBytesAsync
             proc.waitUntilExit()
 
-            let out = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let out = String(data: outBytes, encoding: .utf8) ?? ""
+            let err = String(data: errBytes, encoding: .utf8) ?? ""
 
             if !out.isEmpty { log(.stdout, out) }
             if !err.isEmpty { log(.stderr, err) }
@@ -1723,10 +1735,13 @@ actor DockerfileBuilder {
         let errPipe = Pipe()
         proc.standardError = errPipe
         try proc.run()
+        // Drain stderr before waiting so a flood of tar warnings can't fill
+        // the ~64 KB pipe buffer and deadlock against the unread reader.
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
 
         if proc.terminationStatus != 0 {
-            let errMsg = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let errMsg = String(data: errData, encoding: .utf8) ?? ""
             throw CockerError.buildFailed("tar failed: \(errMsg)")
         }
 
@@ -2042,9 +2057,12 @@ enum BuildCache {
         let errPipe = Pipe()
         proc.standardError = errPipe
         try proc.run()
+        // Drain stderr before waiting to avoid a full-pipe deadlock (see the
+        // tar sites above).
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         proc.waitUntilExit()
         if proc.terminationStatus != 0 {
-            let e = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let e = String(data: errData, encoding: .utf8) ?? ""
             throw CockerError.buildFailed("apply layer to rootfs: \(e)")
         }
 
