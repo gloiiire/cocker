@@ -318,20 +318,23 @@ final class DockerAPITLSListener {
                     chunk = d
                 }
                 buffer.append(chunk)
-                // Bound the header section : until we've seen the blank line
-                // that ends the headers, refuse to accumulate more than the
-                // shared cap. Mirrors the fd parser (which stops at the same
-                // 64 KiB) and stops a client from exhausting memory by never
-                // terminating the header block. Reachable unauthenticated if
-                // COCKER_TCP_TLS_NO_CLIENT_AUTH disables mTLS, so it matters.
-                if headerEnd == nil && buffer.count > HTTPLimits.maxHeaderBytes {
-                    CockerLog.shared.warn("docker-api-tls", "header section exceeded \(HTTPLimits.maxHeaderBytes) bytes")
-                    conn.cancel()
-                    return
-                }
-                // Find header terminator if we don't have it yet.
+                // Bound the HEADER section (everything before the blank
+                // \r\n\r\n line). Once the terminator is seen, measure against
+                // the ACTUAL header length — NOT raw buffer.count, which also
+                // counts body bytes that can arrive in the same receive (or
+                // when the terminator straddles chunks) and would wrongly
+                // reject a request whose headers are within the cap. While no
+                // terminator has appeared, buffer.count IS the header size, so
+                // the same cap guards the never-terminated case — a memory
+                // exhaustion attack, reachable unauthenticated when
+                // COCKER_TCP_TLS_NO_CLIENT_AUTH disables mTLS.
                 if headerEnd == nil {
                     if let r = buffer.range(of: Data([0x0D, 0x0A, 0x0D, 0x0A])) {
+                        if r.lowerBound > HTTPLimits.maxHeaderBytes {
+                            CockerLog.shared.warn("docker-api-tls", "header section exceeded \(HTTPLimits.maxHeaderBytes) bytes")
+                            conn.cancel()
+                            return
+                        }
                         headerEnd = r.lowerBound
                         // Parse Content-Length from headers.
                         if let head = String(data: buffer.subdata(in: 0..<r.lowerBound), encoding: .utf8) {
@@ -347,6 +350,12 @@ final class DockerAPITLSListener {
                             conn.cancel()
                             return
                         }
+                    } else if buffer.count > HTTPLimits.maxHeaderBytes {
+                        // No terminator yet and already over the cap → the
+                        // client is never going to end the header block.
+                        CockerLog.shared.warn("docker-api-tls", "header section exceeded \(HTTPLimits.maxHeaderBytes) bytes")
+                        conn.cancel()
+                        return
                     }
                 }
             }
