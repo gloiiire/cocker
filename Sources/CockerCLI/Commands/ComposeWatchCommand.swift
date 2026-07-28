@@ -102,7 +102,16 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         // A detached watch already owns this project — a second foreground
         // watcher would race it (double rebuilds on every save). Point the
         // user at --attach instead of silently starting a rival loop.
-        if !attach, let existing = Self.livePID(projectDir: projectDir) {
+        //
+        // BUT : the detached child we spawn (see detachAndExit) re-runs this
+        // exact command, and its parent writes the pidfile with the *child's*
+        // pid. Without the marker below the child reads that pidfile, sees its
+        // OWN pid, concludes "a watch is already running", prints the warning
+        // into watch.log and exits — so the background watch dies the instant
+        // it starts (racily, depending on whether the parent won the write).
+        // The env marker lets the legitimate child through.
+        let isDetachedChild = ProcessInfo.processInfo.environment["COCKER_WATCH_DETACHED_CHILD"] == "1"
+        if !attach, !isDetachedChild, let existing = Self.livePID(projectDir: projectDir) {
             UX.Warning.emit(
                 "a detached watch is already running (pid \(existing))",
                 note: "re-attach with `cocker compose watch --attach`, or stop it with `cocker compose watch --stop`"
@@ -249,16 +258,25 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             print("No log file yet at \(log).")
             return
         }
-        // exec tail -f so the user gets the native scrolling experience
-        // (Ctrl-C → SIGINT → tail exits cleanly). Swift can't bridge
-        // varargs `execl`, so we materialize a NULL-terminated argv
-        // array for `execv`.
-        let argv: [UnsafeMutablePointer<CChar>?] = [
-            strdup("tail"),
-            strdup("-f"),
-            strdup(log),
-            nil,
-        ]
+        // Only FOLLOW (`-f`) when a watch is actually running — otherwise
+        // `tail -f` would block forever on a static file that nothing will
+        // ever append to, hijacking the terminal (the exact "it won't give me
+        // my terminal back" bug). With no live watch, dump the tail and exit.
+        let following = Self.livePID(projectDir: projectDir) != nil
+        // Reset SIGINT to its default so the exec'd `tail` always dies on
+        // Ctrl-C, regardless of any SIG_IGN disposition inherited from an
+        // interactive footer session earlier in this process.
+        signal(SIGINT, SIG_DFL)
+        // exec tail so the user gets the native scrolling experience. Swift
+        // can't bridge varargs `execl`, so we materialize a NULL-terminated
+        // argv array for `execv`.
+        let argv: [UnsafeMutablePointer<CChar>?]
+        if following {
+            argv = [strdup("tail"), strdup("-f"), strdup(log), nil]
+        } else {
+            print(" " + UX.TTY.paint("no watch running — last log lines (not following)", .dim, [.italic]))
+            argv = [strdup("tail"), strdup("-n"), strdup("200"), strdup(log), nil]
+        }
         _ = execv("/usr/bin/tail", argv)
         throw CockerError.requestFailed("exec tail: \(String(cString: strerror(errno)))")
     }
@@ -318,6 +336,13 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         proc.standardInput = FileHandle.nullDevice
         proc.standardOutput = logHandle
         proc.standardError = logHandle
+        // Mark the child so its own run() doesn't mistake the pidfile we're
+        // about to write (which holds the child's pid) for a rival watch and
+        // bail out immediately. Without this the background watch dies the
+        // instant it starts.
+        var childEnv = ProcessInfo.processInfo.environment
+        childEnv["COCKER_WATCH_DETACHED_CHILD"] = "1"
+        proc.environment = childEnv
 
         try proc.run()
         let pid = proc.processIdentifier
