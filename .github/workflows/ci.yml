@@ -357,6 +357,8 @@ jobs:
           ./.build/release/cocker daemon start
           sleep 2
           ./.build/release/cocker run --rm alpine echo "ci-smoke-ok"
+          COCKER="$(pwd)/.build/release/cocker" \
+            bash tests/e2e/06-image-run-directory.sh
           ./.build/release/cocker daemon stop
       - name: Smoke skipped (no kernel on runner)
         if: steps.kernel.outputs.available != 'true'
