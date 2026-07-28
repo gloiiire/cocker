@@ -129,36 +129,46 @@ struct ComposeUpCommand: AsyncParsableCommand {
             return
         }
 
-        // Foreground mode : after the up sequence finishes, attach to the
-        // composed containers' logs and let the user hit `d` to detach
-        // without tearing the project down. Matches `docker compose up`'s
-        // "Attached to N containers" experience.
-        _ = try await InteractiveDetach.run { token in
-            do {
-                try await client.sendStreaming(request) { event in
-                    if case .error = event.stream { fail.trip() }
-                    if let view {
-                        view.ingest(stream: event.stream, line: event.data)
-                    } else {
-                        renderComposeEvent(event)
-                    }
+        // Foreground mode : stream the up sequence, then hold the terminal
+        // with a sticky footer (service URLs + `q` to quit) — the same model
+        // as compose watch / run, via UX.InteractiveFooter. Quitting leaves
+        // the containers running (cocker never tears them down on CLI exit).
+        // Off-TTY the footer prints once and we return immediately.
+        let urls = ServiceURLs()
+        do {
+            try await client.sendStreaming(request) { event in
+                if case .error = event.stream { fail.trip() }
+                if case .stdout = event.stream { urls.capture(fromStdout: event.data) }
+                if let view {
+                    view.ingest(stream: event.stream, line: event.data)
+                } else {
+                    renderComposeEvent(event)
                 }
-            } catch {
-                view?.finalize()  // flush buffered build output before the error surfaces (PRO-76)
-                throw error
             }
-            view?.finalize()
-            try fail.throwIfTripped()
-            // After the up call returns the daemon is done building &
-            // starting. From here we attach to the project's running
-            // containers' logs — implemented in a follow-up patch so
-            // the existing teardown-on-exit semantics don't break.
-            // Until then, we simply hold the terminal so the user can
-            // detach cleanly with `d` instead of being dropped back to
-            // the shell the moment up finishes.
-            while !token.isCanceled {
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            }
+        } catch {
+            view?.finalize()  // flush buffered build output before the error surfaces (PRO-76)
+            throw error
+        }
+        view?.finalize()
+        try fail.throwIfTripped()
+
+        let proj = effectiveProjectName ?? "compose"
+        let footer = InteractiveFooter()
+        footer.start(
+            footer: {
+                footerLines(
+                    header: [" " + UX.TTY.paint("→ Running", .progress) + " " + UX.TTY.paint(proj, .accent)],
+                    services: urls.snapshot(),
+                    detachable: false)
+            },
+            onQuit: {
+                print("\n" + UX.TTY.paint("Detached.", .dim) + " "
+                    + UX.TTY.paint("Containers keep running — `cocker compose logs -f` to follow, `cocker compose down` to stop.", .dim))
+            })
+        // Hold the terminal so the footer stays attached ; the key task exits
+        // the process on `q` / Ctrl-C. Off-TTY we don't hold.
+        if footer.animated {
+            while true { try? await Task.sleep(nanoseconds: 200_000_000) }
         }
     }
 
@@ -288,6 +298,8 @@ struct ComposeLogsCommand: AsyncParsableCommand {
         )
         let request = try IPCRequest(type: .composeLogs, payload: payload)
 
+        let footer = InteractiveFooter()
+        if follow { footer.armStreaming(footerLines(detachable: false)) }
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
@@ -295,6 +307,7 @@ struct ComposeLogsCommand: AsyncParsableCommand {
             default: break
             }
         }
+        if follow { footer.restore() }
     }
 }
 
@@ -838,6 +851,8 @@ struct ComposeEventsCommand: AsyncParsableCommand {
         let request = try IPCRequest(type: .events, payload: EmptyPayload())
         let outputJSON = json
 
+        let footer = InteractiveFooter()
+        if !outputJSON { footer.armStreaming(footerLines(detachable: false)) }
         try await client.sendStreaming(request) { event in
             let ts = ISO8601DateFormatter().string(from: event.timestamp)
             // Filter events relevant to this project
@@ -853,6 +868,7 @@ struct ComposeEventsCommand: AsyncParsableCommand {
                 }
             }
         }
+        if !outputJSON { footer.restore() }
     }
 }
 

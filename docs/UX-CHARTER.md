@@ -238,6 +238,19 @@ Example `cocker compose up` :
  ✓ Container  myapp_web_1         Started     2.3s
 ```
 
+### 8.3.1 Service-URL footer
+
+Commands that **start containers publishing ports and then hold the terminal** (`compose up`, `compose watch`, `run --publish`) append a sticky **footer** under the sticky table, redrawn at the bottom after every event so it's always in view without scrolling :
+
+```
+ → Running    myapp
+   myapp_api_1    http://localhost:8000
+   myapp_web_1    http://localhost:3000
+   press q quit
+```
+
+One `name   http://localhost:<port>` row per published service (name padded, URL in `accent`). The last row is the interactive-keys hint (§9.4). All of this lives in one shared primitive (`UX.InteractiveFooter`) so every holding command looks identical.
+
 ### 8.4 Frame budget
 
 Spinners and sticky tables redraw at most every **80ms** (12.5 fps). No matter how fast events arrive, never redraw faster than that — saves CPU and avoids flicker.
@@ -272,6 +285,23 @@ When `--timestamps` is passed :
 ```
 
 Timestamp colored `dim`, RFC3339 format, UTC always.
+
+### 9.4 Interactive keys (`d` / `q`)
+
+Every command that **holds the terminal** offers single-keypress controls (cbreak/no-echo via `termios`, `ISIG` kept so Ctrl-C still works). One contract, everywhere — all of it flows through `UX.InteractiveFooter` :
+
+| Key | Meaning | Offered by |
+|-----|---------|------------|
+| `q` | **Quit** the foreground view and return to the shell. Whatever was started keeps running (containers stay up, the daemon keeps running) — you only detach the *viewer*. | every holding command |
+| `d` | **Detach** into a persistent background process you can re-attach to later. | only where a real re-attachable background exists — today just `compose watch` (`--attach` brings it back) |
+| `Ctrl-C` | Same as `q` (kept working via `ISIG`). | every holding command |
+
+Rules :
+- **Always restore the terminal** to cooked mode on *every* exit path (`q`, `d`, Ctrl-C, error, normal end). Never leave the shell in raw mode.
+- `d` is offered **only** when detaching means something distinct from quitting (a background process persists). Elsewhere, offer `q` alone — don't show two keys that do the same thing.
+- The hint row reads `press q quit` (or `press d detach · q quit` when detachable), `q`/`d` in `accent`, the rest `dim`.
+- **Off-TTY** (pipe, CI, redirected) : no raw mode, no hint row, no keys — see §10. `logs -f | grep` must stay clean.
+- **Never** put stdin in cbreak for commands that forward stdin to a container (`exec -it`, an interactive `attach`) — it would steal the user's keystrokes.
 
 ---
 

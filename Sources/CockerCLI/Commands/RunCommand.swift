@@ -187,7 +187,23 @@ struct RunCommand: AsyncParsableCommand {
         if detach {
             print(result.containerID)
         } else {
-            // Attach to container output
+            // Foreground : show a one-shot header (published URLs + `q` to
+            // quit), then stream the container's logs. `q` / Ctrl-C detach the
+            // viewer and restore the terminal ; the container keeps running.
+            // Shared model with compose up / watch via UX.InteractiveFooter.
+            let name = config.name ?? String(result.containerID.prefix(12))
+            var header = [" " + UX.TTY.paint("→ Running", .progress) + " " + UX.TTY.paint(name, .accent)]
+            for p in config.ports {
+                header.append("   " + UX.TTY.paint("http://localhost:\(p.hostPort)", .accent))
+            }
+            let footer = InteractiveFooter()
+            footer.armStreaming(
+                footerLines(header: header, detachable: false),
+                onQuit: {
+                    print("\n" + UX.TTY.paint("Detached.", .dim) + " "
+                        + UX.TTY.paint("Container keeps running — `cocker logs -f \(name)` to follow, `cocker stop \(name)` to stop.", .dim))
+                })
+
             let logsReq = LogsRequest(id: result.containerID, follow: true, tail: 0)
             let streamReq = try IPCRequest(type: .logs, payload: logsReq)
             try await client.sendStreaming(streamReq) { event in
@@ -197,6 +213,7 @@ struct RunCommand: AsyncParsableCommand {
                 default: break
                 }
             }
+            footer.restore()
         }
     }
 

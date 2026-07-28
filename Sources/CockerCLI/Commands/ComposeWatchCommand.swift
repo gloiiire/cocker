@@ -110,11 +110,6 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             return
         }
 
-        // Interactive = a real TTY. In pipes, CI, or the detached `-d`
-        // child (stdin = /dev/null) we fall back to plain, non-sticky
-        // output so logs / `tee` stay clean — StickyView already no-ops
-        // off-TTY, and we skip raw-mode keys entirely.
-        let interactive = UX.TTY.current.animationEnabled && isatty(fileno(stdin)) != 0
         let urls = ServiceURLs()
 
         // Charter §12 — name the macOS daemons we're talking to so the user
@@ -124,67 +119,38 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         print(" " + UX.TTY.paint("→ Bringing up", .progress) + " " + UX.TTY.paint(effectiveProjectName, .accent) + " " + UX.TTY.paint("before watching", .dim))
         try await composeUp(originalPath: originalPath, projectName: effectiveProjectName, urls: urls)
 
-        // The interactive "scope" : a sticky footer redrawn at the BOTTOM
-        // after every rebuild, so the service URLs + key hints are always
-        // in view without scrolling. Off-TTY it's printed once, plainly.
-        let footer = UX.StickyView()
-        let raw = RawMode()
-        print("")
-        if interactive {
-            raw.enter()
-            footer.render(watchFooterLines(projectDir: projectDir, debounceMs: debounceMs, urls: urls), force: true)
-        } else {
-            for line in watchFooterLines(projectDir: projectDir, debounceMs: debounceMs, urls: urls) { print(line) }
-            print("")
+        // Interactive "scope" : a sticky footer (service URLs + d/q keys)
+        // redrawn at the bottom after every rebuild. Shared with compose up /
+        // run / logs via UX.InteractiveFooter. Off-TTY it degrades to plain.
+        let dir = projectDir
+        let db = debounceMs
+        let footerContent: @Sendable () -> [String] = {
+            footerLines(
+                header: [" " + UX.TTY.paint("→ Watching", .progress) + " " + UX.TTY.paint(dir, .accent)],
+                services: urls.snapshot(),
+                status: ["   " + UX.TTY.paint("FSEvents", .dim) + "   " + UX.TTY.paint("listening (debounce \(db)ms)", .dim)],
+                detachable: true)
         }
+        print("")
+        let footer = InteractiveFooter()
+        footer.start(
+            footer: footerContent,
+            onDetach: {
+                // `d` → spawn a detached background watch (same as -d) and
+                // exit. If one already runs, detachAndExit refuses and returns
+                // false so the footer re-arms.
+                (try? Self.detachAndExit(projectDir: dir, originalArgs: CommandLine.arguments)) ?? false
+            },
+            onQuit: {
+                print("\n" + UX.TTY.paint("Stopped watching.", .dim) + " "
+                    + UX.TTY.paint("Containers keep running — `cocker compose down` to stop them.", .dim))
+            })
 
         let watcher = FSEventWatcher(path: projectDir, debounceMs: debounceMs)
         let stream = watcher.events()
 
-        // Ctrl-C : restore the terminal to cooked mode BEFORE exiting,
-        // otherwise the user's shell is left in cbreak/no-echo and they
-        // type blind. `Darwin.exit` skips `defer`, so restore here too.
-        let sigSrc = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        signal(SIGINT, SIG_IGN)
-        sigSrc.setEventHandler { raw.restore(); print(""); Darwin.exit(0) }
-        sigSrc.resume()
-
-        // Single-keypress controls, Vite/Next style : `d` detaches (watch
-        // keeps running in the background), `q` quits (containers stay up).
-        // Only when interactive ; reads stdin one byte at a time in cbreak.
-        if interactive {
-            let keyDir = projectDir
-            let keyArgs = CommandLine.arguments
-            let keyDebounce = debounceMs
-            Task.detached(priority: .userInitiated) {
-                let fd = fileno(stdin)
-                var buf = [UInt8](repeating: 0, count: 1)
-                while read(fd, &buf, 1) == 1 {
-                    switch buf[0] {
-                    case UInt8(ascii: "q"), UInt8(ascii: "Q"):
-                        raw.restore()
-                        footer.abandon()
-                        print("\n" + UX.TTY.paint("Stopped watching.", .dim) + " "
-                            + UX.TTY.paint("Containers keep running — `cocker compose down` to stop them.", .dim))
-                        Darwin.exit(0)
-                    case UInt8(ascii: "d"), UInt8(ascii: "D"):
-                        raw.restore()
-                        footer.abandon()
-                        print("")
-                        let spawned = (try? Self.detachAndExit(projectDir: keyDir, originalArgs: keyArgs)) ?? false
-                        if spawned { Darwin.exit(0) }
-                        // Refused (a detached watch already runs) : re-arm keys + footer.
-                        raw.enter()
-                        footer.render(watchFooterLines(projectDir: keyDir, debounceMs: keyDebounce, urls: urls), force: true)
-                    default:
-                        break  // ignore other keys ; Ctrl-C handled by the kernel via ISIG
-                    }
-                }
-            }
-        }
-
         for await batch in stream {
-            if interactive { footer.abandon() }
+            footer.clear()
             let head = UX.TTY.paint(UX.Icon.restart.rawValue, .restart)
             print(" \(head) " + UX.TTY.paint("Change detected", .restart) + " " + UX.TTY.paint("(\(batch.count) file\(batch.count > 1 ? "s" : ""))", .dim))
             let start = Date()
@@ -201,15 +167,9 @@ struct ComposeWatchCommand: AsyncParsableCommand {
                     hint: "check the compose file for syntax errors and try `cocker compose up --build` once manually"
                 )
             }
-            // Re-draw the sticky footer so it's always the last thing on
-            // screen — no scrolling to find the URLs after a rebuild.
-            if interactive {
-                footer.render(watchFooterLines(projectDir: projectDir, debounceMs: debounceMs, urls: urls), force: true)
-            } else {
-                print("")
-            }
+            footer.refresh()  // keep the footer as the last thing on screen
         }
-        raw.restore()
+        footer.restore()
     }
 
     private static func pidFilePath(_ projectDir: String) -> String {
@@ -414,88 +374,6 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         }
         try fail.throwIfTripped()
     }
-}
-
-/// Puts stdin into cbreak/no-echo mode so single keystrokes (`d`, `q`)
-/// arrive without Enter — the same mechanism as `InteractiveDetach`, but
-/// kept live across the watch loop's lifetime. Keeps `ISIG` so Ctrl-C
-/// still raises SIGINT. `restore()` is idempotent and lock-guarded so the
-/// key task and the SIGINT handler can both call it safely.
-final class RawMode: @unchecked Sendable {
-    private let lock = NSLock()
-    private var original = termios()
-    private var active = false
-
-    func enter() {
-        lock.lock(); defer { lock.unlock() }
-        guard !active, isatty(fileno(stdin)) != 0 else { return }
-        guard tcgetattr(fileno(stdin), &original) == 0 else { return }
-        var raw = original
-        raw.c_lflag &= ~(UInt(ICANON) | UInt(ECHO))
-        if tcsetattr(fileno(stdin), TCSANOW, &raw) == 0 { active = true }
-    }
-
-    func restore() {
-        lock.lock(); defer { lock.unlock() }
-        guard active else { return }
-        _ = tcsetattr(fileno(stdin), TCSANOW, &original)
-        active = false
-    }
-}
-
-/// Collects `service -> URL` pairs by scraping the daemon's stdout stream
-/// (the " Container <name> Started (id: …)  -> http://localhost:<port>"
-/// lines). Buffered because stream chunks aren't guaranteed line-aligned.
-/// This is the source for the interactive footer's URL list.
-final class ServiceURLs: @unchecked Sendable {
-    private let lock = NSLock()
-    private var order: [String] = []
-    private var map: [String: String] = [:]
-    private var buffer = ""
-
-    func capture(fromStdout chunk: String) {
-        lock.lock(); defer { lock.unlock() }
-        buffer += chunk
-        while let nl = buffer.firstIndex(of: "\n") {
-            parse(String(buffer[buffer.startIndex..<nl]))
-            buffer.removeSubrange(buffer.startIndex...nl)
-        }
-    }
-
-    private func parse(_ line: String) {
-        guard let cRange = line.range(of: "Container "),
-              let sRange = line.range(of: " Started"),
-              let arrow = line.range(of: " -> "),
-              cRange.upperBound <= sRange.lowerBound else { return }
-        let name = String(line[cRange.upperBound..<sRange.lowerBound])
-            .trimmingCharacters(in: .whitespaces)
-        let url = String(line[arrow.upperBound...]).trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, !url.isEmpty else { return }
-        if map[name] == nil { order.append(name) }
-        map[name] = url
-    }
-
-    func snapshot() -> [(name: String, url: String)] {
-        lock.lock(); defer { lock.unlock() }
-        return order.map { ($0, map[$0] ?? "") }
-    }
-}
-
-/// Builds the interactive footer block (project dir, one line per service
-/// URL, the FSEvents status, and the `d`/`q` key hints).
-private func watchFooterLines(projectDir: String, debounceMs: Int, urls: ServiceURLs) -> [String] {
-    var lines: [String] = []
-    lines.append(" " + UX.TTY.paint("→ Watching", .progress) + " " + UX.TTY.paint(projectDir, .accent))
-    let services = urls.snapshot()
-    let width = services.map { $0.name.count }.max() ?? 0
-    for s in services {
-        let padded = s.name.padding(toLength: max(width, s.name.count), withPad: " ", startingAt: 0)
-        lines.append("   " + padded + "   " + UX.TTY.paint(s.url, .accent))
-    }
-    lines.append("   " + UX.TTY.paint("FSEvents", .dim) + "   " + UX.TTY.paint("listening (debounce \(debounceMs)ms)", .dim))
-    lines.append("   " + UX.TTY.paint("press", .dim) + " " + UX.TTY.paint("d", .accent) + " " + UX.TTY.paint("detach", .dim)
-        + UX.TTY.paint("   ·   ", .dim) + UX.TTY.paint("q", .accent) + " " + UX.TTY.paint("quit", .dim))
-    return lines
 }
 
 /// Watch for changes in a path subtree by wrapping macOS' FSEventStream.
