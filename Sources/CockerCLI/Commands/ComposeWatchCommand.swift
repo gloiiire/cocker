@@ -99,22 +99,25 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             return
         }
 
-        // A detached watch already owns this project — a second foreground
-        // watcher would race it (double rebuilds on every save). Point the
-        // user at --attach instead of silently starting a rival loop.
-        //
-        // The detached child we spawn (see detachAndExit) re-runs this exact
-        // command ; its parent already claimed the pidfile atomically, making
-        // it the one legitimate watcher, so it must skip this guard entirely.
-        // A plain foreground watch (no marker) still honours it — refusing to
-        // race a detached watch that owns the project.
-        let isDetachedChild = ProcessInfo.processInfo.environment["COCKER_WATCH_DETACHED_CHILD"] == "1"
-        if !attach, !isDetachedChild, let existing = Self.livePID(projectDir: projectDir) {
-            UX.Warning.emit(
-                "a detached watch is already running (pid \(existing))",
-                note: "re-attach with `cocker compose watch --attach`, or stop it with `cocker compose watch --stop`"
-            )
-            return
+        // At most one watch loop per project — two watchers both running
+        // `compose up --build` on the same events would race and double-build.
+        // Exclusion is enforced with an advisory flock() on `.cocker/watch.lock`
+        // held for the lifetime of whoever runs the loop (foreground watch OR
+        // the detached child). The kernel releases the lock automatically when
+        // that process dies, so — unlike a hand-rolled pidfile — there is no
+        // stale lock to recover, no unlink race, and no malformed-file wedge.
+        // The pidfile is now just an advisory record of who holds it, written
+        // here so --status / --stop can find us.
+        if !attach {
+            guard Self.acquireWatchLock(projectDir: projectDir) else {
+                UX.Warning.emit(
+                    "a watch is already running for this project",
+                    note: "re-attach with `cocker compose watch --attach`, or stop it with `cocker compose watch --stop`"
+                )
+                return
+            }
+            try? "\(getpid())\n".write(toFile: Self.pidFilePath(projectDir),
+                                       atomically: true, encoding: .utf8)
         }
 
         let urls = ServiceURLs()
@@ -207,32 +210,28 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         return nil
     }
 
-    /// Atomically claim the pidfile so two near-simultaneous `--detach`
-    /// invocations can't both spawn a watcher for the same project. `O_EXCL`
-    /// means exactly one racer wins the create ; a loser refuses when a live
-    /// watch already owns the file, or clears a stale file (via livePID) and
-    /// retries the create once. Returns true iff we now own the pidfile
-    /// (holding our own pid as a placeholder until the real child pid is
-    /// written). The single winner serializes detach registration, which the
-    /// pid-equality guard in run() alone could not (both parents pass their
-    /// initial check before either writes the file).
-    private static func claimPidfile(projectDir: String) -> Bool {
-        let path = pidFilePath(projectDir)
+    /// Held for the lifetime of a watcher process so the kernel keeps its
+    /// flock on `.cocker/watch.lock`. Never closed on purpose — the lock is
+    /// meant to persist until the process exits (at which point the OS drops
+    /// it automatically, so a crashed watcher leaves nothing to clean up).
+    private static var lockFD: Int32 = -1
+
+    /// Acquire the single-watcher lock for `projectDir` with a non-blocking
+    /// exclusive flock. Returns true iff we got it (another live watcher holds
+    /// it → false). Kernel-managed, so it is immune to the stale/malformed/
+    /// unlink races a pidfile-based claim is prone to.
+    private static func acquireWatchLock(projectDir: String) -> Bool {
         try? FileManager.default.createDirectory(
             atPath: projectDir + "/.cocker", withIntermediateDirectories: true)
-        for _ in 0..<2 {
-            let fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0o644)
-            if fd >= 0 {
-                let claim = "\(getpid())\n"
-                _ = claim.withCString { write(fd, $0, strlen($0)) }
-                close(fd)
-                return true
-            }
-            // File exists : a live owner blocks us ; a stale one gets removed
-            // by livePID, after which we loop and retry the exclusive create.
-            if livePID(projectDir: projectDir) != nil { return false }
+        let lockPath = projectDir + "/.cocker/watch.lock"
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o644)
+        if fd < 0 { return false }
+        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+            close(fd)  // someone else holds it
+            return false
         }
-        return false
+        lockFD = fd  // keep open → lock held until this process exits
+        return true
     }
 
     /// Terminate a detached background watcher (SIGTERM, escalate to
@@ -317,18 +316,15 @@ struct ComposeWatchCommand: AsyncParsableCommand {
     /// `false` if it refused because a watch is already running.
     @discardableResult
     private static func detachAndExit(projectDir: String, originalArgs: [String]) throws -> Bool {
-        // Refuse to start a second watch loop for the same project — two
-        // watchers both calling `compose up --build` on the same events would
-        // race and double-rebuild. Claiming the pidfile ATOMICALLY (not just
-        // an livePID check) is what serializes two concurrent `--detach`
-        // calls : without it both pass the check before either registers.
-        guard Self.claimPidfile(projectDir: projectDir) else {
-            if let existing = Self.livePID(projectDir: projectDir) {
-                UX.Warning.emit(
-                    "watch is already running (pid \(existing))",
-                    note: "stop with `cocker compose watch --stop` or follow with `cocker compose watch --logs`"
-                )
-            }
+        // Advisory fast-fail : if a watch is already registered, tell the user
+        // now instead of spawning a child that would just lose the flock race
+        // and exit. Authoritative exclusion is the child's acquireWatchLock()
+        // in run() — this check is only for a friendly immediate message.
+        if let existing = Self.livePID(projectDir: projectDir) {
+            UX.Warning.emit(
+                "watch is already running (pid \(existing))",
+                note: "stop with `cocker compose watch --stop` or follow with `cocker compose watch --logs`"
+            )
             return false
         }
 
@@ -351,7 +347,6 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         try? FileManager.default.createDirectory(atPath: logDir,
                                                  withIntermediateDirectories: true)
         let logPath = Self.logFilePath(projectDir)
-        let pidPath = Self.pidFilePath(projectDir)
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: exePath)
@@ -366,25 +361,12 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         proc.standardInput = FileHandle.nullDevice
         proc.standardOutput = logHandle
         proc.standardError = logHandle
-        // Mark the child : we've already claimed ownership atomically above,
-        // so it is the one legitimate watcher and must skip the "already
-        // running" guard entirely (the pidfile transiently holds our parent
-        // pid until we overwrite it below — a pid-equality check would make
-        // the child bail during that window).
-        var childEnv = ProcessInfo.processInfo.environment
-        childEnv["COCKER_WATCH_DETACHED_CHILD"] = "1"
-        proc.environment = childEnv
 
-        do {
-            try proc.run()
-        } catch {
-            // Spawn failed — release the claim so the project isn't wedged.
-            try? FileManager.default.removeItem(atPath: pidPath)
-            throw error
-        }
+        try proc.run()
         let pid = proc.processIdentifier
-        // Replace our placeholder claim with the real child pid.
-        try? "\(pid)\n".write(toFile: pidPath, atomically: true, encoding: .utf8)
+        // The child registers its own pid in the pidfile once it wins the
+        // flock in run() — we don't write it here, so --status/--stop always
+        // reflect the process that actually holds the lock.
 
         print(UX.ActionLine(
             icon: .success, name: "watch",
