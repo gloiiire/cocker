@@ -440,6 +440,16 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             usleep(50_000)
         }
         guard registered else {
+            // The child never registered, yet it may still be alive and
+            // holding watch.lock — an orphan no command could find or stop.
+            // Kill and reap it (it's still our direct child here; it only
+            // reparents to launchd once we exit) before reporting failure.
+            if proc.isRunning {
+                proc.terminate()
+                for _ in 0..<10 { if !proc.isRunning { break }; usleep(50_000) }
+                if proc.isRunning { kill(pid, SIGKILL) }
+            }
+            proc.waitUntilExit()
             UX.Warning.emit(
                 "could not start background watch — another may already own this project",
                 note: "check `cocker compose watch --status`"
