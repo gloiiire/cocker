@@ -274,11 +274,15 @@ struct ComposeWatchCommand: AsyncParsableCommand {
     /// take over. Used when a foreground watcher hands off to a detached
     /// child via the `d` key — the child must be able to claim the lock.
     private static func releaseWatchLock(projectDir: String) {
+        // Remove our pidfile BEFORE dropping the lock. While we still hold the
+        // flock no other watcher can have acquired it and written its own pid,
+        // so this can only ever delete our own registration — never a new
+        // owner's (which would leave a live watcher undiscoverable).
+        try? FileManager.default.removeItem(atPath: pidFilePath(projectDir))
         if lockFD >= 0 {
             close(lockFD)  // closing the fd releases the kernel flock
             lockFD = -1
         }
-        try? FileManager.default.removeItem(atPath: pidFilePath(projectDir))
     }
 
     /// Terminate a detached background watcher (SIGTERM, escalate to
@@ -294,7 +298,16 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             if kill(pid, 0) != 0 { break }
             usleep(100_000)
         }
-        if kill(pid, 0) == 0 { _ = kill(pid, SIGKILL) }
+        if kill(pid, 0) == 0 {
+            _ = kill(pid, SIGKILL)
+            // Wait for the kill to land : the kernel only releases the flock
+            // once the process is actually gone, so `--attach` re-acquiring
+            // the lock right after must not race a not-yet-dead watcher.
+            for _ in 0..<20 {
+                if kill(pid, 0) != 0 { break }
+                usleep(50_000)  // ~1s max
+            }
+        }
         try? FileManager.default.removeItem(atPath: Self.pidFilePath(projectDir))
         return pid
     }
