@@ -65,7 +65,6 @@ public extension UX {
         /// which silently exited 0 (a script couldn't tell success from
         /// failure). `try UX.Failure.fail(...)` replaces `emit(...)` +
         /// `return`, and the CLI's top-level catch exits with `code`.
-        @discardableResult
         public static func fail(
             headline: String, reason: String? = nil, hint: String? = nil,
             details: String? = nil, code: Int32 = 1

@@ -58,8 +58,7 @@ final class VMRuntime: NSObject {
         do {
             imageContentPath = try PathConfinement.confine(destination, to: imageRootfs)
         } catch {
-            fputs("[vm] refuse to seed volume from path that escapes image rootfs: \(destination)\n", stderr)
-            fflush(stderr)
+            CockerLog.shared.debug("vm", "refuse to seed volume from path that escapes image rootfs: \(destination)")
             return
         }
         var srcIsDir: ObjCBool = false
@@ -83,7 +82,7 @@ final class VMRuntime: NSObject {
         do {
             try cp.run()
         } catch {
-            fputs("[vm] cp failed to launch for volume seeding: \(error)\n", stderr); fflush(stderr)
+            CockerLog.shared.error("vm", "cp failed to launch for volume seeding: \(error)")
             return
         }
         // Daemon-side budget : 60 s is generous for a typical
@@ -97,16 +96,14 @@ final class VMRuntime: NSObject {
         if cp.isRunning {
             cp.terminate()
             cp.waitUntilExit()
-            fputs("[vm] WARN: volume seed from \(destination) exceeded 60 s — abandoned\n", stderr)
-            fflush(stderr)
+            CockerLog.shared.warn("vm", "volume seed from \(destination) exceeded 60 s — abandoned")
             return
         }
         cp.waitUntilExit()
         if cp.terminationStatus != 0 {
             let errOut = errPipe.fileHandleForReading.availableData
             let msg = String(data: errOut, encoding: .utf8) ?? ""
-            fputs("[vm] WARN: cp -Rp for \(destination) exited \(cp.terminationStatus): \(msg.prefix(200))\n", stderr)
-            fflush(stderr)
+            CockerLog.shared.warn("vm", "cp -Rp for \(destination) exited \(cp.terminationStatus): \(msg.prefix(200))")
         }
     }
 
@@ -126,6 +123,11 @@ final class VMRuntime: NSObject {
         let stdoutPipe: Pipe
         let stderrPipe: Pipe
         var logBuffer: [StreamEvent] = []
+        /// Subscribers to live console output. `appendLog` yields directly
+        /// to them, so `cocker logs -f` no longer wakes MainActor every
+        /// 100 ms to compare array lengths. UUID ownership makes removal
+        /// deterministic when a consumer cancels.
+        var logContinuations: [UUID: AsyncStream<StreamEvent>.Continuation] = [:]
         /// Where the virtiofs root is mounted from on the host. Carried
         /// here so `stop()` can read `/cocker-exit-code` from the
         /// container's rootfs after the VM is gone — the console-pipe
@@ -196,7 +198,7 @@ final class VMRuntime: NSObject {
     // MARK: - VM creation
 
     func createVM(for container: Container, rootfsPath: URL, stdoutPipe: Pipe) async throws -> VZVirtualMachine {
-        fputs("[vm] createVM enter\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("vm", "createVM enter")
         let config = VZVirtualMachineConfiguration()
 
         // Boot loader — cmdline gets assigned AFTER volume processing
@@ -245,7 +247,7 @@ final class VMRuntime: NSObject {
             try? FileManager.default.removeItem(at: safeLink)
             try FileManager.default.createSymbolicLink(at: safeLink, withDestinationURL: rootfsPath)
             normalizedRootfs = safeLink
-            fputs("[vm] symlinked rootfs: \(safeLink.path) -> \(rootfsPath.path)\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("vm", "symlinked rootfs: \(safeLink.path) -> \(rootfsPath.path)")
         } else {
             normalizedRootfs = rootfsPath
         }
@@ -258,7 +260,7 @@ final class VMRuntime: NSObject {
         let sharing = VZSingleDirectoryShare(directory: sharedDir)
         let fsConfig = VZVirtioFileSystemDeviceConfiguration(tag: "root")
         fsConfig.share = sharing
-        fputs("[vm] virtiofs root config OK\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("vm", "virtiofs root config OK")
         var fsDevices: [VZVirtioFileSystemDeviceConfiguration] = [fsConfig]
 
         // Additional volume mounts. Two backends :
@@ -409,7 +411,7 @@ final class VMRuntime: NSObject {
         let natMACString: String = {
             guard container.networkMode != .none else { return "" }
             let s = netDevice.macAddress.string
-            fputs("[vm] eth0 MAC=\(s)\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("vm", "eth0 MAC=\(s)")
             return s
         }()
         pendingNATMACs[container.id] = natMACString
@@ -433,7 +435,7 @@ final class VMRuntime: NSObject {
                 switchDev.macAddress = macAddr
             }
             netDevices.append(switchDev)
-            fputs("[vm] eth1 attached to L2 switch (mac=\(macStr))\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("vm", "eth1 attached to L2 switch (mac=\(macStr))")
         }
 
         if !netDevices.isEmpty {
@@ -449,17 +451,17 @@ final class VMRuntime: NSObject {
         // with the per-volume specs and hand it to the boot loader.
         let cmdline = buildKernelCommandLine(for: container, rootfsPath: rootfsPath, volumeSpecs: volumeSpecs)
         bootLoader.commandLine = cmdline
-        fputs("[vm] cmdline (\(cmdline.count) chars): \(cmdline)\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("vm", "cmdline (\(cmdline.count) chars): \(cmdline)")
 
         do {
             try config.validate()
-            fputs("[vm] config.validate() OK\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("vm", "config.validate() OK")
         } catch {
-            fputs("[vm] config.validate() FAILED: \(error)\n", stderr); fflush(stderr)
+            CockerLog.shared.error("vm", "config.validate() FAILED: \(error)")
             throw error
         }
         let vm = VZVirtualMachine(configuration: config)
-        fputs("[vm] VZVirtualMachine instance created\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("vm", "VZVirtualMachine instance created")
         return vm
     }
 
@@ -533,8 +535,7 @@ final class VMRuntime: NSObject {
         targetArch: String? = nil,
         buildOverlayOutbox: URL? = nil
     ) async throws -> EphemeralRunResult {
-        fputs("[vm-build] runEphemeral cmd=\(command.joined(separator: " ")) rootfs=\(rootfsPath.path)\n", stderr)
-        fflush(stderr)
+        CockerLog.shared.debug("vm-build", "runEphemeral cmd=\(command.joined(separator: " ")) rootfs=\(rootfsPath.path)")
         try ensureKernelAvailable()
 
         // Build un Container synthétique pour réutiliser la même config
@@ -578,9 +579,9 @@ final class VMRuntime: NSObject {
             if Ext4Image.mke2fsPath() != nil {
                 try Ext4Image.format(at: img)
             } else {
-                fputs("[vm-build] mke2fs not found on host (brew install e2fsprogs) — " +
-                      "deferring ext4 format to the VM (needs mkfs.ext4 in the base image)\n", stderr)
-                fflush(stderr)
+                CockerLog.shared.warn("vm-build",
+                    "mke2fs not found on host (brew install e2fsprogs) — " +
+                    "deferring ext4 format to the VM (needs mkfs.ext4 in the base image)")
             }
             ext4Upper = img
             labels["com.cocker.build-overlay-dev"] = "/dev/vda"
@@ -631,14 +632,14 @@ final class VMRuntime: NSObject {
                 }
             }
         }
-        fputs("[vm-build] VM booted\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("vm-build", "VM booted")
 
         // Same DNS vsock wiring as `start()` — without this, DNS in the
         // build VM fails and `RUN apk add …` / `RUN apt-get …` break.
         if let listener = dnsVsockListener,
            let socketDev = vm.socketDevices.first as? VZVirtioSocketDevice {
             socketDev.setSocketListener(listener, forPort: 5353)
-            fputs("[vm-build] DNS vsock listener attached on port 5353\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("vm-build", "DNS vsock listener attached on port 5353")
         }
 
         // Attendre que la VM s'arrête d'elle-même (cocker-init reboot après le
@@ -655,7 +656,7 @@ final class VMRuntime: NSObject {
         // half-baked images.
         let timedOut = (vm.state == .running)
         if timedOut {
-            fputs("[vm-build] timeout after \(timeout)s — force stopping (treating as exit 124)\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("vm-build", "timeout after \(timeout)s — force stopping (treating as exit 124)")
             try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 vm.stop { _ in continuation.resume() }
             }
@@ -685,14 +686,14 @@ final class VMRuntime: NSObject {
         let exitCode: Int32 = Self.synthesizeExitCode(
             parsed: parseExitCode(from: output), timedOut: timedOut
         )
-        fputs("[vm-build] VM stopped, exitCode=\(exitCode)\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("vm-build", "VM stopped, exitCode=\(exitCode)")
         if exitCode != 0 {
             // Surface the failed step's output instead of swallowing it.
             // Otherwise the user only sees "exit code 1" with no clue.
-            fputs("[vm-build] --- captured output (last 4 KB) ---\n", stderr)
+            // Build-failure output goes out at ERROR level : the user's
+            // build just failed, this is not optional debug noise.
             let tail = output.suffix(4096)
-            fputs(String(tail), stderr)
-            fputs("\n[vm-build] --- end output ---\n", stderr); fflush(stderr)
+            CockerLog.shared.error("vm-build", "--- captured output (last 4 KB) ---\n\(String(tail))\n[vm-build] --- end output ---")
         }
 
         // Cleanup spec/resolv files for next iteration
@@ -752,26 +753,25 @@ final class VMRuntime: NSObject {
     }
 
     func start(container: Container, rootfsPath: URL) async throws {
-        fputs("[vm] start: container=\(container.id) rootfs=\(rootfsPath.path)\n", stderr)
-        fflush(stderr)
+        CockerLog.shared.debug("vm", "start: container=\(container.id) rootfs=\(rootfsPath.path)")
         try ensureKernelAvailable()
-        fputs("[vm] kernel OK\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("vm", "kernel OK")
 
         // Écrit resolv.conf dans le rootfs pour que le container utilise le DNS interne
         try writeResolvConf(to: rootfsPath, container: container)
-        fputs("[vm] resolv.conf OK\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("vm", "resolv.conf OK")
 
         // Écrit la spec container (cmd, env, workdir) dans /cocker-spec
         // car la kernel cmdline ne supporte pas les espaces/quotes
         try writeContainerSpec(to: rootfsPath, container: container)
-        fputs("[vm] cocker-spec OK\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("vm", "cocker-spec OK")
 
         // Pipes pour capturer console (stdout) du VM
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()  // réservé pour usage futur
 
         let vm = try await createVM(for: container, rootfsPath: rootfsPath, stdoutPipe: stdoutPipe)
-        fputs("[vm] createVM OK\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("vm", "createVM OK")
 
         let runningVM = RunningVM(
             vm: vm,
@@ -792,13 +792,12 @@ final class VMRuntime: NSObject {
                     continuation.resume()
                 case .failure(let error):
                     let ns = error as NSError
-                    fputs("[vm] start FAILED domain=\(ns.domain) code=\(ns.code) desc=\(ns.localizedDescription)\n", stderr)
-                    fputs("[vm] userInfo=\(ns.userInfo)\n", stderr)
+                    CockerLog.shared.error("vm", "start FAILED domain=\(ns.domain) code=\(ns.code) desc=\(ns.localizedDescription)")
+                    CockerLog.shared.debug("vm", "userInfo=\(ns.userInfo)")
                     if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
-                        fputs("[vm] underlying: domain=\(underlying.domain) code=\(underlying.code) desc=\(underlying.localizedDescription)\n", stderr)
-                        fputs("[vm] underlying userInfo=\(underlying.userInfo)\n", stderr)
+                        CockerLog.shared.debug("vm", "underlying: domain=\(underlying.domain) code=\(underlying.code) desc=\(underlying.localizedDescription)")
+                        CockerLog.shared.debug("vm", "underlying userInfo=\(underlying.userInfo)")
                     }
-                    fflush(stderr)
                     continuation.resume(throwing: CockerError.vmStartFailed("\(ns.localizedDescription) [code=\(ns.code)]"))
                 }
             }
@@ -810,7 +809,7 @@ final class VMRuntime: NSObject {
         if let listener = dnsVsockListener,
            let socketDev = vm.socketDevices.first as? VZVirtioSocketDevice {
             socketDev.setSocketListener(listener, forPort: 5353)
-            fputs("[vm] DNS vsock listener attached on port 5353\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("vm", "DNS vsock listener attached on port 5353")
         }
     }
 
@@ -904,6 +903,10 @@ final class VMRuntime: NSObject {
         if detectedExit == nil {
             detectedExit = parseExitCode(from: running.logBuffer.map { $0.data }.joined())
         }
+        for continuation in running.logContinuations.values {
+            continuation.finish()
+        }
+        running.logContinuations.removeAll()
         runningVMs.removeValue(forKey: containerID)
         await l2Switch.removePort(containerID: containerID)
         return detectedExit
@@ -915,6 +918,13 @@ final class VMRuntime: NSObject {
     /// console + stderr pipes + /dev/null + vsock IPC channels).
     func cleanup(containerID: String) async {
         guard let running = runningVMs[containerID] else { return }
+        // Finish live log streams before dropping the RunningVM. Consumers
+        // receive a clean end-of-stream immediately instead of polling
+        // isRunning() until their next timer tick.
+        for continuation in running.logContinuations.values {
+            continuation.finish()
+        }
+        running.logContinuations.removeAll()
         // Tear down the readability handler first so it stops capturing
         // the file handle, then close both ends of each pipe explicitly.
         // FileHandle.deinit closes the FD, but the handler closure can
@@ -1022,6 +1032,23 @@ final class VMRuntime: NSObject {
         return Self.readJSONLog(containerID: containerID, tail: tail)
     }
 
+    /// Event-driven live log stream for a running container. Returns nil
+    /// when the VM is already gone, in which case callers can serve the
+    /// persisted backlog and finish immediately.
+    func liveLogs(containerID: String) -> AsyncStream<StreamEvent>? {
+        guard let running = runningVMs[containerID] else { return nil }
+        let subscriptionID = UUID()
+        return AsyncStream { continuation in
+            running.logContinuations[subscriptionID] = continuation
+            continuation.onTermination = { @Sendable [weak self] _ in
+                Task { @MainActor in
+                    self?.runningVMs[containerID]?.logContinuations
+                        .removeValue(forKey: subscriptionID)
+                }
+            }
+        }
+    }
+
     /// Replay the persisted json-file log at
     /// `~/.cocker/containers/<id>/<id>-json.log`. Each line is a Docker-
     /// shape JSON object ({log, stream, time}) ; we decode back to a
@@ -1063,6 +1090,9 @@ final class VMRuntime: NSObject {
     func appendLog(containerID: String, event: StreamEvent) {
         guard let running = runningVMs[containerID] else { return }
         running.logBuffer.append(event)
+        for continuation in running.logContinuations.values {
+            continuation.yield(event)
+        }
         // Cap buffer at 10k lines
         if running.logBuffer.count > 10000 {
             running.logBuffer.removeFirst(running.logBuffer.count - 10000)
@@ -1132,7 +1162,7 @@ final class VMRuntime: NSObject {
     /// shutdown if the signal didn't trigger an exit within the timeout.
     private func sendStopSignal(vm: VZVirtualMachine, containerID: String, signal: String) async {
         guard let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else {
-            fputs("[stopsig] no vsock device for \(containerID)\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("stopsig", "no vsock device for \(containerID)")
             return
         }
         let connection: VZVirtioSocketConnection? = await withCheckedContinuation { cont in
@@ -1140,7 +1170,7 @@ final class VMRuntime: NSObject {
                 switch result {
                 case .success(let conn): cont.resume(returning: conn)
                 case .failure(let err):
-                    fputs("[stopsig] vsock connect failed for \(containerID): \(err)\n", stderr); fflush(stderr)
+                    CockerLog.shared.error("stopsig", "vsock connect failed for \(containerID): \(err)")
                     cont.resume(returning: nil)
                 }
             }
@@ -1176,7 +1206,7 @@ final class VMRuntime: NSObject {
         }
         if got > 0 {
             let ack = String(bytes: ackBuf[0..<got], encoding: .utf8) ?? ""
-            fputs("[stopsig] \(containerID) signal=\(signal) ack=\(ack.trimmingCharacters(in: .whitespacesAndNewlines))\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("stopsig", "\(containerID) signal=\(signal) ack=\(ack.trimmingCharacters(in: .whitespacesAndNewlines))")
         }
     }
 
@@ -1192,17 +1222,19 @@ final class VMRuntime: NSObject {
             throw CockerError.vmCommunicationFailed("No vsock device")
         }
 
-        fputs("[exec] connecting vsock 9000 for container=\(containerID)\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("exec", "connecting vsock 9000 for container=\(containerID)")
         return AsyncStream { continuation in
+            let lifetime = ExecStreamLifetime()
+            continuation.onTermination = { @Sendable _ in lifetime.cancel() }
             socketDevice.connect(toPort: 9000) { result in
                 switch result {
                 case .failure(let error):
-                    fputs("[exec] vsock connect failed: \(error)\n", stderr); fflush(stderr)
+                    CockerLog.shared.error("exec", "vsock connect failed: \(error)")
                     continuation.yield(StreamEvent(stream: .error,
                         data: "exec failed: \(error) — the in-VM listener may be unavailable (try `cocker restart \(containerID)`)"))
                     continuation.finish()
                 case .success(let connection):
-                    fputs("[exec] vsock connected fd=\(connection.fileDescriptor)\n", stderr); fflush(stderr)
+                    CockerLog.shared.debug("exec", "vsock connected fd=\(connection.fileDescriptor)")
                     struct ExecReq: Codable {
                         let cmd: [String]
                         let env: [String: String]
@@ -1221,6 +1253,10 @@ final class VMRuntime: NSObject {
                         continuation.finish(); return
                     }
                     let fd = connection.fileDescriptor
+                    guard lifetime.register(fd: fd) else {
+                        continuation.finish()
+                        return
+                    }
                     // Request : single JSON line, NL-terminated. write() may
                     // accept only part of the buffer when the socket send
                     // buffer is nearly full, so loop until every byte is out
@@ -1238,7 +1274,7 @@ final class VMRuntime: NSObject {
                     }
                     var nl: UInt8 = 0x0A
                     _ = writeAllFD(fd, &nl, 1)
-                    fputs("[exec] wrote req: bytes=\(data.count) nl=1\n", stderr); fflush(stderr)
+                    CockerLog.shared.debug("exec", "wrote req: bytes=\(data.count) nl=1")
 
                     // After the JSON+NL terminator, anything we write on
                     // the same vsock fd becomes the child's stdin (the
@@ -1273,9 +1309,10 @@ final class VMRuntime: NSObject {
                     // (and tear down the vsock fd) the moment the callback
                     // returns. Without this, the host side closes its end
                     // before the guest can accept().
-                    let retained = connection
-                    Task.detached {
-                        _ = retained  // keep alive for the lifetime of the stream
+                    let retained = ConnectionHolder(connection)
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        _ = retained.connection  // keep alive for the lifetime of the stream
+                        defer { lifetime.complete() }
                         var buffer = Data()
                         var chunk = [UInt8](repeating: 0, count: 4096)
                         let exitMarker = Data("__COCKER_EXIT__".utf8)
@@ -1293,6 +1330,7 @@ final class VMRuntime: NSObject {
 
                         while true {
                             let n = Darwin.read(fd, &chunk, chunk.count)
+                            if n < 0, errno == EINTR { continue }
                             if n <= 0 { continuation.finish(); break }
                             buffer.append(contentsOf: chunk.prefix(n))
 
@@ -1340,6 +1378,36 @@ final class ConnectionHolder: @unchecked Sendable {
     init(_ connection: VZVirtioSocketConnection) { self.connection = connection }
 }
 
+/// Cancellation bridge for an AsyncStream backed by a blocking vsock read.
+/// shutdown(2) wakes the GCD reader immediately when the consumer disappears.
+final class ExecStreamLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fd: Int32 = -1
+    private var cancelled = false
+
+    func register(fd: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !cancelled else {
+            _ = Darwin.shutdown(fd, SHUT_RDWR)
+            return false
+        }
+        self.fd = fd
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let current = fd
+        lock.unlock()
+        if current >= 0 { _ = Darwin.shutdown(current, SHUT_RDWR) }
+    }
+
+    func complete() {
+        lock.lock(); fd = -1; lock.unlock()
+    }
+}
+
 /// Single-shot resume guard. NSLock-backed so the timeout / connect
 /// callbacks can race from different queues without double-resuming the
 /// continuation.
@@ -1374,10 +1442,10 @@ extension VMRuntime {
                    argv: [String],
                    timeout: TimeInterval) async -> Int32 {
         guard let socketDevice = runningVMs[containerID]?.vm.socketDevices.first as? VZVirtioSocketDevice else {
-            fputs("[probe] no VM/socket for \(containerID)\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("probe", "no VM/socket for \(containerID)")
             return 1
         }
-        fputs("[probe] connecting vsock 9000 for \(containerID)\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("probe", "connecting vsock 9000 for \(containerID)")
 
         return await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
             let resumeBox = ResumeOnceBox()
@@ -1394,11 +1462,11 @@ extension VMRuntime {
             socketDevice.connect(toPort: 9000) { result in
                 switch result {
                 case .failure(let err):
-                    fputs("[probe] connect failed: \(err)\n", stderr); fflush(stderr)
+                    CockerLog.shared.error("probe", "connect failed: \(err)")
                     resumeOnce(1)
                 case .success(let connection):
                     let fd = connection.fileDescriptor
-                    fputs("[probe] connected fd=\(fd)\n", stderr); fflush(stderr)
+                    CockerLog.shared.debug("probe", "connected fd=\(fd)")
                     struct Req: Codable { let cmd: [String]; let env: [String: String] }
                     guard let data = try? JSONEncoder().encode(Req(cmd: argv, env: [:])) else {
                         resumeOnce(1); return

@@ -271,6 +271,14 @@ func main() async {
             rootDir: rootURL,
             portForwarder: PortForwarder(portFwdBinary: portFwdBinary)
         )
+    } catch let error as CockerError {
+        log.error("startup", "failed to initialize engine: \(error.description)")
+        // Schema-too-new keeps its historical EX_USAGE (64) exit code so
+        // operators / scripts keying on it still work. The check used to
+        // live (as an exit()) inside StateStore ; it now throws and the
+        // process-death decision is made here, at the top level.
+        if case .stateSchemaTooNew = error { exit(64) }
+        exit(1)
     } catch {
         log.error("startup", "failed to initialize engine: \(error)")
         exit(1)
@@ -343,6 +351,10 @@ func main() async {
         await dns.stop()
         await engine.portForwarder.stopAll()
         tlsTcpListener?.stop()
+        // Push any debounced (.coalesced) state mutations to disk before
+        // the process dies — otherwise the last ~500 ms of healthcheck
+        // bookkeeping would be lost on every clean shutdown.
+        await engine.state.flushPending()
         PIDFile.clear(pidFile)
     }
 

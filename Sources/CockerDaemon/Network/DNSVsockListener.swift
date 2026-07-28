@@ -48,8 +48,7 @@ final class DNSVsockListener: NSObject, VZVirtioSocketListenerDelegate {
         let originalFD = connection.fileDescriptor
         let fd = Darwin.dup(originalFD)
         guard fd >= 0 else {
-            fputs("[dns/vsock] dup() failed: \(String(cString: strerror(errno)))\n", stderr)
-            fflush(stderr)
+            CockerLog.shared.error("dns/vsock", "dup() failed: \(String(cString: strerror(errno)))")
             return false
         }
 

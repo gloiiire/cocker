@@ -76,17 +76,18 @@ struct SchemaVersionMigrationTests {
     }
 
     @Test func futureSchemaVersionFailsLoad() throws {
-        // We can't easily test exit(64) without spawning a sub-process,
-        // but we can confirm the decoder reads the schemaVersion value
-        // correctly when present — the production code then bails out.
+        // A state.json written by a newer cockerd must be REFUSED with a
+        // typed error (used to be an untestable exit(64) buried in the
+        // store ; main() now owns the process-death decision).
+        let dir = try tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
         let payload = """
         { "schemaVersion": 999, "containers": {} }
         """
-        struct DecoderRig: Decodable {
-            var schemaVersion: Int = 1
+        try Data(payload.utf8).write(to: dir.appendingPathComponent("state.json"))
+        #expect(throws: CockerError.self) {
+            _ = try StateStore(rootDir: dir)
         }
-        let d = try JSONDecoder().decode(DecoderRig.self, from: Data(payload.utf8))
-        #expect(d.schemaVersion == 999)
     }
 
     @Test func corruptedFileIsPreservedAndStoreStartsEmpty() async throws {

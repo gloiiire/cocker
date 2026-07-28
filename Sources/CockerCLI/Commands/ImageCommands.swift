@@ -243,15 +243,26 @@ struct SaveCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let client = IPCClient()
         let start = Date()
-        let payload = SaveRequest(image: image)
+        let url = URL(fileURLWithPath: output.hasPrefix("/") ? output : FileManager.default.currentDirectoryPath + "/" + output)
+        // v2 : the daemon writes the tar straight to `output` (same host,
+        // same user). Keeps multi-GB images out of the JSON frame — the
+        // legacy in-band path failed past ~75 MB (100 MB frame cap on
+        // base64-inflated payloads) and buffered everything in RAM.
+        let payload = SaveRequest(image: image, outputPath: url.path)
         let request = try IPCRequest(type: .save, payload: payload)
         let response = try await client.send(request)
         let result = try response.decode(SaveResponse.self)
 
-        let url = URL(fileURLWithPath: output.hasPrefix("/") ? output : FileManager.default.currentDirectoryPath + "/" + output)
-        try result.tarData.write(to: url)
+        let byteCount: Int64
+        if result.filePath != nil {
+            byteCount = Int64(result.byteCount ?? 0)
+        } else {
+            // Legacy daemon : bytes came in-band, write them ourselves.
+            try result.tarData.write(to: url)
+            byteCount = Int64(result.tarData.count)
+        }
         if UX.TTY.current.isInteractive {
-            let trailing = "\(UX.formatBytes(Int64(result.tarData.count))) → \(output) · " + UX.formatElapsed(Date().timeIntervalSince(start))
+            let trailing = "\(UX.formatBytes(byteCount)) → \(output) · " + UX.formatElapsed(Date().timeIntervalSince(start))
             print(UX.ActionLine(
                 icon: .success, type: .image, name: image,
                 status: "Saved", trailing: trailing
@@ -281,10 +292,11 @@ struct LoadCommand: AsyncParsableCommand {
             )
             throw ExitCode.failure
         }
-        let tarData = try Data(contentsOf: url)
+        // v2 : hand the daemon the file PATH — it reads from disk directly.
+        // No base64, no 100 MB frame cap, no double-buffering in RAM.
         let client = IPCClient()
         let start = Date()
-        let payload = LoadRequest(tarData: tarData)
+        let payload = LoadRequest(tarData: Data(), inputPath: url.path)
         let request = try IPCRequest(type: .load, payload: payload)
         let response = try await client.send(request)
         let msg = try response.decode(String.self)
@@ -425,16 +437,24 @@ struct ExportCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let client = IPCClient()
         let start = Date()
-        let payload = ExportRequest(containerID: container)
-        let request = try IPCRequest(type: .export, payload: payload)
-        let response = try await client.send(request)
-        let result = try response.decode(SaveResponse.self)
 
         if let outPath = output {
+            // v2 path handoff : daemon writes the tar to the requested file.
             let url = URL(fileURLWithPath: outPath.hasPrefix("/") ? outPath : FileManager.default.currentDirectoryPath + "/" + outPath)
-            try result.tarData.write(to: url)
+            let payload = ExportRequest(containerID: container, outputPath: url.path)
+            let request = try IPCRequest(type: .export, payload: payload)
+            let response = try await client.send(request)
+            let result = try response.decode(SaveResponse.self)
+            let byteCount: Int64
+            if result.filePath != nil {
+                byteCount = Int64(result.byteCount ?? 0)
+            } else {
+                // Legacy daemon : bytes in-band.
+                try result.tarData.write(to: url)
+                byteCount = Int64(result.tarData.count)
+            }
             if UX.TTY.current.isInteractive {
-                let trailing = "\(UX.formatBytes(Int64(result.tarData.count))) → \(outPath) · " + UX.formatElapsed(Date().timeIntervalSince(start))
+                let trailing = "\(UX.formatBytes(byteCount)) → \(outPath) · " + UX.formatElapsed(Date().timeIntervalSince(start))
                 print(UX.ActionLine(
                     icon: .success, type: .container, name: container,
                     status: "Exported", trailing: trailing
@@ -443,6 +463,11 @@ struct ExportCommand: AsyncParsableCommand {
                 print(outPath)
             }
         } else {
+            // stdout streaming : no destination file exists, keep in-band.
+            let payload = ExportRequest(containerID: container)
+            let request = try IPCRequest(type: .export, payload: payload)
+            let response = try await client.send(request)
+            let result = try response.decode(SaveResponse.self)
             FileHandle.standardOutput.write(result.tarData)
         }
     }
@@ -462,7 +487,9 @@ struct ImportCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let tarData: Data
+        var inputPath: String? = nil
         if file == "-" {
+            // stdin : no file on disk, ship bytes in-band (legacy path).
             tarData = FileHandle.standardInput.readDataToEndOfFile()
         } else {
             let url = URL(fileURLWithPath: file.hasPrefix("/") ? file : FileManager.default.currentDirectoryPath + "/" + file)
@@ -474,12 +501,14 @@ struct ImportCommand: AsyncParsableCommand {
                 )
                 throw ExitCode.failure
             }
-            tarData = try Data(contentsOf: url)
+            // v2 path handoff : daemon reads the tar straight from disk.
+            tarData = Data()
+            inputPath = url.path
         }
 
         let client = IPCClient()
         let start = Date()
-        let payload = ContainerImportRequest(tarData: tarData, tag: tag)
+        let payload = ContainerImportRequest(tarData: tarData, tag: tag, inputPath: inputPath)
         let request = try IPCRequest(type: .containerImport, payload: payload)
         let response = try await client.send(request)
         let img = try response.decode(ImageInfo.self)

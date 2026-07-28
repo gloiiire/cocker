@@ -85,6 +85,32 @@ struct HTTPResponse {
         data.append(body)
         return data
     }
+
+    @discardableResult
+    func write(to fd: Int32) -> Bool {
+        serialize().writeAll(to: fd)
+    }
+}
+
+extension Data {
+    @discardableResult
+    func writeAll(to fd: Int32) -> Bool {
+        withUnsafeBytes { buf in
+            guard let base = buf.baseAddress else { return true }
+            var sent = 0
+            while sent < buf.count {
+                let n = Darwin.write(fd, base.advanced(by: sent), buf.count - sent)
+                if n > 0 {
+                    sent += n
+                } else if n < 0, errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
+        }
+    }
 }
 
 // MARK: - HTTP streaming response (for logs, events, pull progress)
@@ -130,15 +156,7 @@ struct HTTPStreamWriter {
     }
 
     private func writeRaw(_ data: Data) {
-        data.withUnsafeBytes { buf in
-            guard let ptr = buf.baseAddress else { return }
-            var sent = 0
-            while sent < buf.count {
-                let n = Darwin.write(fd, ptr.advanced(by: sent), buf.count - sent)
-                if n <= 0 { return }
-                sent += n
-            }
-        }
+        _ = data.writeAll(to: fd)
     }
 }
 

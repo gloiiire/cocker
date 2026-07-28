@@ -3,7 +3,7 @@ require "etc"
 class Cocker < Formula
   desc "Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework"
   homepage "https://github.com/gloiiire/cocker"
-  version "0.7.13.10"
+  version "0.7.13.11"
   url "https://github.com/gloiiire/cocker/archive/refs/tags/v#{version}.tar.gz"
   # Placeholder — replace with `shasum -a 256` of the actual release tarball.
   sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
@@ -27,8 +27,8 @@ class Cocker < Formula
   # both `version "..."` AND this `vX.Y.Z` substring on every release
   # tag so they stay in lock-step.
   bottle do
-    root_url "https://github.com/gloiiire/cocker/releases/download/v0.7.13.10"
-    sha256 cellar: :any_skip_relocation, all:      "25cc06f7b562fdc5afb291739c399824a92cea8322cf16cc43e1f7949bd1b530"
+    root_url "https://github.com/gloiiire/cocker/releases/download/v0.7.13.11"
+    sha256 cellar: :any_skip_relocation, all:      "REPLACE_BOTTLE_SHA256_ALL"
   end
 
   depends_on arch: :arm64
@@ -62,7 +62,7 @@ class Cocker < Formula
              "-o", "cocker-init",
              "init.c", "cmdline.c", "net.c", "dns_proxy.c",
              "spec.c", "qemu.c", "exec_listener.c", "caps.c",
-             "health_poll.c", "etc_overlay.c"
+             "health_poll.c", "etc_overlay.c", "dhcp_min.c"
       cp "cocker-init", "initrd-staging/init"
       chmod 0755, "initrd-staging/init"
       cd "initrd-staging" do

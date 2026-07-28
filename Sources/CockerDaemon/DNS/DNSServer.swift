@@ -109,13 +109,9 @@ actor DNSServer {
 
     private func tcpAcceptLoop(fd: Int32) async {
         while isRunning {
-            let cfd = await Task.detached(priority: .userInitiated) { [fd] in
-                Darwin.accept(fd, nil, nil)
-            }.value
+            let cfd = await Self.acceptConnection(on: fd)
             if cfd < 0 { try? await Task.sleep(nanoseconds: 50_000_000); continue }
-            // Task.detached for same reason as the UDP path : avoid
-            // serializing concurrent queries on the actor's executor.
-            Task.detached(priority: .userInitiated) { [weak self] in
+            Task { [weak self] in
                 await self?.handleTCPClient(fd: cfd)
             }
         }
@@ -141,29 +137,16 @@ actor DNSServer {
     /// reads cleanly.
     nonisolated func handleStreamedDNSQuery(fd: Int32) async {
         defer { close(fd) }
-        var lenBuf: [UInt8] = [0, 0]
-        guard Self.readAll(fd: fd, into: &lenBuf, count: 2) else { return }
-        let msgLen = (Int(lenBuf[0]) << 8) | Int(lenBuf[1])
-        guard msgLen > 0, msgLen <= 65535 else { return }
-
-        var msgBuf = [UInt8](repeating: 0, count: msgLen)
-        guard Self.readAll(fd: fd, into: &msgBuf, count: msgLen) else { return }
-        let query = Data(msgBuf)
+        guard let query = await Self.readStreamedQuery(fd: fd) else { return }
 
         let containers = await state.allContainers(includeAll: false)
-        let upstream = Self.upstreamDNS
-        guard let result = DNSQueryProcessor.process(
-            query: query,
-            containers: containers,
-            forwardUpstream: { q in forwardToUpstream(q, upstream: upstream) }
-        ) else { return }
+        guard let result = await Self.resolve(query: query, containers: containers) else { return }
 
         Self.logResult(result.kind)
 
         let response = result.response
         let prefix: [UInt8] = [UInt8((response.count >> 8) & 0xFF), UInt8(response.count & 0xFF)]
-        _ = prefix.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, 2) }
-        _ = response.withUnsafeBytes { Darwin.write(fd, $0.baseAddress, response.count) }
+        await Self.writeStreamedResponse(fd: fd, prefix: prefix, response: response)
     }
 
     nonisolated private static func logResult(_ kind: DNSQueryAnswerKind) {
@@ -185,6 +168,68 @@ actor DNSServer {
             }
             if n <= 0 { return false }
             off += n
+        }
+        return true
+    }
+
+    private nonisolated static func acceptConnection(on fd: Int32) async -> Int32 {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: Darwin.accept(fd, nil, nil))
+            }
+        }
+    }
+
+    private nonisolated static func readStreamedQuery(fd: Int32) async -> Data? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var length = [UInt8](repeating: 0, count: 2)
+                guard readAll(fd: fd, into: &length, count: 2) else {
+                    continuation.resume(returning: nil); return
+                }
+                let count = (Int(length[0]) << 8) | Int(length[1])
+                guard count > 0, count <= 65_535 else {
+                    continuation.resume(returning: nil); return
+                }
+                var bytes = [UInt8](repeating: 0, count: count)
+                continuation.resume(returning:
+                    readAll(fd: fd, into: &bytes, count: count) ? Data(bytes) : nil)
+            }
+        }
+    }
+
+    private nonisolated static func resolve(query: Data, containers: [Container]) async -> DNSQueryResult? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: DNSQueryProcessor.process(
+                    query: query,
+                    containers: containers,
+                    forwardUpstream: { forwardToUpstream($0, upstream: upstreamDNS) }
+                ))
+            }
+        }
+    }
+
+    private nonisolated static func writeStreamedResponse(
+        fd: Int32, prefix: [UInt8], response: Data
+    ) async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = prefix.withUnsafeBytes { writeAll(fd: fd, base: $0.baseAddress, count: $0.count) }
+                _ = response.withUnsafeBytes { writeAll(fd: fd, base: $0.baseAddress, count: $0.count) }
+                continuation.resume()
+            }
+        }
+    }
+
+    private nonisolated static func writeAll(fd: Int32, base: UnsafeRawPointer?, count: Int) -> Bool {
+        guard let base else { return count == 0 }
+        var offset = 0
+        while offset < count {
+            let n = Darwin.write(fd, base.advanced(by: offset), count - offset)
+            if n > 0 { offset += n }
+            else if n < 0, errno == EINTR { continue }
+            else { return false }
         }
         return true
     }
@@ -241,35 +286,35 @@ actor DNSServer {
     // MARK: - Receive loop
 
     private func receiveLoop(fd: Int32) async {
-        var buf = [UInt8](repeating: 0, count: 4096)
-        var clientAddr = sockaddr_in()
-        var clientAddrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-
         while isRunning {
-            let n = await Task.detached(priority: .userInitiated) { [fd] in
-                withUnsafeMutablePointer(to: &clientAddr) { ptr in
+            guard let datagram = await Self.receiveDatagram(on: fd) else { continue }
+            Task { [weak self] in
+                await self?.handlePacket(datagram.data, clientIP: datagram.ip,
+                                         clientPort: datagram.port, viaFD: fd)
+            }
+        }
+    }
+
+    private struct Datagram: Sendable { let data: Data; let ip: String; let port: UInt16 }
+
+    private nonisolated static func receiveDatagram(on fd: Int32) async -> Datagram? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                var address = sockaddr_in()
+                var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let n = withUnsafeMutablePointer(to: &address) { ptr in
                     ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                        recvfrom(fd, &buf, buf.count, 0, sa, &clientAddrLen)
+                        recvfrom(fd, &buffer, buffer.count, 0, sa, &length)
                     }
                 }
-            }.value
-
-            guard n > DNSHeader.size else { continue }
-            let packet = Data(buf.prefix(n))
-
-            // Capture des infos client pour la réponse
-            let clientPort = clientAddr.sin_port.bigEndian
-            let clientIP = withUnsafeBytes(of: clientAddr.sin_addr) { bytes -> String in
-                let b = bytes.bindMemory(to: UInt8.self)
-                return "\(b[0]).\(b[1]).\(b[2]).\(b[3])"
-            }
-
-            // Task.detached so the per-query handler doesn't run on the
-            // DNSServer actor's executor — concurrent UDP queries now
-            // truly parallelize through forwardToUpstream's 2s blocking
-            // recv, instead of queuing up head-of-line.
-            Task.detached(priority: .userInitiated) { [weak self] in
-                await self?.handlePacket(packet, clientIP: clientIP, clientPort: clientPort, viaFD: fd)
+                guard n > DNSHeader.size else { continuation.resume(returning: nil); return }
+                let ip = withUnsafeBytes(of: address.sin_addr) { raw -> String in
+                    let b = raw.bindMemory(to: UInt8.self)
+                    return "\(b[0]).\(b[1]).\(b[2]).\(b[3])"
+                }
+                continuation.resume(returning: Datagram(
+                    data: Data(buffer.prefix(n)), ip: ip, port: address.sin_port.bigEndian))
             }
         }
     }
@@ -282,12 +327,7 @@ actor DNSServer {
     /// install's parallel A+AAAA bursts hit 8+ second pile-ups → EAI_AGAIN).
     nonisolated private func handlePacket(_ data: Data, clientIP: String, clientPort: UInt16, viaFD: Int32) async {
         let containers = await state.allContainers(includeAll: false)
-        let upstream = Self.upstreamDNS
-        guard let result = DNSQueryProcessor.process(
-            query: data,
-            containers: containers,
-            forwardUpstream: { q in forwardToUpstream(q, upstream: upstream) }
-        ) else { return }
+        guard let result = await Self.resolve(query: data, containers: containers) else { return }
 
         Self.logResult(result.kind)
         Self.sendResponse(result.response, toIP: clientIP, port: clientPort, viaFD: viaFD)

@@ -18,7 +18,7 @@ struct TopLevelCLIConfigurationTests {
     }
 
     @Test func versionIsNonEmpty() {
-        #expect(!(CockerCLI.configuration.version ?? "").isEmpty)
+        #expect(!CockerCLI.configuration.version.isEmpty)
     }
 
     @Test func registersLifecycleSubcommands() {
