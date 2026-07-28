@@ -119,6 +119,19 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             )
             return
         }
+        // Also honor a live pidfile whose owner does NOT hold our flock — e.g.
+        // a detached watcher spawned by a pre-flock version that is still
+        // running across an upgrade. Drop the lock we just took (leaving that
+        // watcher's pidfile intact) and defer to it, so we don't start a rival
+        // loop during the transition window.
+        if let existing = Self.livePID(projectDir: projectDir), existing != getpid() {
+            if Self.lockFD >= 0 { close(Self.lockFD); Self.lockFD = -1 }  // drop flock only
+            UX.Warning.emit(
+                "a watch is already running (pid \(existing))",
+                note: "re-attach with `cocker compose watch --attach`, or stop it with `cocker compose watch --stop`"
+            )
+            return
+        }
         // Only the detached background child records the pidfile : it is the
         // one whose output goes to watch.log, so --status/--logs/--stop track
         // it. A foreground / attached watcher shows output live in its own
@@ -162,7 +175,19 @@ struct ComposeWatchCommand: AsyncParsableCommand {
                 // them ; otherwise the child would fail acquireWatchLock and
                 // exit, and detaching would silently do nothing.
                 Self.releaseWatchLock(projectDir: dir)
-                return (try? Self.detachAndExit(projectDir: dir, originalArgs: CommandLine.arguments)) ?? false
+                if (try? Self.detachAndExit(projectDir: dir, originalArgs: CommandLine.arguments)) == true {
+                    return true  // detached OK → this process exits
+                }
+                // Detach failed (child didn't come up, or another invocation
+                // grabbed the lock during the handoff). Retake the lock so we
+                // keep watching *guarded* ; if we can't, another watcher now
+                // owns the project, so stop rather than run a second unguarded
+                // loop.
+                if Self.acquireWatchLock(projectDir: dir) {
+                    return false  // re-arm the footer, lock re-held
+                }
+                UX.Warning.emit("another watch took over this project — stopping here")
+                return true  // → the footer exits this process (Darwin.exit)
             },
             onQuit: {
                 // `q` / Ctrl-C = quit for real : stop watching AND tear the
