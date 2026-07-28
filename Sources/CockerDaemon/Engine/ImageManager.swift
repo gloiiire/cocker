@@ -823,8 +823,16 @@ actor DockerfileBuilder {
                     env: env
                 )
                 let buildRoot = await imageManager.daemonRootDir()
+                // Identity of the runtime that will execute this step. A
+                // layer captured under a different `cocker-init` / kernel
+                // is not replayable, so it must not be reused after an
+                // upgrade (PRO : the `/run` tmpfs fix in 0.7.13.14 was
+                // masked by cached empty layers until `--no-cache`).
+                let runtimeFingerprint = await vmRuntime?.buildFingerprint()
+                    ?? BuildRuntimeFingerprint.compute(components: ["no-vm-runtime"])
                 if config.noCache == false,
-                   let cached = try await BuildCache.lookup(key: stepHash, root: buildRoot) {
+                   let cached = try await BuildCache.lookup(
+                       key: stepHash, runtime: runtimeFingerprint, root: buildRoot) {
                     log(.stdout, " ---> Using cache (layer \(String(cached.digest.prefix(19))))\n")
                     try await BuildCache.apply(layer: cached, to: rootfs, root: buildRoot)
                     layers.append(CreatedLayer(digest: cached.digest, size: cached.size))
@@ -915,7 +923,8 @@ actor DockerfileBuilder {
                         }
                         if let layer = try await registerOverlayLayer(tar: layerTar, rootfs: rootfs, blobsDir: blobsDir) {
                             layers.append(layer)
-                            try? await BuildCache.store(key: stepHash, layer: layer, root: buildRoot)
+                            try? await BuildCache.store(key: stepHash, layer: layer,
+                                                       runtime: runtimeFingerprint, root: buildRoot)
                             log(.stdout, " ---> Created layer \(String(layer.digest.prefix(19))) (ext4 overlay)\n")
                         }
                         try? FileManager.default.removeItem(at: outbox)
@@ -949,6 +958,7 @@ actor DockerfileBuilder {
                         // sequence skips the VM exec entirely.
                         try? await BuildCache.store(key: stepHash,
                                                      layer: layer,
+                                                     runtime: runtimeFingerprint,
                                                      root: buildRoot)
                         log(.stdout, " ---> Created layer \(String(layer.digest.prefix(19))) (\(changed.count) changed, \(deleted.count) deleted)\n")
                     }
@@ -2018,6 +2028,11 @@ enum BuildCache {
     struct CachedLayerEntry: Codable {
         let digest: String
         let size: Int
+        /// Identity of the runtime that produced this layer. Absent in
+        /// entries written before 0.7.13.15 — those predate the `/run`
+        /// tmpfs fix and cannot be trusted, so a nil value is treated as
+        /// a mismatch and the entry is discarded on lookup.
+        var runtime: String?
     }
 
     // Cache + blob locations, derived from the daemon's actual data root
@@ -2033,11 +2048,25 @@ enum BuildCache {
         root.appendingPathComponent("images/blobs/sha256")
     }
 
-    static func lookup(key: String, root: URL) async throws -> CachedLayerEntry? {
+    /// Look up a cached layer for `key`.
+    ///
+    /// `runtime` is the fingerprint of the environment that would execute
+    /// the step now. An entry produced by a different runtime is dropped :
+    /// the same `RUN` can legitimately yield a different filesystem after
+    /// a `cocker-init` or kernel change, and replaying the stale layer
+    /// silently ships a wrong image (see BuildRuntimeFingerprint).
+    static func lookup(key: String, runtime: String, root: URL) async throws -> CachedLayerEntry? {
         let url = cacheDir(root).appendingPathComponent("\(key).json")
         guard let data = try? Data(contentsOf: url),
               let entry = try? JSONDecoder().decode(CachedLayerEntry.self, from: data)
         else { return nil }
+        guard entry.runtime == runtime else {
+            // Built by another runtime (or before fingerprints existed).
+            // Drop the pointer so the step re-runs once and repopulates
+            // the cache for the current runtime.
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
         // Sanity check : the blob still exists in the store. The blob
         // GC sweep might have collected it between builds.
         let blobName = String(entry.digest.dropFirst("sha256:".count))
@@ -2052,10 +2081,11 @@ enum BuildCache {
 
     static func store(key: String,
                        layer: DockerfileBuilder.CreatedLayer,
+                       runtime: String,
                        root: URL) async throws {
         let dir = cacheDir(root)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let entry = CachedLayerEntry(digest: layer.digest, size: layer.size)
+        let entry = CachedLayerEntry(digest: layer.digest, size: layer.size, runtime: runtime)
         let data = try JSONEncoder().encode(entry)
         try data.write(to: dir.appendingPathComponent("\(key).json"), options: .atomic)
     }
