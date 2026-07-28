@@ -199,10 +199,16 @@ public actor ImageStore {
         process.standardError = pipe
 
         try process.run()
+        // Drain stderr to EOF *before* waiting. readDataToEndOfFile returns
+        // only when the child closes the pipe (i.e. exits), so this both
+        // reaps and prevents a deadlock : tar emitting more than the ~64 KB
+        // pipe buffer (thousands of whiteout / permission warnings on a large
+        // layer) would otherwise block on the unread reader while we block in
+        // waitUntilExit() — neither side ever moves.
+        let errData = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
 
         if process.terminationStatus != 0 {
-            let errData = pipe.fileHandleForReading.readDataToEndOfFile()
             let errMsg = String(data: errData, encoding: .utf8) ?? "unknown"
             // tar exits non-zero for whiteout files sometimes; only fail on serious errors
             if !errMsg.contains("Ignoring unknown extended header") {

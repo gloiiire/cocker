@@ -31,11 +31,14 @@ enum Ext4Image {
     /// Allocate a sparse `size`-byte file at `url` (ftruncate — costs only
     /// the bytes actually written on APFS). No filesystem yet.
     static func createSparse(at url: URL, size: UInt64) throws {
-        let fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        // 0600 : same rationale as VolumeManager — the image is a raw
+        // filesystem. open()'s mode is umask-masked, so fchmod pins it.
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
         guard fd >= 0 else {
             throw CockerError.requestFailed(
                 "create ext4 image \(url.path): \(String(cString: strerror(errno)))")
         }
+        _ = fchmod(fd, 0o600)
         let rc = ftruncate(fd, off_t(size))
         close(fd)
         guard rc == 0 else {
