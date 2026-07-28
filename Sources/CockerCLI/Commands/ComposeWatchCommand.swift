@@ -103,15 +103,15 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         // watcher would race it (double rebuilds on every save). Point the
         // user at --attach instead of silently starting a rival loop.
         //
-        // BUT : the detached child we spawn (see detachAndExit) re-runs this
-        // exact command, and its parent writes the pidfile with the *child's*
-        // pid. Without the marker below the child reads that pidfile, sees its
-        // OWN pid, concludes "a watch is already running", prints the warning
-        // into watch.log and exits — so the background watch dies the instant
-        // it starts (racily, depending on whether the parent won the write).
-        // The env marker lets the legitimate child through.
-        let isDetachedChild = ProcessInfo.processInfo.environment["COCKER_WATCH_DETACHED_CHILD"] == "1"
-        if !attach, !isDetachedChild, let existing = Self.livePID(projectDir: projectDir) {
+        // Subtlety : the detached child we spawn (see detachAndExit) re-runs
+        // this exact command, and its parent writes the pidfile with the
+        // *child's* pid. So the child legitimately finds its OWN pid here and
+        // must NOT treat that as a rival and bail (that race silently killed
+        // the background watch the instant it started). We bypass the guard
+        // only when the recorded pid is our own — a pidfile holding any OTHER
+        // live pid (including a rival detached child) still stops us, so two
+        // concurrent `--detach` invocations can't both survive.
+        if !attach, let existing = Self.livePID(projectDir: projectDir), existing != getpid() {
             UX.Warning.emit(
                 "a detached watch is already running (pid \(existing))",
                 note: "re-attach with `cocker compose watch --attach`, or stop it with `cocker compose watch --stop`"
@@ -336,16 +336,12 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         proc.standardInput = FileHandle.nullDevice
         proc.standardOutput = logHandle
         proc.standardError = logHandle
-        // Mark the child so its own run() doesn't mistake the pidfile we're
-        // about to write (which holds the child's pid) for a rival watch and
-        // bail out immediately. Without this the background watch dies the
-        // instant it starts.
-        var childEnv = ProcessInfo.processInfo.environment
-        childEnv["COCKER_WATCH_DETACHED_CHILD"] = "1"
-        proc.environment = childEnv
 
         try proc.run()
         let pid = proc.processIdentifier
+        // The child recognises this pid as its own (getpid()) and so skips the
+        // "already running" guard for it — while still bailing on any other
+        // live pid. See the guard in run().
         try? "\(pid)\n".write(toFile: pidPath, atomically: true, encoding: .utf8)
 
         print(UX.ActionLine(
