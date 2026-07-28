@@ -261,7 +261,17 @@ final class DockerAPITLSListener {
             // body (if any) is fully drained.
             var headerEnd: Int? = nil
             var contentLength = 0
+            // Whole-request receive budget. NWConnection.receive has no
+            // timeout of its own, so without this a client that dribbles
+            // bytes (or stalls mid-request) could pin the connection and its
+            // growing buffer indefinitely.
+            let deadline = Date().addingTimeInterval(30)
             while headerEnd == nil || buffer.count < headerEnd! + 4 + contentLength {
+                if Date() > deadline {
+                    CockerLog.shared.warn("docker-api-tls", "request receive timed out")
+                    conn.cancel()
+                    return
+                }
                 let chunk: Data? = await withCheckedContinuation { (k: CheckedContinuation<Data?, Never>) in
                     conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
                         if let error {
@@ -278,6 +288,17 @@ final class DockerAPITLSListener {
                 }
                 guard let chunk, !chunk.isEmpty else { break }
                 buffer.append(chunk)
+                // Bound the header section : until we've seen the blank line
+                // that ends the headers, refuse to accumulate more than the
+                // shared cap. Mirrors the fd parser (which stops at the same
+                // 64 KiB) and stops a client from exhausting memory by never
+                // terminating the header block. Reachable unauthenticated if
+                // COCKER_TCP_TLS_NO_CLIENT_AUTH disables mTLS, so it matters.
+                if headerEnd == nil && buffer.count > HTTPLimits.maxHeaderBytes {
+                    CockerLog.shared.warn("docker-api-tls", "header section exceeded \(HTTPLimits.maxHeaderBytes) bytes")
+                    conn.cancel()
+                    return
+                }
                 // Find header terminator if we don't have it yet.
                 if headerEnd == nil {
                     if let r = buffer.range(of: Data([0x0D, 0x0A, 0x0D, 0x0A])) {

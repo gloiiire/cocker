@@ -50,8 +50,50 @@
 
 static volatile sig_atomic_t worker_count = 0;
 
+/* Scan from the `[` that opens the cmd array to its matching `]`, honoring
+ * quoted strings and backslash escapes so a `]` inside an argument value
+ * doesn't end the array early. Returns the `]` position, or NULL if the
+ * array is unterminated. Operates on the still-pristine buffer. */
+static char *cmd_array_end(char *open_bracket) {
+    char *q = open_bracket + 1;
+    int in_str = 0;
+    while (*q) {
+        if (in_str) {
+            if (*q == '\\' && q[1]) { q += 2; continue; }
+            if (*q == '"') in_str = 0;
+        } else if (*q == '"') {
+            in_str = 1;
+        } else if (*q == ']') {
+            return q;
+        }
+        q++;
+    }
+    return NULL;
+}
+
+/* Locate `needle` (e.g. "\"tty\"") in `buf`, skipping any match that falls
+ * inside the cmd array span (lo, hi). Two properties matter here :
+ *   1. It runs on the pristine buffer *before* the argv loop plants NUL
+ *      terminators into cmd's string values — so it is immune to JSON key
+ *      ordering (JSONEncoder guarantees none). A from-`p`-after-cmd search
+ *      used to miss `tty`/`env` whenever they preceded `cmd`, and a
+ *      whole-buffer strstr used to stop dead at the first NUL the argv loop
+ *      had written.
+ *   2. Skipping the cmd span stops a command argument that literally
+ *      contains the text `"tty"` or `"env"` (e.g. `cocker exec c tty`) from
+ *      being mistaken for the top-level field. */
+static char *find_top_field(char *buf, const char *needle, char *lo, char *hi) {
+    char *s = buf;
+    while ((s = strstr(s, needle)) != NULL) {
+        if (lo && hi && s > lo && s < hi) { s = hi; continue; }
+        return s;
+    }
+    return NULL;
+}
+
 /* Very small in-place JSON scanner — handles the two specific shapes
- * cockerd sends (`{"cmd":[...],"env":{...}}`). Not a general decoder.
+ * cockerd sends (`{"cmd":[...],"env":{...},"tty":bool}` in any key order).
+ * Not a general decoder.
  *
  * Returns the number of argv entries on success, 0 on parse error. argv and
  * env_out are filled with pointers into `buf`, which the caller owns. */
@@ -63,14 +105,15 @@ static int parse_exec_request(char *buf, size_t buf_len,
     if (buf_len >= EXEC_BUF_SIZE) buf_len = EXEC_BUF_SIZE - 1;
     buf[buf_len] = '\0';
 
-    /* --- argv ---
+    *tty_out = 0;
+    argv[0] = NULL;
+    env_out[0] = NULL;
+
+    /* --- locate cmd array ---
      * Locate the colon that terminates the `"cmd"` key, then the *next*
      * non-whitespace char must be a `[`. The pre-fix code used
      * `strchr(p, '[')` which would also accept `"cmd":"[hack]"`, parsing
-     * it as an empty argv array (the next char after `[` is a `"` which
-     * we treat as the start of an item, then we read `hack]` and fail) —
-     * a harmless failure mode in practice but it ate the request buffer
-     * pointer for the env scan below. Constraining the scan to a literal
+     * it as an empty argv array. Constraining the scan to a literal
      * `: WS* [` makes the parser closer to a real JSON peek. */
     char *p = strstr(buf, "\"cmd\"");
     if (!p) return 0;
@@ -79,7 +122,30 @@ static int parse_exec_request(char *buf, size_t buf_len,
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     if (*p != '[') return 0;
-    p++;
+    char *cmd_open = p;
+    char *cmd_close = cmd_array_end(cmd_open);
+
+    /* --- tty & env location --- done on the pristine buffer and outside
+     * the cmd span BEFORE the argv loop below mutates cmd's values. This is
+     * the fix for the order-dependent `exec -it` breakage : previously tty
+     * was only seen if it preceded cmd and env only if it followed cmd, so a
+     * given daemon boot (JSONEncoder's key order is randomized per process)
+     * could silently drop the PTY or the environment for its whole lifetime.
+     * env is *parsed* further down, after argv — its region lies outside the
+     * cmd array, so the argv loop leaves it pristine. */
+    char *t = find_top_field(buf, "\"tty\"", cmd_open, cmd_close);
+    if (t) {
+        t = strchr(t, ':');
+        if (t) {
+            t++;
+            while (*t == ' ' || *t == '\t') t++;
+            if (*t == 't') *tty_out = 1;  /* "true" */
+        }
+    }
+    char *env_field = find_top_field(buf, "\"env\"", cmd_open, cmd_close);
+
+    /* --- argv --- (mutates cmd's string values in place) */
+    p = cmd_open + 1;
     int argc = 0;
     while (*p && argc < argv_max - 1) {
         while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t') p++;
@@ -114,23 +180,9 @@ static int parse_exec_request(char *buf, size_t buf_len,
      * unhelpful 127. */
     if (argc == 0 || argv[0] == NULL || argv[0][0] == '\0') return 0;
 
-    /* --- tty --- search from the start of the buffer so we don't depend
-     * on field order in the JSON (Swift's JSONEncoder doesn't guarantee
-     * one). */
-    *tty_out = 0;
-    char *t = strstr(buf, "\"tty\"");
-    if (t) {
-        t = strchr(t, ':');
-        if (t) {
-            t++;
-            while (*t == ' ' || *t == '\t') t++;
-            if (*t == 't') *tty_out = 1;  /* "true" */
-        }
-    }
-
-    /* --- env --- */
+    /* --- env --- parse from the pre-located pointer (see note above). */
     int envc = 0;
-    char *e = strstr(p, "\"env\"");
+    char *e = env_field;
     if (e) {
         e = strchr(e, '{');
         if (e) {

@@ -32,14 +32,44 @@
 #define MAX_ARGV        128
 #define MAX_ENV         128
 
-/* Verbatim copy of exec_listener.c's parse_exec_request — keep these
- * two synchronized when the production parser changes. */
+/* Verbatim copy of exec_listener.c's parse_exec_request (+ its two helpers)
+ * — keep these synchronized when the production parser changes. */
+static char *cmd_array_end(char *open_bracket) {
+    char *q = open_bracket + 1;
+    int in_str = 0;
+    while (*q) {
+        if (in_str) {
+            if (*q == '\\' && q[1]) { q += 2; continue; }
+            if (*q == '"') in_str = 0;
+        } else if (*q == '"') {
+            in_str = 1;
+        } else if (*q == ']') {
+            return q;
+        }
+        q++;
+    }
+    return NULL;
+}
+
+static char *find_top_field(char *buf, const char *needle, char *lo, char *hi) {
+    char *s = buf;
+    while ((s = strstr(s, needle)) != NULL) {
+        if (lo && hi && s > lo && s < hi) { s = hi; continue; }
+        return s;
+    }
+    return NULL;
+}
+
 static int parse_exec_request(char *buf, size_t buf_len,
                               char **argv, int argv_max,
                               char **env_out, int env_max,
                               int *tty_out) {
     if (buf_len >= EXEC_BUF_SIZE) buf_len = EXEC_BUF_SIZE - 1;
     buf[buf_len] = '\0';
+
+    *tty_out = 0;
+    argv[0] = NULL;
+    env_out[0] = NULL;
 
     char *p = strstr(buf, "\"cmd\"");
     if (!p) return 0;
@@ -48,8 +78,21 @@ static int parse_exec_request(char *buf, size_t buf_len,
     p++;
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     if (*p != '[') return 0;
-    p++;
+    char *cmd_open = p;
+    char *cmd_close = cmd_array_end(cmd_open);
 
+    char *t = find_top_field(buf, "\"tty\"", cmd_open, cmd_close);
+    if (t) {
+        t = strchr(t, ':');
+        if (t) {
+            t++;
+            while (*t == ' ' || *t == '\t') t++;
+            if (*t == 't') *tty_out = 1;
+        }
+    }
+    char *env_field = find_top_field(buf, "\"env\"", cmd_open, cmd_close);
+
+    p = cmd_open + 1;
     int argc = 0;
     while (*p && argc < argv_max - 1) {
         while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t') p++;
@@ -78,19 +121,8 @@ static int parse_exec_request(char *buf, size_t buf_len,
     argv[argc] = NULL;
     if (argc == 0 || argv[0] == NULL || argv[0][0] == '\0') return 0;
 
-    *tty_out = 0;
-    char *t = strstr(buf, "\"tty\"");
-    if (t) {
-        t = strchr(t, ':');
-        if (t) {
-            t++;
-            while (*t == ' ' || *t == '\t') t++;
-            if (*t == 't') *tty_out = 1;
-        }
-    }
-
     int envc = 0;
-    char *e = strstr(p, "\"env\"");
+    char *e = env_field;
     if (e) {
         e = strchr(e, '{');
         if (e) {

@@ -2,6 +2,25 @@ import Foundation
 @preconcurrency import Virtualization
 import CockerCore
 
+/// Write all `count` bytes at `base` to `fd`, looping over short writes and
+/// retrying on EINTR. Returns false on a real write error. A bare
+/// `Darwin.write` may accept only part of the buffer (or be interrupted by a
+/// signal), so callers that must deliver a complete framed message — like the
+/// NL-terminated exec request over vsock — need this instead of a single call.
+fileprivate func writeAllFD(_ fd: Int32, _ base: UnsafeRawPointer, _ count: Int) -> Bool {
+    var off = 0
+    while off < count {
+        let w = Darwin.write(fd, base.advanced(by: off), count - off)
+        if w < 0 {
+            if errno == EINTR { continue }
+            return false
+        }
+        if w == 0 { return false }
+        off += w
+    }
+    return true
+}
+
 // Apple Virtualization.framework runtime
 // Each container = one lightweight Linux VM booted via VZLinuxBootLoader
 // Rootfs shared via virtiofs (VZVirtioFileSystemDeviceConfiguration)
@@ -1190,18 +1209,36 @@ final class VMRuntime: NSObject {
                         let tty: Bool
                     }
                     let req = ExecReq(cmd: command, env: env, tty: tty)
-                    guard let data = try? JSONEncoder().encode(req) else {
+                    // `.sortedKeys` gives a deterministic wire order. The in-VM
+                    // parser is now key-order independent either way, but a
+                    // stable byte stream keeps logs and the exec-parser tests
+                    // reproducible (default JSONEncoder key order is randomized
+                    // per process by the hash seed).
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = .sortedKeys
+                    guard let data = try? encoder.encode(req) else {
                         continuation.yield(StreamEvent(stream: .error, data: "Failed to encode exec request"))
                         continuation.finish(); return
                     }
                     let fd = connection.fileDescriptor
-                    // Request : single JSON line, NL-terminated.
-                    let wrote = data.withUnsafeBytes { buf in
-                        Darwin.write(fd, buf.baseAddress!, buf.count)
+                    // Request : single JSON line, NL-terminated. write() may
+                    // accept only part of the buffer when the socket send
+                    // buffer is nearly full, so loop until every byte is out
+                    // (retrying EINTR) BEFORE sending the newline delimiter.
+                    // Otherwise a large command / env could ship truncated
+                    // JSON followed by the terminator, and the guest would try
+                    // to parse a broken request.
+                    let ok = data.withUnsafeBytes { buf -> Bool in
+                        guard let base = buf.baseAddress else { return false }
+                        return writeAllFD(fd, base, buf.count)
+                    }
+                    guard ok else {
+                        continuation.yield(StreamEvent(stream: .error, data: "Failed to send exec request"))
+                        continuation.finish(); return
                     }
                     var nl: UInt8 = 0x0A
-                    let wroteNL = Darwin.write(fd, &nl, 1)
-                    fputs("[exec] wrote req: bytes=\(wrote) nl=\(wroteNL)\n", stderr); fflush(stderr)
+                    _ = writeAllFD(fd, &nl, 1)
+                    fputs("[exec] wrote req: bytes=\(data.count) nl=1\n", stderr); fflush(stderr)
 
                     // After the JSON+NL terminator, anything we write on
                     // the same vsock fd becomes the child's stdin (the
