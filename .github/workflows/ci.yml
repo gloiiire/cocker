@@ -79,7 +79,10 @@ jobs:
           #     under the in-process test runner. Its PURE logic (footerLines,
           #     ServiceURLs) IS unit-tested (InteractiveFooterTests) — the
           #     exclusion only spares the terminal-bound glue.
-          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/Ext4Image|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift|CockerCLI/UX/InteractiveFooter\.swift)'
+          # EngineOperations was extracted from ContainerEngine without changing
+          # behavior. It owns the same VM/filesystem integration paths, so keep
+          # the coverage boundary stable instead of counting moved code as 0%.
+          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/EngineOperations|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/Ext4Image|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift|CockerCLI/UX/InteractiveFooter\.swift)'
 
           xcrun llvm-cov report "$BIN" -instr-profile="$PROF" \
             -ignore-filename-regex="$IGNORE" \
