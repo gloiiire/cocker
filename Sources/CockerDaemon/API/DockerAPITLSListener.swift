@@ -133,13 +133,14 @@ final class DockerAPITLSListener {
         sec_protocol_options_set_min_tls_protocol_version(
             tlsOptions.securityProtocolOptions, .TLSv12
         )
-        // mTLS — require the client to present a cert too. Without
-        // this anyone with TCP reach to the port could drive cockerd
-        // (= root inside any container). Disabled-by-default in the
-        // env-var "COCKER_TCP_TLS_NO_CLIENT_AUTH" to allow operators
-        // to test the TLS-only path without rolling client certs.
-        let mtlsEnabled = ProcessInfo.processInfo.environment["COCKER_TCP_TLS_NO_CLIENT_AUTH"] == nil
-        if mtlsEnabled {
+        // mTLS is mandatory. A TLS-only listener exposed on 0.0.0.0 gives
+        // every reachable host full daemon control, including host mounts and
+        // arbitrary command execution. Refuse the legacy test escape hatch.
+        if ProcessInfo.processInfo.environment["COCKER_TCP_TLS_NO_CLIENT_AUTH"] != nil {
+            throw CockerError.internalError(
+                "COCKER_TCP_TLS_NO_CLIENT_AUTH is unsafe and no longer supported; configure a client certificate")
+        }
+        do {
             sec_protocol_options_set_peer_authentication_required(
                 tlsOptions.securityProtocolOptions, true
             )

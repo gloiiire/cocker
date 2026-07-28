@@ -24,17 +24,12 @@ public actor IPCClient {
         let sock = socket(AF_UNIX, SOCK_STREAM, 0)
         guard sock >= 0 else { throw CockerError.connectionFailed(String(cString: strerror(errno))) }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        socketPath.withCString { ptr in
-            withUnsafeMutablePointer(to: &addr.sun_path) { dest in
-                dest.withMemoryRebound(to: CChar.self, capacity: 104) { dest in
-                    _ = strncpy(dest, ptr, 103)
-                }
-            }
-        }
+        let addr: sockaddr_un
+        do { addr = try makeUnixSocketAddress(path: socketPath) }
+        catch { close(sock); throw error }
 
-        let result = withUnsafePointer(to: &addr) { ptr in
+        var mutableAddr = addr
+        let result = withUnsafePointer(to: &mutableAddr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                 Darwin.connect(sock, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
             }

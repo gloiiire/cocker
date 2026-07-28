@@ -195,15 +195,20 @@ actor StateStore {
         try data.write(to: tmp)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600],
                                                  ofItemAtPath: tmp.path)
-        do {
-            // Replace existing atomically. macOS rename(2) is atomic between
-            // paths on the same volume — both tmp and stateFile live in
-            // ~/.cocker/ so we're safe.
-            _ = try FileManager.default.replaceItemAt(stateFile, withItemAt: tmp)
-        } catch {
-            // Fallback : straight move. The temp still has 0o600 perms.
-            try? FileManager.default.removeItem(at: stateFile)
-            try FileManager.default.moveItem(at: tmp, to: stateFile)
+        // POSIX rename(2) atomically replaces an existing destination when
+        // both paths are on the same filesystem (they are siblings here).
+        // The old FileManager fallback did remove(old) then move(tmp), which
+        // created a crash window where state.json did not exist at all.
+        // Calling rename directly gives one atomic operation for both the
+        // first save and every replacement.
+        let renameRC = tmp.path.withCString { src in
+            stateFile.path.withCString { dst in Darwin.rename(src, dst) }
+        }
+        guard renameRC == 0 else {
+            let code = errno
+            try? FileManager.default.removeItem(at: tmp)
+            throw CockerError.internalError(
+                "atomic state rename failed: \(String(cString: strerror(code)))")
         }
         // Belt + suspenders : re-assert perms on the final path. Some
         // FileManager.replaceItemAt implementations copy perms from the

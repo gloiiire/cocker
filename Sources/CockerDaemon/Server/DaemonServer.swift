@@ -34,15 +34,9 @@ final class DaemonServer {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw CockerError.internalError("socket() failed: \(String(cString: strerror(errno)))") }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        socketPath.withCString { ptr in
-            withUnsafeMutablePointer(to: &addr.sun_path) { dest in
-                dest.withMemoryRebound(to: CChar.self, capacity: 108) { dest in
-                    _ = strncpy(dest, ptr, 107)
-                }
-            }
-        }
+        var addr: sockaddr_un
+        do { addr = try makeUnixSocketAddress(path: socketPath) }
+        catch { close(fd); throw error }
 
         let bindResult = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in

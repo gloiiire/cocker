@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import Darwin
 @testable import CockerCore
 
 // Unit tests for the pure helpers introduced by the 0.6.0 audit. Each
@@ -65,6 +66,24 @@ struct PathConfinementLexicalTests {
         #expect(throws: CockerError.self) {
             _ = try PathConfinement.confine("etc\0/../escape", to: root)
         }
+    }
+}
+
+@Suite("Unix socket address validation")
+struct UnixSocketAddressTests {
+    @Test func preservesValidPathExactly() throws {
+        let path = "/tmp/cocker-test.sock"
+        var address = try makeUnixSocketAddress(path: path)
+        let decoded = withUnsafePointer(to: &address.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+        }
+        #expect(decoded == path)
+    }
+
+    @Test func rejectsPathThatWouldBeTruncated() {
+        let capacity = MemoryLayout.size(ofValue: sockaddr_un().sun_path)
+        let path = "/" + String(repeating: "x", count: capacity)
+        #expect(throws: Error.self) { try makeUnixSocketAddress(path: path) }
     }
 }
 

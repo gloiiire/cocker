@@ -43,15 +43,9 @@ final class DockerAPIServer {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw CockerError.internalError("docker.sock: socket() failed") }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        socketPath.withCString { ptr in
-            withUnsafeMutablePointer(to: &addr.sun_path) { dest in
-                dest.withMemoryRebound(to: CChar.self, capacity: 108) { dest in
-                    _ = strncpy(dest, ptr, 107)
-                }
-            }
-        }
+        var addr: sockaddr_un
+        do { addr = try makeUnixSocketAddress(path: socketPath) }
+        catch { close(fd); throw error }
 
         let bindResult = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
@@ -166,17 +160,34 @@ final class DockerAPIServer {
         }
         let writerFD = fds[0]
         let readerFD = fds[1]
+        // Drain concurrently. Waiting until routeRequest returns can deadlock
+        // once a streaming response fills the socketpair buffer, particularly
+        // because the router is MainActor-isolated.
+        async let collected = Self.drainResponse(fd: readerFD)
         await routeRequest(req, fd: writerFD)
         close(writerFD)
-        var collected = Data()
-        var buf = [UInt8](repeating: 0, count: 16 * 1024)
-        while true {
-            let n = Darwin.read(readerFD, &buf, buf.count)
-            if n <= 0 { break }
-            collected.append(contentsOf: buf.prefix(Int(n)))
+        return await collected
+    }
+
+    private nonisolated static func drainResponse(fd: Int32) async -> Data {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { close(fd) }
+                var collected = Data()
+                var buf = [UInt8](repeating: 0, count: 16 * 1024)
+                while true {
+                    let n = Darwin.read(fd, &buf, buf.count)
+                    if n > 0 {
+                        collected.append(contentsOf: buf.prefix(Int(n)))
+                    } else if n < 0, errno == EINTR {
+                        continue
+                    } else {
+                        break
+                    }
+                }
+                continuation.resume(returning: collected)
+            }
         }
-        close(readerFD)
-        return collected
     }
 
     // MARK: - Router
@@ -389,11 +400,7 @@ final class DockerAPIServer {
         }
 
         if let response {
-            let data = response.serialize()
-            data.withUnsafeBytes { buf in
-                guard let ptr = buf.baseAddress else { return }
-                _ = Darwin.write(fd, ptr, buf.count)
-            }
+            _ = response.write(to: fd)
         }
     }
 
@@ -840,8 +847,7 @@ final class DockerAPIServer {
     private func handleExecStart(id: String, req: HTTPRequest, fd: Int32) async {
         guard let session = execSessions[id] else {
             let resp = HTTPResponse.error("No such exec instance", status: 404)
-            let data = resp.serialize()
-            data.withUnsafeBytes { buf in _ = Darwin.write(fd, buf.baseAddress!, buf.count) }
+            _ = resp.write(to: fd)
             return
         }
 

@@ -71,7 +71,7 @@ struct StateStoreContainersTests {
     @Test func updateModifiesPersistedField() async throws {
         let (s, dir) = try await makeStore()
         defer { try? FileManager.default.removeItem(at: dir) }
-        var c = sample()
+        let c = sample()
         try await s.store(container: c)
         try await s.updateContainer(id: c.id) { c in
             c.status = .running

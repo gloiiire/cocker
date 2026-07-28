@@ -1224,6 +1224,8 @@ final class VMRuntime: NSObject {
 
         CockerLog.shared.debug("exec", "connecting vsock 9000 for container=\(containerID)")
         return AsyncStream { continuation in
+            let lifetime = ExecStreamLifetime()
+            continuation.onTermination = { @Sendable _ in lifetime.cancel() }
             socketDevice.connect(toPort: 9000) { result in
                 switch result {
                 case .failure(let error):
@@ -1251,6 +1253,10 @@ final class VMRuntime: NSObject {
                         continuation.finish(); return
                     }
                     let fd = connection.fileDescriptor
+                    guard lifetime.register(fd: fd) else {
+                        continuation.finish()
+                        return
+                    }
                     // Request : single JSON line, NL-terminated. write() may
                     // accept only part of the buffer when the socket send
                     // buffer is nearly full, so loop until every byte is out
@@ -1303,9 +1309,10 @@ final class VMRuntime: NSObject {
                     // (and tear down the vsock fd) the moment the callback
                     // returns. Without this, the host side closes its end
                     // before the guest can accept().
-                    let retained = connection
-                    Task.detached {
-                        _ = retained  // keep alive for the lifetime of the stream
+                    let retained = ConnectionHolder(connection)
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        _ = retained.connection  // keep alive for the lifetime of the stream
+                        defer { lifetime.complete() }
                         var buffer = Data()
                         var chunk = [UInt8](repeating: 0, count: 4096)
                         let exitMarker = Data("__COCKER_EXIT__".utf8)
@@ -1323,6 +1330,7 @@ final class VMRuntime: NSObject {
 
                         while true {
                             let n = Darwin.read(fd, &chunk, chunk.count)
+                            if n < 0, errno == EINTR { continue }
                             if n <= 0 { continuation.finish(); break }
                             buffer.append(contentsOf: chunk.prefix(n))
 
@@ -1368,6 +1376,36 @@ final class VMRuntime: NSObject {
 final class ConnectionHolder: @unchecked Sendable {
     let connection: VZVirtioSocketConnection
     init(_ connection: VZVirtioSocketConnection) { self.connection = connection }
+}
+
+/// Cancellation bridge for an AsyncStream backed by a blocking vsock read.
+/// shutdown(2) wakes the GCD reader immediately when the consumer disappears.
+final class ExecStreamLifetime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fd: Int32 = -1
+    private var cancelled = false
+
+    func register(fd: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !cancelled else {
+            _ = Darwin.shutdown(fd, SHUT_RDWR)
+            return false
+        }
+        self.fd = fd
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let current = fd
+        lock.unlock()
+        if current >= 0 { _ = Darwin.shutdown(current, SHUT_RDWR) }
+    }
+
+    func complete() {
+        lock.lock(); fd = -1; lock.unlock()
+    }
 }
 
 /// Single-shot resume guard. NSLock-backed so the timeout / connect
