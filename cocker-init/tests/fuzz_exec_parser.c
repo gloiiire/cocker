@@ -32,30 +32,52 @@
 #define MAX_ARGV        128
 #define MAX_ENV         128
 
-/* Verbatim copy of exec_listener.c's parse_exec_request (+ its two helpers)
+/* Verbatim copy of exec_listener.c's parse_exec_request (+ top_level_value)
  * — keep these synchronized when the production parser changes. */
-static char *cmd_array_end(char *open_bracket) {
-    char *q = open_bracket + 1;
-    int in_str = 0;
-    while (*q) {
-        if (in_str) {
-            if (*q == '\\' && q[1]) { q += 2; continue; }
-            if (*q == '"') in_str = 0;
-        } else if (*q == '"') {
-            in_str = 1;
-        } else if (*q == ']') {
-            return q;
+static char *top_level_value(char *buf, const char *key) {
+    char *p = strchr(buf, '{');
+    if (!p) return NULL;
+    p++;
+    size_t keylen = strlen(key);
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p == '}' || *p == '\0') return NULL;
+        if (*p != '"') return NULL;
+        char *k = p + 1;
+        char *ke = k;
+        while (*ke && *ke != '"') { if (*ke == '\\' && ke[1]) ke += 2; else ke++; }
+        if (*ke != '"') return NULL;
+        size_t klen = (size_t)(ke - k);
+        p = ke + 1;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p != ':') return NULL;
+        p++;
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        char *value = p;
+        if (klen == keylen && strncmp(k, key, keylen) == 0) return value;
+        if (*p == '"') {
+            p++;
+            while (*p && *p != '"') { if (*p == '\\' && p[1]) p += 2; else p++; }
+            if (*p == '"') p++;
+        } else if (*p == '{' || *p == '[') {
+            int depth = 0, in_str = 0;
+            for (; *p; p++) {
+                if (in_str) {
+                    if (*p == '\\' && p[1]) { p++; continue; }
+                    if (*p == '"') in_str = 0;
+                } else if (*p == '"') {
+                    in_str = 1;
+                } else if (*p == '{' || *p == '[') {
+                    depth++;
+                } else if (*p == '}' || *p == ']') {
+                    depth--;
+                    if (depth == 0) { p++; break; }
+                }
+            }
+        } else {
+            while (*p && *p != ',' && *p != '}' && *p != ']'
+                   && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
         }
-        q++;
-    }
-    return NULL;
-}
-
-static char *find_top_field(char *buf, const char *needle, char *lo, char *hi) {
-    char *s = buf;
-    while ((s = strstr(s, needle)) != NULL) {
-        if (lo && hi && s > lo && s < hi) { s = hi; continue; }
-        return s;
     }
     return NULL;
 }
@@ -71,28 +93,15 @@ static int parse_exec_request(char *buf, size_t buf_len,
     argv[0] = NULL;
     env_out[0] = NULL;
 
-    char *p = strstr(buf, "\"cmd\"");
-    if (!p) return 0;
-    p = strchr(p, ':');
-    if (!p) return 0;
-    p++;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != '[') return 0;
-    char *cmd_open = p;
-    char *cmd_close = cmd_array_end(cmd_open);
+    char *cmd_open = top_level_value(buf, "cmd");
+    if (!cmd_open || *cmd_open != '[') return 0;
 
-    char *t = find_top_field(buf, "\"tty\"", cmd_open, cmd_close);
-    if (t) {
-        t = strchr(t, ':');
-        if (t) {
-            t++;
-            while (*t == ' ' || *t == '\t') t++;
-            if (*t == 't') *tty_out = 1;
-        }
-    }
-    char *env_field = find_top_field(buf, "\"env\"", cmd_open, cmd_close);
+    char *t = top_level_value(buf, "tty");
+    if (t && *t == 't') *tty_out = 1;
 
-    p = cmd_open + 1;
+    char *env_field = top_level_value(buf, "env");
+
+    char *p = cmd_open + 1;
     int argc = 0;
     while (*p && argc < argv_max - 1) {
         while (*p == ' ' || *p == ',' || *p == '\n' || *p == '\t') p++;

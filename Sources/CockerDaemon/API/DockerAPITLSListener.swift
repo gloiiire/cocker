@@ -29,6 +29,13 @@ private final class UncheckedBox<T>: @unchecked Sendable {
     init(_ value: T) { self.value = value }
 }
 
+/// Outcome of one `conn.receive` raced against an idle-timeout sleep.
+private enum TLSRecvOutcome {
+    case data(Data)
+    case eof        // clean close, error, or empty complete
+    case timedOut   // no bytes for the idle window
+}
+
 @MainActor
 final class DockerAPITLSListener {
     private let port: NWEndpoint.Port
@@ -261,32 +268,55 @@ final class DockerAPITLSListener {
             // body (if any) is fully drained.
             var headerEnd: Int? = nil
             var contentLength = 0
-            // Whole-request receive budget. NWConnection.receive has no
-            // timeout of its own, so without this a client that dribbles
-            // bytes (or stalls mid-request) could pin the connection and its
-            // growing buffer indefinitely.
-            let deadline = Date().addingTimeInterval(30)
-            while headerEnd == nil || buffer.count < headerEnd! + 4 + contentLength {
-                if Date() > deadline {
-                    CockerLog.shared.warn("docker-api-tls", "request receive timed out")
-                    conn.cancel()
-                    return
-                }
-                let chunk: Data? = await withCheckedContinuation { (k: CheckedContinuation<Data?, Never>) in
-                    conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
-                        if let error {
-                            CockerLog.shared.warn("docker-api-tls", "receive error: \(error)")
-                            k.resume(returning: nil)
-                            return
+            // Per-receive IDLE timeout, reset on every chunk. NWConnection.receive
+            // has no timeout of its own. A fixed whole-request deadline is wrong
+            // twice over : it kills a legitimately long transfer that is still
+            // making progress (a large image push over a slow link), and it
+            // never fires while the client is actually stalled inside receive()
+            // — only between chunks. Racing each receive against a sleep bounds
+            // a stalled / slowloris connection without capping honest big bodies.
+            let idleTimeoutNanos: UInt64 = 30 * 1_000_000_000
+            receiveLoop: while headerEnd == nil || buffer.count < headerEnd! + 4 + contentLength {
+                let outcome: TLSRecvOutcome = await withTaskGroup(of: TLSRecvOutcome.self) { group in
+                    group.addTask {
+                        await withCheckedContinuation { (k: CheckedContinuation<TLSRecvOutcome, Never>) in
+                            conn.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, _, error in
+                                if let error {
+                                    CockerLog.shared.warn("docker-api-tls", "receive error: \(error)")
+                                    k.resume(returning: .eof)
+                                    return
+                                }
+                                if let data, !data.isEmpty {
+                                    k.resume(returning: .data(data))
+                                } else {
+                                    k.resume(returning: .eof)  // isComplete / empty
+                                }
+                            }
                         }
-                        if isComplete && (data == nil || data!.isEmpty) {
-                            k.resume(returning: nil)
-                            return
-                        }
-                        k.resume(returning: data)
                     }
+                    group.addTask {
+                        try? await Task.sleep(nanoseconds: idleTimeoutNanos)
+                        return .timedOut
+                    }
+                    let first = await group.next() ?? .eof
+                    // If the idle timer won, cancel the connection NOW so the
+                    // still-pending receive callback fires and its child task
+                    // can finish — withTaskGroup awaits every child at scope
+                    // exit, so a stuck continuation would otherwise hang here.
+                    if case .timedOut = first { conn.cancel() }
+                    group.cancelAll()
+                    return first
                 }
-                guard let chunk, !chunk.isEmpty else { break }
+                let chunk: Data
+                switch outcome {
+                case .timedOut:
+                    CockerLog.shared.warn("docker-api-tls", "receive idle-timed out")
+                    return  // conn already cancelled inside the group
+                case .eof:
+                    break receiveLoop
+                case .data(let d):
+                    chunk = d
+                }
                 buffer.append(chunk)
                 // Bound the header section : until we've seen the blank line
                 // that ends the headers, refuse to accumulate more than the
