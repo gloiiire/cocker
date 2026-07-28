@@ -64,7 +64,7 @@ static int g_build_overlay = 0;
 
 /* Shared tail for every rootfs backend : once the real root is mounted
  * at /newroot, move the early /proc,/sys,/dev into it, set up
- * /run,/tmp,/dev/pts, then switch_root into /newroot. Only the backing
+ * /tmp,/dev/pts, then switch_root into /newroot. Only the backing
  * mount (virtiofs vs ext4 block) differs between callers. */
 static void finish_switch_root(void) {
     mkdir("/newroot/proc", 0755);
@@ -77,8 +77,12 @@ static void finish_switch_root(void) {
     mount("/sys",  "/newroot/sys",  NULL, MS_MOVE, NULL);
     mount("/dev",  "/newroot/dev",  NULL, MS_MOVE, NULL);
 
-    mount("tmpfs", "/newroot/run", "tmpfs", MS_NOSUID | MS_NODEV,
-          "mode=755,size=64m");
+    /* Do not mount a fresh tmpfs over /run here. The default OCI runtime
+     * semantics preserve the image's /run tree. Masking it broke images that
+     * create required runtime directories during build, notably nginx images
+     * with /run/nginx.
+     * mkdir above still supplies /run for FROM scratch without replacing
+     * existing image contents. */
     if (g_build_overlay) {
         /* Build VMs : keep /tmp on the roomy ext4 overlay (~16 GiB) rather
          * than a 64 MB tmpfs. pip / npm / cargo stage large downloads under
