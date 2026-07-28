@@ -108,14 +108,23 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         // stale lock to recover, no unlink race, and no malformed-file wedge.
         // The pidfile is now just an advisory record of who holds it, written
         // here so --status / --stop can find us.
-        if !attach {
-            guard Self.acquireWatchLock(projectDir: projectDir) else {
-                UX.Warning.emit(
-                    "a watch is already running for this project",
-                    note: "re-attach with `cocker compose watch --attach`, or stop it with `cocker compose watch --stop`"
-                )
-                return
-            }
+        // Every path that runs the loop takes the lock — foreground, --attach
+        // (its stopDetached above already released the previous holder's), and
+        // the detached child. The detach PARENT returns via detachAndExit and
+        // never reaches here.
+        guard Self.acquireWatchLock(projectDir: projectDir) else {
+            UX.Warning.emit(
+                "a watch is already running for this project",
+                note: "re-attach with `cocker compose watch --attach`, or stop it with `cocker compose watch --stop`"
+            )
+            return
+        }
+        // Only the detached background child records the pidfile : it is the
+        // one whose output goes to watch.log, so --status/--logs/--stop track
+        // it. A foreground / attached watcher shows output live in its own
+        // terminal and stays unregistered — so `--logs` from another terminal
+        // never latches onto its static log file.
+        if ProcessInfo.processInfo.environment["COCKER_WATCH_DETACHED_CHILD"] == "1" {
             try? "\(getpid())\n".write(toFile: Self.pidFilePath(projectDir),
                                        atomically: true, encoding: .utf8)
         }
@@ -148,10 +157,12 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         footer.start(
             footer: footerContent,
             onDetach: {
-                // `d` → spawn a detached background watch (same as -d) and
-                // exit. If one already runs, detachAndExit refuses and returns
-                // false so the footer re-arms.
-                (try? Self.detachAndExit(projectDir: dir, originalArgs: CommandLine.arguments)) ?? false
+                // `d` → hand off to a detached background watch and exit.
+                // Release OUR lock (and pid) first so the child can claim
+                // them ; otherwise the child would fail acquireWatchLock and
+                // exit, and detaching would silently do nothing.
+                Self.releaseWatchLock(projectDir: dir)
+                return (try? Self.detachAndExit(projectDir: dir, originalArgs: CommandLine.arguments)) ?? false
             },
             onQuit: {
                 // `q` / Ctrl-C = quit for real : stop watching AND tear the
@@ -232,6 +243,17 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         }
         lockFD = fd  // keep open → lock held until this process exits
         return true
+    }
+
+    /// Drop the flock (and any pidfile we recorded) so another process can
+    /// take over. Used when a foreground watcher hands off to a detached
+    /// child via the `d` key — the child must be able to claim the lock.
+    private static func releaseWatchLock(projectDir: String) {
+        if lockFD >= 0 {
+            close(lockFD)  // closing the fd releases the kernel flock
+            lockFD = -1
+        }
+        try? FileManager.default.removeItem(atPath: pidFilePath(projectDir))
     }
 
     /// Terminate a detached background watcher (SIGTERM, escalate to
@@ -361,12 +383,31 @@ struct ComposeWatchCommand: AsyncParsableCommand {
         proc.standardInput = FileHandle.nullDevice
         proc.standardOutput = logHandle
         proc.standardError = logHandle
+        // Tell the child it is THE detached background watcher so it records
+        // the pidfile once it wins the flock (foreground watchers don't).
+        var childEnv = ProcessInfo.processInfo.environment
+        childEnv["COCKER_WATCH_DETACHED_CHILD"] = "1"
+        proc.environment = childEnv
 
         try proc.run()
         let pid = proc.processIdentifier
-        // The child registers its own pid in the pidfile once it wins the
-        // flock in run() — we don't write it here, so --status/--stop always
-        // reflect the process that actually holds the lock.
+        // Wait for the child to actually win the flock and register, so we
+        // never report a successful background start for a child that lost a
+        // race (or hit a held lock) and exited. It registers its pid in the
+        // pidfile from run() the moment it holds the lock.
+        var registered = false
+        for _ in 0..<40 {  // ~2s
+            if Self.livePID(projectDir: projectDir) == pid { registered = true; break }
+            if kill(pid, 0) != 0 { break }  // child already gone
+            usleep(50_000)
+        }
+        guard registered else {
+            UX.Warning.emit(
+                "could not start background watch — another may already own this project",
+                note: "check `cocker compose watch --status`"
+            )
+            return false
+        }
 
         print(UX.ActionLine(
             icon: .success, name: "watch",
