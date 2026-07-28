@@ -21,7 +21,7 @@ struct ReconcileAfterRestartTests {
             .appendingPathComponent("cocker-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
         let store = try StateStore(rootDir: tmp)
-        var c = Container(
+        let c = Container(
             id: "abcdef012345",
             name: "t",
             image: "alpine",

@@ -228,7 +228,6 @@ actor L2Switch: L2Switching {
     }
 
     private nonisolated func log(_ msg: String) {
-        fputs("[l2switch] \(msg)\n", stderr)
-        fflush(stderr)
+        CockerLog.shared.debug("l2switch", "\(msg)")
     }
 }

@@ -126,9 +126,9 @@ final class ContainerEngine {
                 group.addTask { @MainActor [self] in
                     do {
                         try await self.start(id: c.id)
-                        fputs("[eng] auto-restarted \(c.id) (policy=\(c.restartPolicy))\n", stderr); fflush(stderr)
+                        CockerLog.shared.debug("eng", "auto-restarted \(c.id) (policy=\(c.restartPolicy))")
                     } catch {
-                        fputs("[eng] auto-restart failed for \(c.id): \(error)\n", stderr); fflush(stderr)
+                        CockerLog.shared.error("eng", "auto-restart failed for \(c.id): \(error)")
                     }
                 }
             }
@@ -145,7 +145,7 @@ final class ContainerEngine {
         var spanStatus: SpanStatus = .ok
         defer { runSpan.end(status: spanStatus) }
 
-        fputs("[eng] run() image=\(config.image)\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "run() image=\(config.image)")
         // Pre-flight lease pool check : if vmnet's bootpd is saturated,
         // the new VM will silently fail DHCP. Touch the helper trigger
         // proactively so we don't ship a half-broken container.
@@ -177,21 +177,21 @@ final class ContainerEngine {
                 spanStatus = .error
                 throw error
             }
-            fputs("[eng] image not present, pulling\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("eng", "image not present, pulling")
         }
-        fputs("[eng] image exists\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "image exists")
 
         // Generate container ID and name (12 chars lowercase, matches state lookup)
         let id = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(12)).lowercased()
-        fputs("[eng] id=\(id)\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "id=\(id)")
         let generatedName = await state.generateName()
         let name = config.name ?? generatedName
-        fputs("[eng] name=\(name)\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "name=\(name)")
 
         guard !(await state.nameExists(name)) else {
             throw CockerError.containerAlreadyExists(name)
         }
-        fputs("[eng] name unique check OK\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "name unique check OK")
 
         // Resolve ports
         let ports = config.ports
@@ -273,46 +273,46 @@ final class ContainerEngine {
         container.shmSizeMB = config.shmSizeMB
         if let workdir = resolvedWorkdir { container.env["WORKDIR"] = workdir }
 
-        fputs("[eng] container struct created\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "container struct created")
         // Allocate IP
         container.ip = await networks.allocateIP(for: id)
-        fputs("[eng] ipv4=\(container.ip ?? "?")\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "ipv4=\(container.ip ?? "?")")
         container.ipv6 = await networks.allocateIPv6(for: id)
-        fputs("[eng] ipv6=\(container.ipv6 ?? "?")\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "ipv6=\(container.ipv6 ?? "?")")
         // Allocate IP+MAC on the cocker L2 switch (inter-container fabric)
         let (cIP, cMAC) = await networks.allocateCockerIPAndMAC(for: id)
         container.cockerIP = cIP
         container.cockerMAC = cMAC
-        fputs("[eng] cocker switch ip=\(cIP) mac=\(cMAC)\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "cocker switch ip=\(cIP) mac=\(cMAC)")
         // eth0 MAC is filled in after VM start (VZ picks it during config).
         // We use it later to look up the matching lease in
         // /var/db/dhcpd_leases when /cocker-ip polling times out.
         container.natMAC = nil
         try await state.store(container: container)
-        fputs("[eng] state stored\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "state stored")
         emitEvent("container", action: "create", id: id)
-        fputs("[eng] event emitted\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "event emitted")
 
         // Start VM
         // Overlay rootfs : clone le rootfs de l'image vers un dossier propre
         // au container via APFS clonefile. Garantit l'isolation fs entre
         // containers de la même image (sinon ils écrivent dans le même rootfs
         // partagé — bug du PoC initial visible sur compose db+web).
-        fputs("[eng] cloning rootfs (APFS copy-on-write)\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "cloning rootfs (APFS copy-on-write)")
         // S'assure que l'image a un rootfs extrait (pull-on-demand)
         _ = try await images.rootfsPath(for: config.image)
         let rootfsPath = try await images.cloneRootfs(for: config.image, containerID: id)
-        fputs("[eng] container rootfs=\(rootfsPath.path)\n", stderr); fflush(stderr)
-        fputs("[eng] calling vmRuntime.start\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "container rootfs=\(rootfsPath.path)")
+        CockerLog.shared.debug("eng", "calling vmRuntime.start")
         try await vmRuntime.start(container: container, rootfsPath: rootfsPath)
-        fputs("[eng] vmRuntime.start returned\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("eng", "vmRuntime.start returned")
         // Drain the eth0 MAC VZ generated during createVM and persist it so
         // the IP-discovery task below can use it for /var/db/dhcpd_leases
         // fallback when the in-VM /cocker-ip write loses the race.
         if let mac = vmRuntime.takeNATMAC(forContainer: id) {
             container.natMAC = mac
             try? await state.updateContainer(id: id) { c in c.natMAC = mac }
-            fputs("[eng] nat MAC=\(mac)\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("eng", "nat MAC=\(mac)")
         }
 
         // Update status
@@ -333,12 +333,12 @@ final class ContainerEngine {
         // du rootfs (visible via virtiofs côté host). On poll ce fichier
         // pour récupérer l'IP — placeholder "127.0.0.1" si non dispo.
         if !ports.isEmpty {
-            fputs("[eng] scheduling IP discovery task for ports: \(ports.map { $0.description }.joined(separator: ","))\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("eng", "scheduling IP discovery task for ports: \(ports.map { $0.description }.joined(separator: ","))")
             let natMAC = container.natMAC
             Task { [rootfsPath, ports, id, natMAC] in
-                fputs("[eng] IP discovery task started for \(id)\n", stderr); fflush(stderr)
+                CockerLog.shared.debug("eng", "IP discovery task started for \(id)")
                 let ipFile = rootfsPath.appendingPathComponent("cocker-ip")
-                fputs("[eng] polling \(ipFile.path)\n", stderr); fflush(stderr)
+                CockerLog.shared.debug("eng", "polling \(ipFile.path)")
                 var realIP: String? = nil
                 for attempt in 0..<150 {  // 15s timeout (100ms × 150)
                     if FileManager.default.fileExists(atPath: ipFile.path),
@@ -347,7 +347,7 @@ final class ContainerEngine {
                                     .trimmingCharacters(in: .whitespacesAndNewlines),
                        !ip.isEmpty {
                         realIP = ip
-                        fputs("[eng] IP read on attempt \(attempt): \(ip)\n", stderr); fflush(stderr)
+                        CockerLog.shared.debug("eng", "IP read on attempt \(attempt): \(ip)")
                         break
                     }
                     try? await Task.sleep(nanoseconds: 100_000_000)
@@ -366,26 +366,24 @@ final class ContainerEngine {
                 if realIP == nil, let mac = natMAC,
                    let leased = ContainerEngine.lookupLeasedIP(forMAC: mac) {
                     realIP = leased
-                    fputs("[eng] /cocker-ip never appeared; recovered from /var/db/dhcpd_leases: \(leased) (mac=\(mac))\n", stderr); fflush(stderr)
+                    CockerLog.shared.debug("eng", "/cocker-ip never appeared; recovered from /var/db/dhcpd_leases: \(leased) (mac=\(mac))")
                 }
                 let finalIP = realIP ?? "127.0.0.1"
                 if realIP == nil {
                     let pool = ContainerEngine.leasePoolCount()
                     let helper = ContainerEngine.leasePoolHelperInstalled() ? "yes" : "no"
-                    fputs(
-                        "[eng] WARN container \(id) got no DHCP IP after 15s — port-forwarding will route to 127.0.0.1 (broken). " +
+                    CockerLog.shared.warn("eng",
+                        "container \(id) got no DHCP IP after 15s — port-forwarding will route to 127.0.0.1 (broken). " +
                         "Lease pool=\(pool)/256, helper installed=\(helper). " +
-                        "Run `cocker daemon clear-leases` (one-shot) or `cocker daemon helper-install` (permanent).\n",
-                        stderr)
-                    fflush(stderr)
+                        "Run `cocker daemon clear-leases` (one-shot) or `cocker daemon helper-install` (permanent).")
                 } else {
-                    fputs("[eng] container IP discovered: \(finalIP) (ports: \(ports.map { $0.description }.joined(separator: ", ")))\n", stderr); fflush(stderr)
+                    CockerLog.shared.debug("eng", "container IP discovered: \(finalIP) (ports: \(ports.map { $0.description }.joined(separator: ", ")))")
                 }
                 // Update state with real IP
                 try? await self.state.updateContainer(id: id) { c in c.ip = finalIP }
-                fputs("[eng] state updated, calling portForwarder.start\n", stderr); fflush(stderr)
+                CockerLog.shared.debug("eng", "state updated, calling portForwarder.start")
                 await self.portForwarder.start(containerID: id, containerIP: finalIP, mappings: ports)
-                fputs("[eng] portForwarder.start returned\n", stderr); fflush(stderr)
+                CockerLog.shared.debug("eng", "portForwarder.start returned")
             }
         }
 
@@ -601,7 +599,12 @@ final class ContainerEngine {
             guard await state.container(id: containerID)?.status == .running else { continue }
             // Always append to the ring buffer ; FailingStreak is updated
             // below based on Docker's start-period rules.
-            try? await state.updateContainer(id: containerID) { c in
+            // `.coalesced` : probe history is the hottest write path in the
+            // daemon (one append per probe per container) and losing <1 s
+            // of it on a crash is harmless — reconcileAfterRestart resets
+            // health bookkeeping anyway. Don't pay a full state.json
+            // rewrite for it.
+            try? await state.updateContainer(id: containerID, durability: .coalesced) { c in
                 c.healthLog.append(HealthLogEntry(start: probeStart,
                                                   end: probeEnd,
                                                   exitCode: result.exitCode,
@@ -612,7 +615,7 @@ final class ContainerEngine {
             }
             if result.exitCode == 0 {
                 consecutiveFailures = 0
-                try? await state.updateContainer(id: containerID) { c in c.healthFailingStreak = 0 }
+                try? await state.updateContainer(id: containerID, durability: .coalesced) { c in c.healthFailingStreak = 0 }
                 if !nowHealthy {
                     nowHealthy = true
                     try? await state.updateContainer(id: containerID) { c in c.healthStatus = .healthy }
@@ -625,7 +628,7 @@ final class ContainerEngine {
                 // unhealthy yet.
                 if Date() < initialStartPeriodEndsAt { continue }
                 consecutiveFailures += 1
-                try? await state.updateContainer(id: containerID) { c in
+                try? await state.updateContainer(id: containerID, durability: .coalesced) { c in
                     c.healthFailingStreak = consecutiveFailures
                 }
                 if consecutiveFailures >= spec.retries, nowHealthy || consecutiveFailures == spec.retries {
@@ -680,7 +683,7 @@ final class ContainerEngine {
         do {
             try Data(encoded.utf8).write(to: cmdFile, options: .atomic)
         } catch {
-            fputs("[health] couldn't write \(cmdFile.path): \(error)\n", stderr); fflush(stderr)
+            CockerLog.shared.error("health", "couldn't write \(cmdFile.path): \(error)")
             return ProbeResult(exitCode: 1, output: "internal: failed to write probe request")
         }
 
@@ -709,11 +712,11 @@ final class ContainerEngine {
             let output = String(raw[raw.index(after: nl)...])
                 .replacingOccurrences(of: "\u{0}", with: " ")
             try? FileManager.default.removeItem(at: resultFile)
-            fputs("[health] cmd \(containerID) seq=\(seq) → exit \(code)\n", stderr); fflush(stderr)
+            CockerLog.shared.debug("health", "cmd \(containerID) seq=\(seq) → exit \(code)")
             return ProbeResult(exitCode: code, output: output)
         }
         try? FileManager.default.removeItem(at: cmdFile)
-        fputs("[health] cmd \(containerID) seq=\(seq) → daemon-side timeout after \(Int(timeout))s\n", stderr); fflush(stderr)
+        CockerLog.shared.debug("health", "cmd \(containerID) seq=\(seq) → daemon-side timeout after \(Int(timeout))s")
         // 124 matches Docker's reserved "timeout" exit code so the surfaced
         // FailingStreak / Log entry tells the user what went wrong.
         return ProbeResult(exitCode: 124, output: "probe timed out")
@@ -1043,6 +1046,11 @@ final class ContainerEngine {
         let historical = vmRuntime.logs(containerID: container.id, tail: request.tail)
         let follow = request.follow
         let containerID = container.id
+        // Subscribe BEFORE returning the stream. VMRuntime and this engine
+        // share MainActor isolation, so no log can land between the final
+        // backlog snapshot and continuation registration without one of
+        // the two actor-isolated operations seeing it.
+        let live = follow ? vmRuntime.liveLogs(containerID: containerID) : nil
 
         return AsyncStream { continuation in
             Task { @MainActor in
@@ -1055,20 +1063,15 @@ final class ContainerEngine {
                     return
                 }
 
-                // Tail follow: check every 100ms for new logs (real impl: pipe from VM console)
-                var lastCount = historical.count
-                while true {
-                    try? await Task.sleep(nanoseconds: 100_000_000)
-                    let current = self.vmRuntime.logs(containerID: containerID, tail: 0)
-                    if current.count > lastCount {
-                        for event in current.dropFirst(lastCount) {
-                            continuation.yield(event)
-                        }
-                        lastCount = current.count
-                    }
-                    if !self.vmRuntime.isRunning(containerID: containerID) {
-                        break
-                    }
+                guard let live else {
+                    continuation.finish()
+                    return
+                }
+                // Event-driven follow : appendLog yields each console event
+                // directly. No permanent 100 ms timer per client, no O(M)
+                // MainActor churn for M attached log followers.
+                for await event in live {
+                    continuation.yield(event)
                 }
                 continuation.finish()
             }
@@ -1330,7 +1333,7 @@ final class ContainerEngine {
                                     restartAttempts = 0
                                 }
                             } catch {
-                                fputs("[eng] restart failed: \(error)\n", stderr); fflush(stderr)
+                                CockerLog.shared.error("eng", "restart failed: \(error)")
                             }
                         }
                     }
@@ -1378,7 +1381,7 @@ final class ContainerEngine {
                 pruned.append(img.reference)
             } catch {
                 // Best-effort : one stuck image shouldn't block the rest.
-                fputs("[gc] skip \(img.reference): \(error)\n", stderr)
+                CockerLog.shared.error("gc", "skip \(img.reference): \(error)")
             }
         }
         return pruned
@@ -1415,4 +1418,3 @@ final class ContainerEngine {
         LeasePoolMonitor.lookupLeasedIP(forMAC: mac)
     }
 }
-

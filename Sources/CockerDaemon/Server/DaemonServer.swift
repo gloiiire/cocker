@@ -8,14 +8,13 @@ final class DaemonServer {
     private let socketPath: String
     private let engine: ContainerEngine
     private let compose: ComposeEngine
-    // `serverFD` and `isRunning` are touched from the nonisolated accept
-    // loop ; `nonisolated(unsafe)` lets us read them without an `await`
-    // hop. Writes happen only at start/stop, the accept syscall observes
-    // any stale value within one iteration (the next accept after
-    // serverFD is closed returns -1 and the loop drops out), so a benign
-    // data race is acceptable here.
-    private nonisolated(unsafe) var serverFD: Int32 = -1
-    private nonisolated(unsafe) var isRunning = false
+    // Both are only ever read/written from the MainActor : `acceptLoop`
+    // stays actor-isolated and only the blocking accept(2) syscall runs
+    // off-actor in a detached Task (the `await` suspends without blocking
+    // the actor). No `nonisolated(unsafe)`, no benign-race hand-waving —
+    // same pattern as DockerAPIServer.
+    private var serverFD: Int32 = -1
+    private var isRunning = false
 
     init(socketPath: String, engine: ContainerEngine) {
         self.socketPath = socketPath
@@ -35,15 +34,9 @@ final class DaemonServer {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw CockerError.internalError("socket() failed: \(String(cString: strerror(errno)))") }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        socketPath.withCString { ptr in
-            withUnsafeMutablePointer(to: &addr.sun_path) { dest in
-                dest.withMemoryRebound(to: CChar.self, capacity: 108) { dest in
-                    _ = strncpy(dest, ptr, 107)
-                }
-            }
-        }
+        var addr: sockaddr_un
+        do { addr = try makeUnixSocketAddress(path: socketPath) }
+        catch { close(fd); throw error }
 
         let bindResult = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
@@ -75,15 +68,15 @@ final class DaemonServer {
         await acceptLoop()
     }
 
-    private nonisolated func acceptLoop() async {
+    private func acceptLoop() async {
         while isRunning {
-            // accept(2) blocks until a client connects ; we already run it
-            // off the main actor via Task.detached so the daemon's other
-            // background tasks (watchers, healthchecks, signal sources) can
-            // make progress while we wait.
-            let clientFD = await Task.detached(priority: .userInitiated) { [fd = self.serverFD] in
-                accept(fd, nil, nil)
-            }.value
+            // accept(2) blocks until a client connects. The loop itself is
+            // actor-isolated (so serverFD/isRunning reads are race-free) ;
+            // only the blocking syscall runs on a GCD worker. Do NOT use
+            // Task.detached here : it shares Swift's cooperative executor,
+            // whose threads must never block in POSIX I/O. A few idle
+            // clients could otherwise occupy every executor thread.
+            let clientFD = await Self.acceptConnection(on: serverFD)
 
             guard clientFD >= 0 else {
                 if !isRunning { break }
@@ -120,7 +113,11 @@ final class DaemonServer {
     private nonisolated func handleConnection(fd: Int32) async {
         do {
             while true {
-                let data = try IPCFramer.read(from: fd)
+                // Same rule as accept(2) : a client may stay connected and
+                // silent indefinitely. Keep blocking read(2) on GCD rather
+                // than parking one Swift cooperative-executor thread per
+                // idle connection.
+                let data = try await Self.readFrame(from: fd)
                 // Decode off-actor too — IPCRequest is Sendable so this is
                 // safe. Only the engine call below requires MainActor.
                 let request = try JSONDecoder().decode(IPCRequest.self, from: data)
@@ -131,6 +128,31 @@ final class DaemonServer {
             // client that issued one command and disconnected. We swallow
             // the error here ; sendErrorResponse-worthy failures already
             // emitted their reply earlier in the dispatch.
+        }
+    }
+
+    /// POSIX accept bridged from a blocking GCD queue into async Swift.
+    /// Closing `fd` from stop() wakes accept with -1 and resumes exactly
+    /// once.
+    private nonisolated static func acceptConnection(on fd: Int32) async -> Int32 {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: accept(fd, nil, nil))
+            }
+        }
+    }
+
+    /// One complete length-prefixed IPC frame, read on GCD so slow/idle
+    /// clients never occupy Swift cooperative-executor threads.
+    private nonisolated static func readFrame(from fd: Int32) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    continuation.resume(returning: try IPCFramer.read(from: fd))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 
@@ -155,11 +177,11 @@ final class DaemonServer {
                 try sendResponse(requestId: request.id, payload: PingResponse(), to: fd)
 
             case .run:
-                fputs("[srv] .run received\n", stderr); fflush(stderr)
+                CockerLog.shared.debug("srv", ".run received")
                 let runReq = try JSONDecoder().decode(RunRequest.self, from: request.payload)
-                fputs("[srv] decoded RunRequest, image=\(runReq.config.image)\n", stderr); fflush(stderr)
+                CockerLog.shared.debug("srv", "decoded RunRequest, image=\(runReq.config.image)")
                 let containerID = try await engine.run(config: runReq.config)
-                fputs("[srv] engine.run returned id=\(containerID)\n", stderr); fflush(stderr)
+                CockerLog.shared.debug("srv", "engine.run returned id=\(containerID)")
                 try sendResponse(requestId: request.id, payload: RunResponse(containerID: containerID), to: fd)
 
             case .start:
@@ -324,7 +346,8 @@ final class DaemonServer {
 
             case .cp:
                 let req = try JSONDecoder().decode(CpRequest.self, from: request.payload)
-                try await handleCp(req, requestId: request.id, to: fd)
+                try await engine.copy(request: req)
+                try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
 
             case .rename:
                 let req = try JSONDecoder().decode(RenameRequest.self, from: request.payload)
@@ -340,29 +363,29 @@ final class DaemonServer {
 
             case .diff:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
-                let result = try await handleDiff(req.id)
+                let result = try await engine.diff(containerID: req.id)
                 try sendResponse(requestId: request.id, payload: result, to: fd)
 
             case .save:
                 let req = try JSONDecoder().decode(SaveRequest.self, from: request.payload)
-                let result = try await handleSave(req.image)
+                let result = try await handleSave(req)
                 try sendResponse(requestId: request.id, payload: result, to: fd)
 
             case .load:
                 let req = try JSONDecoder().decode(LoadRequest.self, from: request.payload)
-                let msg = try await handleLoad(req.tarData)
+                let msg = try await handleLoad(req)
                 try sendResponse(requestId: request.id, payload: msg, to: fd)
 
             case .imageHistory:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
-                let entries = try await handleImageHistory(req.id)
+                let entries = try await engine.imageHistory(req.id)
                 try sendResponse(requestId: request.id, payload: ImageHistoryResponse(entries: entries), to: fd)
 
             case .imagePrune:
                 // Backward-compatible: an older CLI sends EmptyPayload, which
                 // fails to decode as ImagePruneRequest → default to all:false.
                 let pruneReq = (try? JSONDecoder().decode(ImagePruneRequest.self, from: request.payload)) ?? ImagePruneRequest(all: false)
-                let result = try await handleImagePrune(all: pruneReq.all)
+                let result = try await engine.imagePrune(all: pruneReq.all)
                 try sendResponse(requestId: request.id, payload: result, to: fd)
 
             case .containerPrune:
@@ -376,11 +399,11 @@ final class DaemonServer {
                 try sendResponse(requestId: request.id, payload: result, to: fd)
 
             case .systemDf:
-                let result = try await handleSystemDf()
+                let result = try await engine.systemDf()
                 try sendResponse(requestId: request.id, payload: result, to: fd)
 
             case .composeLs:
-                let result = await handleComposeLs()
+                let result = await engine.composeProjects()
                 try sendResponse(requestId: request.id, payload: result, to: fd)
 
             case .composeLogs:
@@ -438,22 +461,46 @@ final class DaemonServer {
 
             case .commit:
                 let req = try JSONDecoder().decode(CommitRequest.self, from: request.payload)
-                let result = try await handleCommit(req)
+                let result = try await engine.commitContainer(req)
                 try sendResponse(requestId: request.id, payload: result, to: fd)
 
             case .export:
                 let req = try JSONDecoder().decode(ExportRequest.self, from: request.payload)
-                let tarData = try await handleExport(req.containerID)
-                try sendResponse(requestId: request.id, payload: SaveResponse(tarData: tarData), to: fd)
+                if let outputPath = req.outputPath {
+                    // v2 same-host handoff : write the tar where the client
+                    // asked, return only metadata. No 100 MB frame cap, no
+                    // base64, no full buffer in RAM.
+                    let tarURL = try await engine.exportContainerToTar(req.containerID)
+                    let url = URL(fileURLWithPath: outputPath)
+                    try? FileManager.default.removeItem(at: url)
+                    try FileManager.default.moveItem(at: tarURL, to: url)
+                    let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+                    let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+                    try sendResponse(requestId: request.id,
+                                     payload: SaveResponse(tarData: Data(),
+                                                           filePath: outputPath,
+                                                           byteCount: size),
+                                     to: fd)
+                } else {
+                    let tarData = try await engine.exportContainer(req.containerID)
+                    try sendResponse(requestId: request.id, payload: SaveResponse(tarData: tarData), to: fd)
+                }
 
             case .containerImport:
                 let req = try JSONDecoder().decode(ContainerImportRequest.self, from: request.payload)
-                let img = try await engine.images.importTar(req.tarData, tag: req.tag)
+                let tarData: Data
+                if let inputPath = req.inputPath {
+                    // v2 : read the tar straight from disk.
+                    tarData = try Data(contentsOf: URL(fileURLWithPath: inputPath))
+                } else {
+                    tarData = req.tarData
+                }
+                let img = try await engine.images.importTar(tarData, tag: req.tag)
                 try sendResponse(requestId: request.id, payload: img, to: fd)
 
             case .update:
                 let req = try JSONDecoder().decode(UpdateRequest.self, from: request.payload)
-                try await handleUpdate(req)
+                try await engine.updateResources(req)
                 try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
 
             case .setup:
@@ -580,344 +627,40 @@ final class DaemonServer {
         }
     }
 
-    // MARK: - Feature helpers
+    // MARK: - Save / Load (transport shims)
 
-    private func handleCp(_ req: CpRequest, requestId: String, to fd: Int32) async throws {
-        guard let container = await engine.state.container(id: req.containerID) else {
-            throw CockerError.containerNotFound(req.containerID)
+    /// Transport-side shim : business logic lives in
+    /// `ContainerEngine.saveImageToTar`. v2 clients pass `outputPath` and
+    /// the tar is MOVED there directly — nothing rides through the JSON
+    /// frame. Legacy clients (no outputPath) still get in-band bytes,
+    /// subject to the historical 100 MB frame cap.
+    private func handleSave(_ req: SaveRequest) async throws -> SaveResponse {
+        let tarURL = try await engine.saveImageToTar(reference: req.image)
+        if let outputPath = req.outputPath {
+            let dst = URL(fileURLWithPath: outputPath)
+            try? FileManager.default.removeItem(at: dst)
+            try FileManager.default.moveItem(at: tarURL, to: dst)
+            let attrs = try? FileManager.default.attributesOfItem(atPath: dst.path)
+            let size = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+            return SaveResponse(tarData: Data(), filePath: outputPath, byteCount: size)
         }
-        // Resolve against the container's clonefile rootfs — the image's
-        // rootfs is shared between all containers of that image, so writing
-        // to it corrupts every sibling. Fall back to the image rootfs only
-        // if the container hasn't been cloned yet (very early lifecycle).
-        let clonedRootfs = await engine.images.store.containerRootfsDirectory(containerID: req.containerID)
-        let rootfsDir: URL
-        if FileManager.default.fileExists(atPath: clonedRootfs.path) {
-            rootfsDir = clonedRootfs
-        } else {
-            let img = try await engine.images.find(container.image)
-            rootfsDir = await engine.images.store.rootfsDirectory(for: img)
-        }
-
-        let fm = FileManager.default
-
-        if req.toContainer {
-            // host → container. Lexical confinement is enough on the write
-            // side : the daemon never reads through a malicious symlink
-            // because the destination doesn't exist yet (or we're replacing
-            // it). We DO follow symlinks on the **source** because a regular
-            // user is allowed to copy files they own from anywhere on the
-            // host into a container they control.
-            let src = URL(fileURLWithPath: req.hostPath)
-            let dst = try PathConfinement.confine(req.containerPath, to: rootfsDir)
-            let parent = dst.deletingLastPathComponent()
-            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
-            if fm.fileExists(atPath: dst.path) { try fm.removeItem(at: dst) }
-            try fm.copyItem(at: src, to: dst)
-        } else {
-            // container → host. The container rootfs is attacker-controlled
-            // (the container image author + the running container's processes
-            // both can plant arbitrary symlinks under rootfsDir). Use the
-            // read flavour that walks symlinks and refuses any final target
-            // that escapes the confined root.
-            let src = try PathConfinement.confineRead(req.containerPath, to: rootfsDir)
-            let dst = URL(fileURLWithPath: req.hostPath)
-            let parent = dst.deletingLastPathComponent()
-            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
-            if fm.fileExists(atPath: dst.path) { try fm.removeItem(at: dst) }
-            try fm.copyItem(at: src, to: dst)
-        }
-        try sendResponse(requestId: requestId, payload: EmptyPayload(), to: fd)
-    }
-
-    private func handleDiff(_ containerID: String) async throws -> DiffResponse {
-        guard let container = await engine.state.container(id: containerID) else {
-            throw CockerError.containerNotFound(containerID)
-        }
-        let img = try await engine.images.find(container.image)
-        let rootfsDir = await engine.images.store.rootfsDirectory(for: img)
-
-        // Use find to list all files in rootfs relative to root — treat them all as "Added" for simplicity
-        // (A real diff would compare to a snapshot; here we show the complete filesystem as Changed)
-        let fm = FileManager.default
-        var entries: [DiffEntry] = []
-
-        if let enumerator = fm.enumerator(at: rootfsDir, includingPropertiesForKeys: [.isDirectoryKey]) {
-            // for-case on FileManager.DirectoryEnumerator calls
-            // makeIterator() which Swift 6 marks unavailable from async
-            // contexts. Drive it with nextObject() directly — same
-            // semantics, no implicit iterator.
-            while let any = enumerator.nextObject() {
-                guard let url = any as? URL else { continue }
-                let rel = url.path.replacingOccurrences(of: rootfsDir.path, with: "")
-                if rel.isEmpty { continue }
-                let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                entries.append(DiffEntry(kind: isDir ? "C" : "A", path: rel))
-                if entries.count >= 200 { break }  // cap output
-            }
-        }
-
-        return DiffResponse(entries: entries)
-    }
-
-    private func handleSave(_ reference: String) async throws -> SaveResponse {
-        let img = try await engine.images.find(reference)
-        let rootfsDir = await engine.images.store.rootfsDirectory(for: img)
-
-        // Stage a working tree so the produced tar has both `manifest.json`
-        // at the root AND a `rootfs/` directory carrying the extracted
-        // image. handleLoad reads both. The pre-fix code wrote the manifest
-        // to a sibling temp file but never tar'd it ; the resulting
-        // archive was just a rootfs blob with no way to recover the
-        // repo:tag or any of the OCI config defaults.
-        let staging = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("cocker-save-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: staging) }
-
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = .prettyPrinted
-        let manifestData = try encoder.encode(img)
-        try manifestData.write(to: staging.appendingPathComponent("manifest.json"))
-
-        if FileManager.default.fileExists(atPath: rootfsDir.path) {
-            let rootfsTarget = staging.appendingPathComponent("rootfs")
-            // Use clonefile for instant copy on APFS — falls back
-            // transparently to a regular copy on other filesystems.
-            try FileManager.default.copyItem(at: rootfsDir, to: rootfsTarget)
-        }
-
-        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("cocker-save-\(UUID().uuidString).tar")
-        defer { try? FileManager.default.removeItem(at: tmpURL) }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        process.arguments = ["-c", "-f", tmpURL.path, "-C", staging.path, "."]
-        let pipe = Pipe()
-        process.standardError = pipe
-        try process.run()
-        process.waitUntilExit()
-
-        let tarData = (try? Data(contentsOf: tmpURL)) ?? Data()
+        defer { try? FileManager.default.removeItem(at: tarURL) }
+        let tarData = (try? Data(contentsOf: tarURL)) ?? Data()
         return SaveResponse(tarData: tarData)
     }
 
-    private func handleLoad(_ tarData: Data) async throws -> String {
-        let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("cocker-load-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tmpDir) }
-
-        let tmpTar = tmpDir.appendingPathComponent("image.tar")
-        try tarData.write(to: tmpTar)
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        process.arguments = ["-x", "-f", tmpTar.path, "-C", tmpDir.path]
-        try process.run()
-        process.waitUntilExit()
-
-        // Look for manifest.json at the tarball root.
-        let manifestURL = tmpDir.appendingPathComponent("manifest.json")
-        guard let data = try? Data(contentsOf: manifestURL),
-              let img = try? JSONDecoder().decode(ImageInfo.self, from: data) else {
-            return "Loaded image archive (manifest not found — use `cocker images` to verify)"
+    /// Transport-side shim over `ContainerEngine.loadImageFromTar`.
+    /// v2 clients pass `inputPath` (a file already on disk) ; legacy
+    /// clients ship the bytes in-band and we stage them to a temp file.
+    private func handleLoad(_ req: LoadRequest) async throws -> String {
+        if let inputPath = req.inputPath {
+            return try await engine.loadImageFromTar(at: URL(fileURLWithPath: inputPath))
         }
-        // Copy the bundled rootfs into the store. New-style archives (≥
-        // v0.4.2) ship a `rootfs/` subdirectory ; older flat archives put
-        // the filesystem entries at the tar root, so we accept both.
-        let destRootfs = await engine.images.store.rootfsDirectory(for: img)
-        if !FileManager.default.fileExists(atPath: destRootfs.path) {
-            try FileManager.default.createDirectory(at: destRootfs.deletingLastPathComponent(),
-                                                     withIntermediateDirectories: true)
-            let bundled = tmpDir.appendingPathComponent("rootfs")
-            if FileManager.default.fileExists(atPath: bundled.path) {
-                try FileManager.default.copyItem(at: bundled, to: destRootfs)
-            } else {
-                try FileManager.default.createDirectory(at: destRootfs,
-                                                         withIntermediateDirectories: true)
-                // Older flat shape : copy every entry except the manifest.
-                if let files = try? FileManager.default.contentsOfDirectory(
-                    at: tmpDir, includingPropertiesForKeys: nil) {
-                    for f in files where !["manifest.json", "image.tar"]
-                                            .contains(f.lastPathComponent) {
-                        try? FileManager.default.copyItem(
-                            at: f, to: destRootfs.appendingPathComponent(f.lastPathComponent))
-                    }
-                }
-            }
-        }
-        try await engine.images.storeBuiltImage(img)
-        return "Loaded image: \(img.repository):\(img.tag)"
-    }
-
-    private func handleImagePrune(all: Bool = false) async throws -> PruneResponse {
-        let allImages = await engine.images.list()
-        let allContainers = await engine.state.allContainers(includeAll: true)
-
-        // Containers whose image must be protected. Default prune protects
-        // images referenced by ANY container (running or stopped) ; `--all`
-        // narrows that to images a *running* container depends on — a running
-        // VM has already cloned its own rootfs, but yanking the source image
-        // out from under it would break commit/restart, so we keep those.
-        let holders = all ? allContainers.filter { $0.status == .running } : allContainers
-
-        // Resolve each holder's stored image string to a concrete image ID via
-        // the same lookup the rest of the daemon uses. A container records the
-        // reference the user typed (`alpine:3.19`) while the image is stored
-        // normalized (`library/alpine:3.19`) — comparing the raw strings never
-        // matched, so a plain prune used to delete images still held by a
-        // stopped container. Matching by resolved ID fixes that.
-        var protectedIDs = Set<String>()
-        for c in holders {
-            if let img = try? await engine.images.find(c.image) {
-                protectedIDs.insert(img.id)
-            }
-        }
-
-        var deleted: [String] = []
-        var reclaimed: UInt64 = 0
-
-        for img in allImages where !protectedIDs.contains(img.id) {
-            reclaimed += img.size
-            try? await engine.images.remove(img.reference, force: all)
-            deleted.append(img.reference)
-        }
-
-        return PruneResponse(containersDeleted: [], imagesDeleted: deleted, volumesDeleted: [], spaceReclaimed: reclaimed)
-    }
-
-    private func handleSystemDf() async throws -> SystemDfResponse {
-        let allContainers = await engine.state.allContainers(includeAll: true)
-        let runningContainers = allContainers.filter { $0.status == .running }
-        let allImages = await engine.images.list()
-        let allVolumes = await engine.volumes.list()
-        let usedImages = Set(allContainers.map { $0.image })
-
-        // Image size
-        let totalImageSize = allImages.reduce(UInt64(0)) { $0 + $1.size }
-        let unusedImageSize = allImages.filter { !usedImages.contains($0.reference) && !usedImages.contains($0.id) }.reduce(UInt64(0)) { $0 + $1.size }
-
-        // Container size (approximation via rootfs)
-        let fm = FileManager.default
-        let rootfsBase = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".cocker/images/rootfs")
-        var containerSize: UInt64 = 0
-        if let items = try? fm.contentsOfDirectory(at: rootfsBase, includingPropertiesForKeys: [.fileSizeKey]) {
-            for item in items {
-                if let res = try? item.resourceValues(forKeys: [.fileSizeKey]) {
-                    containerSize += UInt64(res.fileSize ?? 0)
-                }
-            }
-        }
-
-        // Volume size
-        var totalVolSize: UInt64 = 0
-        for vol in allVolumes {
-            if let items = try? fm.contentsOfDirectory(at: URL(fileURLWithPath: vol.mountpoint), includingPropertiesForKeys: [.fileSizeKey]) {
-                for item in items {
-                    if let res = try? item.resourceValues(forKeys: [.fileSizeKey]) {
-                        totalVolSize += UInt64(res.fileSize ?? 0)
-                    }
-                }
-            }
-        }
-
-        let stoppedContainers = allContainers.filter { $0.status == .stopped || $0.status == .dead }
-
-        let entries: [SystemDfResponse.DfEntry] = [
-            SystemDfResponse.DfEntry(type: "Images", total: allImages.count, active: usedImages.count, size: totalImageSize, reclaimable: unusedImageSize),
-            SystemDfResponse.DfEntry(type: "Containers", total: allContainers.count, active: runningContainers.count, size: containerSize, reclaimable: stoppedContainers.isEmpty ? 0 : containerSize / UInt64(max(1, allContainers.count)) * UInt64(stoppedContainers.count)),
-            SystemDfResponse.DfEntry(type: "Volumes", total: allVolumes.count, active: allVolumes.count, size: totalVolSize, reclaimable: 0),
-        ]
-
-        return SystemDfResponse(entries: entries)
-    }
-
-    private func handleComposeLs() async -> ComposeLsResponse {
-        let allContainers = await engine.state.allContainers(includeAll: true)
-        var projects: [String: (containers: [Container], configFile: String)] = [:]
-
-        for c in allContainers {
-            guard let proj = c.labels["com.cocker.project"] else { continue }
-            var entry = projects[proj] ?? (containers: [], configFile: "")
-            entry.containers.append(c)
-            projects[proj] = entry
-        }
-
-        let infos = projects.map { (name, entry) -> ComposeLsResponse.ProjectInfo in
-            let running = entry.containers.filter { $0.status == .running }.count
-            let total = entry.containers.count
-            let status = running == total && total > 0 ? "running(\(running))" : "partially running(\(running)/\(total))"
-            return ComposeLsResponse.ProjectInfo(
-                name: name,
-                status: status,
-                configFiles: "cocker-compose.yml",
-                servicesCount: entry.containers.count
-            )
-        }.sorted { $0.name < $1.name }
-
-        return ComposeLsResponse(projects: infos)
-    }
-
-    // MARK: - Commit
-
-    private func handleCommit(_ req: CommitRequest) async throws -> ImageInfo {
-        guard let container = await engine.state.container(id: req.containerID) else {
-            throw CockerError.containerNotFound(req.containerID)
-        }
-        let img = try await engine.images.find(container.image)
-        // Commit MUST snapshot the container's OVERLAY rootfs (where the
-        // container's filesystem changes live thanks to APFS clonefile),
-        // not the image's shared base. The earlier path read from the
-        // image's rootfs and silently lost every modification the
-        // container made — `echo modified > /custom.txt && cocker commit`
-        // produced an image identical to the base.
-        let containerRootfs = await engine.images.store.containerRootfsDirectory(containerID: container.id)
-        let rootfsDir: URL
-        if FileManager.default.fileExists(atPath: containerRootfs.path) {
-            rootfsDir = containerRootfs
-        } else {
-            // Container's overlay was already cleaned up (rare ; happens
-            // after `cocker rm` then attempted commit). Fall back to the
-            // image base — at least the image config gets a new tag.
-            rootfsDir = await engine.images.store.rootfsDirectory(for: img)
-        }
-        guard FileManager.default.fileExists(atPath: rootfsDir.path) else {
-            throw CockerError.imageNotFound("\(container.image) (rootfs not available)")
-        }
-        return try await engine.images.commit(
-            fromRootfs: rootfsDir,
-            tag: req.tag,
-            baseImage: img,
-            author: req.author,
-            message: req.message
-        )
-    }
-
-    // MARK: - Export
-
-    private func handleExport(_ containerID: String) async throws -> Data {
-        guard let container = await engine.state.container(id: containerID) else {
-            throw CockerError.containerNotFound(containerID)
-        }
-        let img = try await engine.images.find(container.image)
-        let rootfsDir = await engine.images.store.rootfsDirectory(for: img)
-        guard FileManager.default.fileExists(atPath: rootfsDir.path) else {
-            throw CockerError.imageNotFound("\(container.image) (rootfs not available)")
-        }
-        return try await engine.images.exportRootfs(at: rootfsDir)
-    }
-
-    // MARK: - Update
-
-    private func handleUpdate(_ req: UpdateRequest) async throws {
-        guard let _ = await engine.state.container(id: req.containerID) else {
-            throw CockerError.containerNotFound(req.containerID)
-        }
-        try await engine.state.updateContainer(id: req.containerID) { c in
-            if let cpus = req.cpus { c.cpuCount = cpus }
-            if let mem = req.memoryMB { c.memoryMB = mem }
-        }
+        let tmpTar = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cocker-load-\(UUID().uuidString).tar")
+        try req.tarData.write(to: tmpTar)
+        defer { try? FileManager.default.removeItem(at: tmpTar) }
+        return try await engine.loadImageFromTar(at: tmpTar)
     }
 
     // MARK: - Attach / history / compose helpers (A2)
@@ -934,34 +677,6 @@ final class DaemonServer {
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
-    }
-
-    /// `docker history` synthesises a fake history record per stored layer
-    /// plus a final FROM line. We don't track layer-build metadata so this
-    /// is approximative — the entries Docker tools display match the ones a
-    /// fresh-built Docker image of the same layer count would have produced.
-    private func handleImageHistory(_ reference: String) async throws -> [ImageHistoryEntry] {
-        let img = try await engine.images.find(reference)
-        var entries: [ImageHistoryEntry] = []
-        for (i, layer) in img.layers.enumerated() {
-            entries.append(ImageHistoryEntry(
-                id: String(layer.prefix(19)),
-                createdAt: img.createdAt.addingTimeInterval(TimeInterval(-i * 60)),
-                createdBy: i == 0 ? "/bin/sh -c #(nop) FROM \(img.repository):\(img.tag)" : "/bin/sh -c layer \(i)",
-                size: img.size / UInt64(max(1, img.layers.count)),
-                comment: ""
-            ))
-        }
-        if entries.isEmpty {
-            entries.append(ImageHistoryEntry(
-                id: String(img.id.prefix(19)),
-                createdAt: img.createdAt,
-                createdBy: "/bin/sh -c #(nop) ADD \(img.repository):\(img.tag)",
-                size: img.size,
-                comment: ""
-            ))
-        }
-        return entries
     }
 
     private func handleComposeLogs(_ req: ComposeRequest, requestId: String, to fd: Int32) async throws {
