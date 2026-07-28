@@ -154,7 +154,7 @@ final class InteractiveFooter: @unchecked Sendable {
     /// before the process exits.
     func start(footer: @escaping @Sendable () -> [String],
                onDetach: (@Sendable () -> Bool)? = nil,
-               onQuit: (@Sendable () -> Void)? = nil) {
+               onQuit: (@Sendable () async -> Void)? = nil) {
         lock.lock(); builder = footer; lock.unlock()
 
         guard animated else {
@@ -169,10 +169,17 @@ final class InteractiveFooter: @unchecked Sendable {
         let sticky = self.sticky
         let build: @Sendable () -> [String] = { [weak self] in self?.currentFooter() ?? [] }
 
-        // Ctrl-C: restore cooked mode BEFORE exit (Darwin.exit skips defers).
+        // Ctrl-C = quit for real (same as `q`): restore cooked mode, run the
+        // teardown, then exit. Darwin.exit skips defers, so restore here too.
         let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         signal(SIGINT, SIG_IGN)
-        sig.setEventHandler { raw.restore(); print(""); Darwin.exit(0) }
+        sig.setEventHandler {
+            raw.restore(); sticky.abandon()
+            Task.detached(priority: .userInitiated) {
+                if let onQuit { await onQuit() }
+                Darwin.exit(0)
+            }
+        }
         sig.resume()
 
         Task.detached(priority: .userInitiated) {
@@ -182,7 +189,7 @@ final class InteractiveFooter: @unchecked Sendable {
                 switch b[0] {
                 case UInt8(ascii: "q"), UInt8(ascii: "Q"):
                     raw.restore(); sticky.abandon()
-                    onQuit?()
+                    if let onQuit { await onQuit() }
                     Darwin.exit(0)
                 case UInt8(ascii: "d"), UInt8(ascii: "D"):
                     guard let onDetach else { break }  // d not offered
@@ -203,23 +210,42 @@ final class InteractiveFooter: @unchecked Sendable {
     /// bottom-pinned footer would fight a fast, unbounded log stream. `q` (and
     /// Ctrl-C) restore the terminal and exit; the container/daemon keeps
     /// running (we only detach the viewer). Off-TTY: print once, no keys.
-    func armStreaming(_ lines: [String], onQuit: @escaping @Sendable () -> Void = {}) {
+    func armStreaming(_ lines: [String],
+                      onDetach: (@Sendable () -> Bool)? = nil,
+                      onQuit: (@Sendable () async -> Void)? = nil) {
         // Off-TTY (piped / CI) this is a total no-op — no hint line, no keys —
         // so `logs -f | grep` stays clean.
         guard animated else { return }
         for l in lines { print(l) }
         raw.enter()
         let raw = self.raw
+        // Ctrl-C = quit for real (same as `q`): teardown then exit.
         let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         signal(SIGINT, SIG_IGN)
-        sig.setEventHandler { raw.restore(); print(""); Darwin.exit(0) }
+        sig.setEventHandler {
+            raw.restore()
+            Task.detached(priority: .userInitiated) {
+                if let onQuit { await onQuit() }
+                Darwin.exit(0)
+            }
+        }
         sig.resume()
         Task.detached(priority: .userInitiated) {
             let fd = fileno(stdin)
             var b = [UInt8](repeating: 0, count: 1)
             while read(fd, &b, 1) == 1 {
-                if b[0] == UInt8(ascii: "q") || b[0] == UInt8(ascii: "Q") {
-                    raw.restore(); onQuit(); Darwin.exit(0)
+                switch b[0] {
+                case UInt8(ascii: "q"), UInt8(ascii: "Q"):
+                    raw.restore()
+                    if let onQuit { await onQuit() }
+                    Darwin.exit(0)
+                case UInt8(ascii: "d"), UInt8(ascii: "D"):
+                    guard let onDetach else { break }  // d not offered
+                    raw.restore(); print("")
+                    if onDetach() { Darwin.exit(0) }
+                    raw.enter()  // refused → keep reading keys
+                default:
+                    break
                 }
             }
         }
