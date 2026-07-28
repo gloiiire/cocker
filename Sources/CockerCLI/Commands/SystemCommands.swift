@@ -281,7 +281,7 @@ struct SystemEventsCommand: AsyncParsableCommand {
         let allowedIDs = ids
 
         let footer = InteractiveFooter()
-        footer.armStreaming(footerLines(detachable: false))
+        footer.armStreaming(footerLines(detach: true), onDetach: { true })
         try await client.sendStreaming(request) { event in
             // Wire format engine→client : "<type>\t<action>\t<id>".
             let parts = event.data.split(separator: "\t", maxSplits: 2,

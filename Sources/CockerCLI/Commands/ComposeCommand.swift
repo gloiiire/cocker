@@ -161,7 +161,7 @@ struct ComposeUpCommand: AsyncParsableCommand {
                 footerLines(
                     header: [" " + UX.TTY.paint("→ Running", .progress) + " " + UX.TTY.paint(proj, .accent)],
                     services: urls.snapshot(),
-                    detachable: true)
+                    detach: true, quit: true)
             },
             onDetach: {
                 // `d` = detach : leave the containers running, return the shell.
@@ -311,7 +311,7 @@ struct ComposeLogsCommand: AsyncParsableCommand {
         let request = try IPCRequest(type: .composeLogs, payload: payload)
 
         let footer = InteractiveFooter()
-        if follow { footer.armStreaming(footerLines(detachable: false)) }
+        if follow { footer.armStreaming(footerLines(detach: true), onDetach: { true }) }
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
@@ -864,7 +864,7 @@ struct ComposeEventsCommand: AsyncParsableCommand {
         let outputJSON = json
 
         let footer = InteractiveFooter()
-        if !outputJSON { footer.armStreaming(footerLines(detachable: false)) }
+        if !outputJSON { footer.armStreaming(footerLines(detach: true), onDetach: { true }) }
         try await client.sendStreaming(request) { event in
             let ts = ISO8601DateFormatter().string(from: event.timestamp)
             // Filter events relevant to this project

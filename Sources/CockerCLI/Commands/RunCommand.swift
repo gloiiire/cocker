@@ -199,7 +199,7 @@ struct RunCommand: AsyncParsableCommand {
             let cid = result.containerID
             let footer = InteractiveFooter()
             footer.armStreaming(
-                footerLines(header: header, detachable: true),
+                footerLines(header: header, detach: true, quit: true),
                 onDetach: {
                     // `d` = detach : leave the container running, return the shell.
                     print(UX.TTY.paint("Detached.", .dim) + " "
