@@ -7,7 +7,7 @@ COCKER=${COCKER:-cocker}
 
 # Print PASS/FAIL summary + cleanup hook
 on_exit() {
-    rc=$?
+    rc=${1:-$?}
     # Best-effort cleanup of any container the test created via mk_container.
     for c in "${CREATED_CONTAINERS[@]:-}"; do
         $COCKER rm -f "$c" >/dev/null 2>&1 || true
