@@ -393,6 +393,9 @@ struct ComposeExecCommand: AsyncParsableCommand {
     var command: [String]
 
     mutating func run() async throws {
+        // Same POSIX terminator rule as `cocker exec` : a leading `--`
+        // separates flags from the command, it is not the command.
+        let command = CommandSeparator.strippingLeadingSeparator(self.command)
         let composePath = resolvePath(file)
         let pName = ProjectName.normalize(projectName ?? URL(fileURLWithPath: composePath).deletingLastPathComponent().lastPathComponent)
         let containerName = "\(pName)_\(service)_1"
