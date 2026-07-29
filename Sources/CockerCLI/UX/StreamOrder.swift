@@ -23,4 +23,17 @@ public extension UX {
     static func syncStdout() {
         fflush(stdout)
     }
+
+    /// Write a chunk of a never-ending stream (`logs -f`, `attach`,
+    /// `events`, attached `compose up`) to stdout.
+    ///
+    /// These commands only end when the user interrupts them, so a
+    /// block-buffered stdout — which is what a redirect or a pipe gives —
+    /// never gets flushed and the consumer sees nothing at all. Measured
+    /// on `compose up -a`: 0 bytes written after 14 seconds of live output.
+    /// Flushing per chunk is what makes `| grep` and `> file` work.
+    static func writeStreamChunk(_ text: String) {
+        print(text, terminator: "")
+        fflush(stdout)
+    }
 }

@@ -15,13 +15,26 @@ struct StartCommand: AsyncParsableCommand {
         abstract: "Start one or more stopped containers"
     )
 
-    @Flag(name: [.short, .customLong("attach")], help: "Attach STDOUT/STDERR")
+    /// `docker start -a` streams the container's output until it exits.
+    /// This flag existed here but was never read — it parsed fine and did
+    /// nothing, which is worse than not offering it at all.
+    @Flag(name: [.short, .customLong("attach")],
+          help: "Attach STDOUT/STDERR and stream until the container exits")
     var attach = false
 
     @Argument(help: "Container ID(s) or name(s)")
     var containers: [String]
 
     mutating func run() async throws {
+        // Attaching to several containers at once would interleave two
+        // unlabelled streams into one terminal ; docker rejects it too.
+        if attach && containers.count > 1 {
+            try UX.Failure.fail(
+                headline: "--attach needs exactly one container",
+                reason: "got \(containers.count)",
+                hint: "use `cocker logs -f` to follow several containers at once")
+        }
+
         let client = IPCClient()
         var failed = false
         for id in containers {
@@ -30,6 +43,20 @@ struct StartCommand: AsyncParsableCommand {
                 let request = try IPCRequest(type: .start, payload: ContainerIDRequest(id: id))
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .start, elapsed: Date().timeIntervalSince(start))
+
+                // Stream the container's output, exactly like `docker start -a`.
+                if attach {
+                    let logsReq = try IPCRequest(
+                        type: .logs,
+                        payload: LogsRequest(id: id, follow: true, tail: 0))
+                    try await client.sendStreaming(logsReq) { event in
+                        switch event.stream {
+                        case .stdout: UX.writeStreamChunk(event.data)
+                        case .stderr: UX.writeStderr(event.data)
+                        default: break
+                        }
+                    }
+                }
             } catch let error as CockerError {
                 failed = true
                 UX.Failure.emit(
@@ -389,7 +416,7 @@ struct ExecCommand: AsyncParsableCommand {
 
         try await client.sendStreaming(request) { event in
             switch event.stream {
-            case .stdout: print(event.data, terminator: "")
+            case .stdout: UX.writeStreamChunk(event.data)
             case .stderr: UX.writeStderr(event.data)
             default: break
             }
@@ -504,7 +531,7 @@ struct AttachCommand: AsyncParsableCommand {
         let fail = UX.FailFlag()
         try await client.sendStreaming(request) { event in
             switch event.stream {
-            case .stdout: print(event.data, terminator: "")
+            case .stdout: UX.writeStreamChunk(event.data)
             case .stderr: UX.writeStderr(event.data)
             case .status:
                 if !event.data.isEmpty { print(event.data, terminator: "") }
