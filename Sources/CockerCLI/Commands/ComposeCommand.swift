@@ -193,7 +193,8 @@ struct ComposeUpCommand: AsyncParsableCommand {
             try await streamAttachedLogs(
                 composePath: stage.path,
                 projectName: proj,
-                downPath: downPath)
+                downPath: downPath,
+                urls: urls)
             return
         }
 
@@ -234,7 +235,8 @@ struct ComposeUpCommand: AsyncParsableCommand {
     /// this only has to pick the services and hand the request over.
     private func streamAttachedLogs(composePath: String,
                                     projectName: String,
-                                    downPath: String) async throws {
+                                    downPath: String,
+                                    urls: ServiceURLs) async throws {
         let client = IPCClient()
 
         // Resolve the selection against the services that actually exist,
@@ -263,13 +265,21 @@ struct ComposeUpCommand: AsyncParsableCommand {
             return
         }
 
-        // `armStreaming` deliberately keeps no sticky region : a pinned
-        // footer fights an unbounded log stream.
+        // A pinned footer with the log stream scrolling ABOVE it — the same
+        // shape as `compose watch`, so the service URLs and the d/q keys
+        // stay visible no matter how much output goes by. Each incoming
+        // chunk clears the footer, prints, then redraws it at the bottom.
         let footer = InteractiveFooter()
-        footer.armStreaming(
-            footerLines(header: [" " + UX.TTY.paint("→ Attached", .progress)
-                                 + " " + UX.TTY.paint(selected.joined(separator: ", "), .accent)],
-                        detach: true, quit: true),
+        let attached = selected.joined(separator: ", ")
+        let footerContent: @Sendable () -> [String] = {
+            footerLines(
+                header: [" " + UX.TTY.paint("→ Attached", .progress)
+                         + " " + UX.TTY.paint(attached, .accent)],
+                services: urls.snapshot(),
+                detach: true, quit: true)
+        }
+        footer.start(
+            footer: footerContent,
             onDetach: {
                 print(UX.TTY.paint("Detached.", .dim) + " "
                     + UX.TTY.paint("Containers keep running — `cocker compose down` to stop.", .dim))
@@ -290,12 +300,33 @@ struct ComposeUpCommand: AsyncParsableCommand {
                                          follow: true,
                                          tail: 0)
         let logsRequest = try IPCRequest(type: .composeLogs, payload: logsPayload)
+        // The daemon forwards output as it arrives, so a single log line can
+        // span several events. Redrawing the footer between events would
+        // then tear the line in half and wedge the footer inside it, so
+        // only emit once a line is complete.
+        let assembler = LineBuffer()
         try await client.sendStreaming(logsRequest) { event in
             switch event.stream {
-            case .stdout: UX.writeStreamChunk(event.data)
-            case .stderr: UX.writeStderr(event.data)
+            case .stdout:
+                let lines = assembler.feed(event.data)
+                guard !lines.isEmpty else { return }
+                // Erase the footer, emit the finished lines where they
+                // belong, then pin the footer back at the bottom. Same
+                // clear/refresh dance `compose watch` uses around a rebuild.
+                footer.clear()
+                for line in lines { UX.writeStreamChunk(line) }
+                footer.refresh()
+            case .stderr:
+                footer.clear()
+                UX.writeStderr(event.data)
+                footer.refresh()
             default: break
             }
+        }
+        // A last line without a trailing newline must not be swallowed.
+        if let rest = assembler.flush() {
+            footer.clear()
+            UX.writeStreamChunk(rest)
         }
         footer.restore()
     }
