@@ -32,9 +32,33 @@ final class SignalTrap: @unchecked Sendable {
     private let lock = NSLock()
     private var sources: [DispatchSourceSignal] = []
     private var firing = false
+    /// Process exit, injectable so tests can drive the handler without
+    /// killing the test runner. Defaults to the real thing.
+    private let exitProcess: @Sendable (Int32) -> Void
 
     /// Signals that should trigger a graceful shutdown.
     private static let trapped: [Int32] = [SIGINT, SIGTERM, SIGHUP]
+
+    init(exitProcess: @escaping @Sendable (Int32) -> Void = { Darwin.exit($0) }) {
+        self.exitProcess = exitProcess
+    }
+
+    /// What a delivered signal should do, given whether one is already
+    /// being handled. Pure decision logic, split out so the behaviour can
+    /// be tested without a real signal and a real process exit.
+    enum Action: Equatable {
+        /// First signal, no teardown to run : leave with 128+SIGINT.
+        case exitNow(code: Int32)
+        /// First signal : restore the terminal, then run teardown.
+        case gracefulShutdown
+        /// Another signal arrived while shutting down : leave immediately.
+        case forceExit(code: Int32)
+    }
+
+    static func decide(alreadyFiring: Bool, hasTeardown: Bool) -> Action {
+        if alreadyFiring { return .forceExit(code: 130) }
+        return hasTeardown ? .gracefulShutdown : .exitNow(code: 130)
+    }
 
     /// Install the handlers.
     ///
@@ -55,20 +79,23 @@ final class SignalTrap: @unchecked Sendable {
                 self.firing = true
                 self.lock.unlock()
 
-                if alreadyFiring {
+                switch Self.decide(alreadyFiring: alreadyFiring,
+                                   hasTeardown: onTeardown != nil) {
+                case .forceExit(let code):
                     // Second Ctrl-C : the user is telling us the graceful
-                    // path is taking too long. Leave immediately with the
-                    // conventional 128+SIGINT status.
-                    Darwin.exit(130)
-                }
-
-                // Terminal first : whatever happens next, the shell is sane.
-                onFirst()
-
-                guard let onTeardown else { Darwin.exit(130) }
-                Task.detached(priority: .userInitiated) {
-                    await onTeardown()
-                    Darwin.exit(0)
+                    // path is taking too long.
+                    self.exitProcess(code)
+                case .exitNow(let code):
+                    // Terminal first : whatever happens next, the shell is sane.
+                    onFirst()
+                    self.exitProcess(code)
+                case .gracefulShutdown:
+                    onFirst()
+                    let done = self.exitProcess
+                    Task.detached(priority: .userInitiated) {
+                        await onTeardown?()
+                        done(0)
+                    }
                 }
             }
             source.resume()

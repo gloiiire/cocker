@@ -94,6 +94,43 @@ struct SignalTrapTests {
         #expect(previousAddr != ignoreAddr,
                 "SIGINT left ignored after uninstall would silently break Ctrl-C")
     }
+
+    // MARK: - What a delivered signal decides
+
+    /// First Ctrl-C with teardown to run : restore, then tear down.
+    @Test func firstSignalWithTeardownShutsDownGracefully() {
+        #expect(SignalTrap.decide(alreadyFiring: false, hasTeardown: true)
+            == .gracefulShutdown)
+    }
+
+    /// First Ctrl-C with nothing to tear down : leave straight away, with
+    /// the conventional 128+SIGINT status.
+    @Test func firstSignalWithoutTeardownExitsImmediately() {
+        #expect(SignalTrap.decide(alreadyFiring: false, hasTeardown: false)
+            == .exitNow(code: 130))
+    }
+
+    /// The reason a second Ctrl-C exists : teardown talks to the daemon and
+    /// can be slow, and a user pressing twice means "now".
+    @Test func secondSignalForcesExitEvenWithTeardown() {
+        #expect(SignalTrap.decide(alreadyFiring: true, hasTeardown: true)
+            == .forceExit(code: 130))
+        #expect(SignalTrap.decide(alreadyFiring: true, hasTeardown: false)
+            == .forceExit(code: 130))
+    }
+
+    // MARK: - Real signal delivery
+    //
+    // Deliberately NOT unit-tested. Sending a real SIGINT/SIGTERM to the
+    // test process is unsafe here: the suite runs tests in parallel, and
+    // any test that restores the default disposition (as the uninstall
+    // test must) turns a sibling's signal into an immediate kill of the
+    // whole runner — the suite died mid-flight when this was attempted.
+    //
+    // Delivery is therefore proven where it belongs, against a real
+    // process: `Tests/e2e/09-ctrl-c-during-build.sh` sends an actual
+    // SIGINT to a running build and requires a clean exit. That scenario
+    // was verified RED by putting the handler back on the main queue.
 }
 
 /// Minimal thread-safe flag : handlers fire off the test's thread.
