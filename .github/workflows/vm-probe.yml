@@ -1,0 +1,120 @@
+name: VM capability probe
+
+# Can a GitHub-hosted macOS runner actually boot a Cocker VM ?
+#
+# The `e2e smoke` job silently skips because it can't find a Linux kernel,
+# so "smoke passed" has been meaningless. Before either fixing that or
+# giving up on hosted e2e, we need facts :
+#
+#   1. Is Virtualization.framework usable from an unattended CI context ?
+#   2. Is the host M3+ (nested virtualization) or M1/M2 (no) ?
+#   3. Is the runner itself a VM ? If so, booting a guest needs nested virt.
+#   4. Where does `apple/container/container` actually drop its kernel ?
+#
+# Manual trigger only : this answers a question, it does not gate
+# anything. Re-run it whenever GitHub changes its macOS fleet — the day
+# the runners move to M3, hosted e2e becomes possible and the `smoke`
+# job in ci.yml can be revisited.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Probe VM capability
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Host hardware and OS
+        run: |
+          echo "== chip =="
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.model || true
+          echo "== os =="
+          sw_vers
+          echo "== cores / ram =="
+          sysctl -n hw.ncpu hw.memsize || true
+
+      - name: Is the runner itself virtualised?
+        # A guest reports hv_vmm_present=1. If the runner is already a VM,
+        # booting our own guest requires nested virtualization, which Apple
+        # only offers on M3 and later.
+        run: |
+          echo "hv_vmm_present = $(sysctl -n kern.hv_vmm_present 2>/dev/null || echo '<absent>')"
+          echo "hv_support     = $(sysctl -n kern.hv_support 2>/dev/null || echo '<absent>')"
+
+      - name: Does Virtualization.framework accept a VM configuration?
+        # The decisive test : build a real VZVirtualMachineConfiguration and
+        # validate it. Validation is what fails first when the framework is
+        # unusable (missing entitlement, no hypervisor, sandboxed context).
+        run: |
+          mkdir -p /tmp/vzprobe && cd /tmp/vzprobe
+          cat > probe.swift <<'SWIFT'
+          import Foundation
+          import Virtualization
+
+          // Report nested-virtualization support (M3+ only, macOS 15+).
+          if #available(macOS 15.0, *) {
+              print("nestedVirtualizationSupported = \(VZGenericPlatformConfiguration.isNestedVirtualizationSupported)")
+          } else {
+              print("nestedVirtualizationSupported = <macOS < 15>")
+          }
+
+          // A minimal Linux VM config. We only validate it — no boot — so
+          // the probe stays fast and needs no kernel image.
+          let config = VZVirtualMachineConfiguration()
+          config.cpuCount = 1
+          config.memorySize = 512 * 1024 * 1024
+
+          // A boot loader is mandatory for validation ; point it at a
+          // placeholder file so we exercise the real code path.
+          let fake = URL(fileURLWithPath: "/tmp/vzprobe/fake-kernel")
+          FileManager.default.createFile(atPath: fake.path, contents: Data([0x00]))
+          config.bootLoader = VZLinuxBootLoader(kernelURL: fake)
+
+          do {
+              try config.validate()
+              print("validate = OK")
+          } catch {
+              print("validate = FAILED: \(error)")
+          }
+
+          // Instantiating the VM object is the step that needs the
+          // com.apple.security.virtualization entitlement at runtime.
+          let vm = VZVirtualMachine(configuration: config)
+          print("VZVirtualMachine instantiated = \(vm.state.rawValue)")
+          SWIFT
+
+          cat > entitlements.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.virtualization</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          swiftc -o probe probe.swift -framework Virtualization
+          codesign --force --sign - --entitlements entitlements.plist probe
+          echo "== running probe =="
+          ./probe || echo "probe exited $?"
+
+      - name: Where does the Apple container kernel land?
+        # The smoke job looks in /opt/homebrew/var/container/kernels and
+        # finds nothing. Either the tap fails to install here, or the path
+        # moved. Find out which.
+        run: |
+          brew install apple/container/container 2>&1 | tail -20 || echo "install failed"
+          echo "== searching for any kernel image =="
+          find /opt/homebrew -name 'vmlinu*' -o -name '*.img' 2>/dev/null | head -20 || true
+          ls -la /opt/homebrew/var/container/kernels 2>&1 || echo "kernels dir absent"
+
+      - name: Verdict
+        if: always()
+        run: |
+          echo "Read the steps above :"
+          echo "  hv_vmm_present=1        → runner is a VM, needs nested virt (M3+ only)"
+          echo "  validate = FAILED       → framework unusable in CI, hosted e2e impossible"
+          echo "  validate = OK + M3 chip → hosted e2e is worth wiring up"
