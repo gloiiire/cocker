@@ -1033,12 +1033,22 @@ final class VMRuntime: NSObject {
 
     // MARK: - Logs
 
+    /// Backlog for a container, newest last.
+    ///
+    /// Every event is newline-terminated, whichever path it came from. The
+    /// two sources disagree by nature: the in-memory ring holds raw console
+    /// chunks (which end in CRLF), while the JSON log stores one record per
+    /// line with the terminator stripped. Returning both as-is made the
+    /// difference every caller's problem, and callers got it wrong — three
+    /// of them consumed this, and each had to remember. `compose logs`
+    /// silently ran consecutive backlog lines together; `attach` still
+    /// would. Normalising here is the only place that fixes all of them.
     func logs(containerID: String, tail: Int) -> [StreamEvent] {
         // Fast path : container still running, serve from in-memory ring.
         if let running = runningVMs[containerID] {
             let all = running.logBuffer
-            if tail <= 0 { return all }
-            return Array(all.suffix(tail))
+            let scope = (tail <= 0) ? all : Array(all.suffix(tail))
+            return scope.map { Self.terminated($0) }
         }
         // Cold path : container already exited (very common for short-
         // lived `cocker run --rm` workloads — the watcher may have
@@ -1046,6 +1056,23 @@ final class VMRuntime: NSObject {
         // CLI's follow-attach. Without this fallback the user sees no
         // output even though writeJSONLog has it on disk.
         return Self.readJSONLog(containerID: containerID, tail: tail)
+            .map { Self.terminated($0) }
+    }
+
+    /// Same event, guaranteed to end in a newline.
+    ///
+    /// The check is at scalar level on purpose: Swift treats "\r\n" as one
+    /// Character, so `hasSuffix("\n")` is false for CRLF-terminated console
+    /// output and would append a second, spurious newline.
+    ///
+    /// `internal` and `nonisolated` so the contract can be unit-tested
+    /// without a VM: the rest of VMRuntime needs Virtualization.framework
+    /// and is excluded from the coverage gate for that reason.
+    nonisolated static func terminated(_ event: StreamEvent) -> StreamEvent {
+        guard !event.data.isEmpty, event.data.unicodeScalars.last != "\n" else { return event }
+        return StreamEvent(stream: event.stream,
+                           data: event.data + "\n",
+                           timestamp: event.timestamp)
     }
 
     /// Event-driven live log stream for a running container. Returns nil
