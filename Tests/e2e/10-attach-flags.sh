@@ -203,7 +203,12 @@ echo " → 4/4 direct attach follows output produced after attachment"
 # produced after the client subscribed.
 seen_before=0
 for _ in $(seq 1 60); do
-    if "$COCKER" logs "$cname" 2>/dev/null | grep -q 'ATTACH-BEFORE'; then
+    # Do not pipe directly into `grep -q`: it exits as soon as it finds the
+    # marker, closes the pipe, and can make the still-writing Swift client die
+    # with SIGPIPE.  With pipefail enabled that turns a successful observation
+    # into a false negative.  Let `cocker logs` finish before inspecting it.
+    if "$COCKER" logs "$cname" >"$tmp/direct-before.log" 2>/dev/null &&
+        grep -q 'ATTACH-BEFORE' "$tmp/direct-before.log"; then
         seen_before=1
         break
     fi
