@@ -335,7 +335,11 @@ jobs:
           zig cc -target aarch64-linux-musl -static -O2 -Wall \
             -o cocker-init init.c cmdline.c net.c dns_proxy.c qemu.c spec.c exec_listener.c caps.c health_poll.c etc_overlay.c dhcp_min.c
           cp cocker-init initrd-staging/init
-          (cd initrd-staging && find . | cpio -o -H newc 2>/dev/null) | gzip -9 > ../initrd.img
+          # NB: the redirection is evaluated in the CURRENT directory,
+          # not inside the subshell — `> ../initrd.img` from cocker-init/
+          # wrote to the repo root instead (hence the /initrd.img entry in
+          # .gitignore). Write the explicit path.
+          (cd initrd-staging && find . | cpio -o -H newc 2>/dev/null) | gzip -9 > initrd.img
       - name: Sign cockerd with entitlements
         run: |
           codesign --force --sign - \
@@ -381,3 +385,82 @@ jobs:
           echo
           echo "Container behaviour is covered by Tests/e2e/run-all.sh, run on"
           echo "real hardware before tagging a release."
+
+  e2e:
+    # The real thing : boot actual containers and run the full e2e suite.
+    #
+    # Requires a self-hosted runner on Apple silicon that can use
+    # Virtualization.framework — hosted runners cannot (see the `smoke`
+    # job above and .github/workflows/vm-probe.yml).
+    #
+    # `vm-capable` is a custom label, so this job simply stays queued and
+    # is reported as skipped when no such runner is online. It never
+    # blocks a PR on machine availability.
+    name: e2e (self-hosted, real VMs)
+    needs: [swift-tests, swift-build-release, cocker-init-build]
+    runs-on: [self-hosted, macOS, ARM64, vm-capable]
+    # A queued job on an offline runner would hang the PR forever.
+    timeout-minutes: 30
+    # Never run code from a fork on someone's personal machine. Forks can
+    # still be tested by pushing the branch to this repository.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v6
+      - name: Confirm this host can actually virtualise
+        # Fail loudly rather than silently skipping, which is exactly the
+        # trap the old hosted "smoke" job fell into.
+        run: |
+          echo "chip = $(sysctl -n machdep.cpu.brand_string)"
+          echo "hv_vmm_present = $(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)"
+          if [ "$(sysctl -n kern.hv_vmm_present 2>/dev/null || echo 0)" = "1" ]; then
+            echo "::error::this runner is itself a VM — it cannot boot containers"
+            exit 1
+          fi
+      - name: Build and sign
+        run: |
+          swift build -c release
+          cd cocker-init
+          zig cc -target aarch64-linux-musl -static -O2 -Wall \
+            -o cocker-init init.c cmdline.c net.c dns_proxy.c qemu.c spec.c exec_listener.c caps.c health_poll.c etc_overlay.c dhcp_min.c
+          cp cocker-init initrd-staging/init
+          # NB: the redirection is evaluated in the CURRENT directory,
+          # not inside the subshell — `> ../initrd.img` from cocker-init/
+          # wrote to the repo root instead (hence the /initrd.img entry in
+          # .gitignore). Write the explicit path.
+          (cd initrd-staging && find . | cpio -o -H newc 2>/dev/null) | gzip -9 > initrd.img
+          cd ..
+          codesign --force --sign - \
+            --entitlements entitlements/cockerd.entitlements \
+            .build/release/cockerd
+      - name: Start a daemon on an isolated root
+        # A dedicated --root keeps CI containers, images and build cache
+        # away from whatever the machine's owner is running.
+        run: |
+          ROOT="$RUNNER_TEMP/cocker-ci-root"
+          rm -rf "$ROOT" && mkdir -p "$ROOT/kernel"
+          # Reuse the machine's kernel; ship OUR freshly built initrd.
+          cp -L "$HOME/.cocker/kernel/vmlinuz" "$ROOT/kernel/vmlinuz"
+          cp cocker-init/initrd.img "$ROOT/kernel/initrd.img"
+          echo "COCKER_CI_ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "COCKER_HOST=unix://$ROOT/cocker.sock" >> "$GITHUB_ENV"
+          nohup ./.build/release/cockerd --root "$ROOT" --socket "$ROOT/cocker.sock" \
+            > "$RUNNER_TEMP/cockerd.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            COCKER_HOST="unix://$ROOT/cocker.sock" ./.build/release/cocker info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          COCKER_HOST="unix://$ROOT/cocker.sock" ./.build/release/cocker info | head -5
+      - name: Run the full e2e suite
+        run: |
+          COCKER="$(pwd)/.build/release/cocker" \
+          COCKER_ROOT="$COCKER_CI_ROOT" \
+            bash Tests/e2e/run-all.sh
+      - name: Daemon log on failure
+        if: failure()
+        run: tail -100 "$RUNNER_TEMP/cockerd.log" || true
+      - name: Tear down
+        if: always()
+        run: |
+          ./.build/release/cocker system prune -f >/dev/null 2>&1 || true
+          pkill -f "cockerd --root $COCKER_CI_ROOT" || true
+          rm -rf "$COCKER_CI_ROOT"
