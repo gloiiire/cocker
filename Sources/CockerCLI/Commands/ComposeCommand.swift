@@ -48,6 +48,19 @@ struct ComposeUpCommand: AsyncParsableCommand {
     @Flag(name: .customLong("remove-orphans"), help: "Remove containers for services not in compose file")
     var removeOrphans = false
 
+    /// Docker semantics : an attached `up` aggregates every service's
+    /// output, and `--attach` RESTRICTS that set rather than enabling it.
+    /// Repeatable, like docker's.
+    @Option(name: [.short, .customLong("attach")],
+            help: "Restrict log streaming to the given services (repeatable)")
+    var attach: [String] = []
+
+    /// The other half of the pair : keep the aggregate but drop the noisy
+    /// ones. Applied after `--attach`.
+    @Option(name: .customLong("no-attach"),
+            help: "Do not stream logs from the given services (repeatable)")
+    var noAttach: [String] = []
+
     @Argument(help: "Services to start (default: all)", completion: .none)
     var services: [String] = []
 
@@ -55,6 +68,16 @@ struct ComposeUpCommand: AsyncParsableCommand {
         let originalPath = resolvePath(file)
         guard FileManager.default.fileExists(atPath: originalPath) else {
             throw CockerError.invalidComposeFile("File not found: \(originalPath)")
+        }
+
+        // `-d` means "don't hold the terminal", so there is nothing to
+        // attach to. Docker rejects the combination rather than silently
+        // ignoring the flag, and a silently ignored flag is exactly the
+        // kind of thing that wastes an afternoon.
+        if detach && !(attach.isEmpty && noAttach.isEmpty) {
+            throw CockerError.invalidComposeFile(
+                "--attach / --no-attach cannot be combined with --detach: "
+                + "detached mode streams no logs at all")
         }
 
         // iCloud Drive paths trigger EDEADLK ("Resource deadlock avoided")
@@ -158,6 +181,22 @@ struct ComposeUpCommand: AsyncParsableCommand {
         let proj = effectiveProjectName
         let downPath = stage.path
         let downProj = effectiveProjectName
+
+        // `--attach` / `--no-attach` turn `up` into an aggregated log view,
+        // the way `docker compose up` behaves by default.
+        //
+        // Cocker's own default stays as it was — a sticky footer with the
+        // service URLs — because changing what a bare `cocker compose up`
+        // prints would break every script and habit built on it. The flags
+        // opt into the docker-style stream.
+        if !attach.isEmpty || !noAttach.isEmpty {
+            try await streamAttachedLogs(
+                composePath: stage.path,
+                projectName: proj,
+                downPath: downPath)
+            return
+        }
+
         let footer = InteractiveFooter()
         footer.start(
             footer: {
@@ -185,6 +224,80 @@ struct ComposeUpCommand: AsyncParsableCommand {
         if footer.animated {
             while true { try? await Task.sleep(nanoseconds: 200_000_000) }
         }
+    }
+
+    /// Stream the selected services' logs until the user quits, then tear
+    /// the project down — matching `docker compose up`'s attached mode.
+    ///
+    /// The daemon already filters by service, prefixes each line with the
+    /// container name and multiplexes the streams (`handleComposeLogs`), so
+    /// this only has to pick the services and hand the request over.
+    private func streamAttachedLogs(composePath: String,
+                                    projectName: String,
+                                    downPath: String) async throws {
+        let client = IPCClient()
+
+        // Resolve the selection against the services that actually exist,
+        // so a typo is reported instead of silently streaming nothing.
+        let psPayload = ComposeRequest(composePath: composePath,
+                                       projectName: projectName)
+        let psRequest = try IPCRequest(type: .composePs, payload: psPayload)
+        let running = (try? await client.send(psRequest))
+            .flatMap { try? $0.decode(PSResponse.self) }?
+            .containers ?? []
+        let allServices = running.compactMap { $0.labels["com.cocker.service"] }
+
+        let unknown = AttachSelection.unknownServices(
+            all: allServices, attach: attach, noAttach: noAttach)
+        if !unknown.isEmpty {
+            throw CockerError.invalidComposeFile(
+                "no such service: \(unknown.joined(separator: ", ")) "
+                + "(available: \(allServices.sorted().joined(separator: ", ")))")
+        }
+
+        let selected = AttachSelection.resolve(
+            all: allServices, attach: attach, noAttach: noAttach)
+        if selected.isEmpty {
+            UX.Warning.emit("nothing to attach to",
+                            note: "--no-attach excluded every service")
+            return
+        }
+
+        // `armStreaming` deliberately keeps no sticky region : a pinned
+        // footer fights an unbounded log stream.
+        let footer = InteractiveFooter()
+        footer.armStreaming(
+            footerLines(header: [" " + UX.TTY.paint("→ Attached", .progress)
+                                 + " " + UX.TTY.paint(selected.joined(separator: ", "), .accent)],
+                        detach: true, quit: true),
+            onDetach: {
+                print(UX.TTY.paint("Detached.", .dim) + " "
+                    + UX.TTY.paint("Containers keep running — `cocker compose down` to stop.", .dim))
+                return true
+            },
+            onQuit: {
+                if let req = try? IPCRequest(type: .composeDown,
+                                             payload: ComposeRequest(composePath: downPath,
+                                                                     projectName: projectName)) {
+                    _ = try? await IPCClient().send(req)
+                }
+                print("\n" + UX.TTY.paint("Stopped and removed the project.", .dim))
+            })
+
+        let logsPayload = ComposeRequest(composePath: composePath,
+                                         projectName: projectName,
+                                         services: selected,
+                                         follow: true,
+                                         tail: 0)
+        let logsRequest = try IPCRequest(type: .composeLogs, payload: logsPayload)
+        try await client.sendStreaming(logsRequest) { event in
+            switch event.stream {
+            case .stdout: UX.writeStreamChunk(event.data)
+            case .stderr: UX.writeStderr(event.data)
+            default: break
+            }
+        }
+        footer.restore()
     }
 
 }
@@ -317,7 +430,7 @@ struct ComposeLogsCommand: AsyncParsableCommand {
         if follow { footer.armStreaming(footerLines(detach: true), onDetach: { true }) }
         try await client.sendStreaming(request) { event in
             switch event.stream {
-            case .stdout: print(event.data, terminator: "")
+            case .stdout: UX.writeStreamChunk(event.data)
             case .stderr: UX.writeStderr(event.data)
             default: break
             }
