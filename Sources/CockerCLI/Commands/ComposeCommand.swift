@@ -97,6 +97,10 @@ struct ComposeUpCommand: AsyncParsableCommand {
         // network/volume/container with live status + per-resource timer),
         // chronological passthrough otherwise (CI, pipes, logs).
         let view: UX.ComposeUpView? = UX.TTY.current.animationEnabled ? UX.ComposeUpView() : nil
+        // Start the repaint loop before the first event : the daemon can
+        // spend minutes inside one RUN without emitting anything, and a
+        // view that only repaints on events freezes mid-frame.
+        view?.startAnimating()
         // A `.error` stream event reports a build/start failure the stream
         // doesn't itself throw for — latch it and fail after draining so
         // `compose up` doesn't exit 0 on a broken build. See PRO-76.

@@ -36,12 +36,38 @@ public extension UX {
         private var startedAt = Date()
         private var pendingErrors: [String] = []
         private let animated: Bool
+        /// Repaints the table while the daemon is silent. A single long
+        /// `RUN` emits nothing for minutes, and without this the spinner
+        /// and the per-row timers freeze mid-frame — indistinguishable
+        /// from a hung command.
+        private var ticker: Ticker?
 
         public init() {
             self.animated = UX.TTY.current.animationEnabled
         }
 
+        /// Begin animating. Safe to call more than once ; a no-op off-TTY,
+        /// where there is no cursor to move and nothing to redraw.
+        public func startAnimating() {
+            guard animated, ticker == nil else { return }
+            let ticker = Ticker { [weak self] in self?.repaint() }
+            self.ticker = ticker
+            ticker.start()
+        }
+
+        /// Re-render the current state without ingesting anything. Called
+        /// by the ticker between events.
+        private func repaint() {
+            lock.lock()
+            // Nothing on screen yet : don't claim lines the view doesn't own.
+            guard !order.isEmpty else { lock.unlock(); return }
+            let frame = renderLocked()
+            lock.unlock()
+            sticky.render(frame)
+        }
+
         public func ingest(stream: StreamEvent.Stream, line: String) {
+            startAnimating()
             let parsed = ComposeEvent.parse(stream: stream, line: line)
             lock.lock()
             switch parsed {
@@ -81,6 +107,8 @@ public extension UX {
         }
 
         public func finalize() {
+            ticker?.stop()
+            ticker = nil
             lock.lock()
             let frame = renderLocked(finished: true)
             let errs = pendingErrors
@@ -137,6 +165,13 @@ public extension UX {
                     case .failed:  return .failure
                     }
                 }()
+                // Running rows animate ; the frame is derived from elapsed
+                // time so every row stays in phase and keeps turning even
+                // when no event arrives.
+                let iconOverride: String? = {
+                    guard animated, case .running = r.status else { return nil }
+                    return UX.spinnerFrame(since: startedAt)
+                }()
                 let elapsedStr: String = {
                     if let end = r.finishedAt {
                         return UX.formatElapsed(end.timeIntervalSince(r.startedAt))
@@ -147,7 +182,7 @@ public extension UX {
                     return ""
                 }()
                 let actionLine = UX.ActionLine(
-                    icon: icon, type: r.type, name: r.name,
+                    icon: icon, iconOverride: iconOverride, type: r.type, name: r.name,
                     status: r.statusText, trailing: elapsedStr.isEmpty ? nil : elapsedStr
                 )
                 lines.append(actionLine.render(nameWidth: nameWidth, statusWidth: statusWidth))
