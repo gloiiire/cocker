@@ -14,6 +14,9 @@
 #   3. `start -a` used to declare the flag and never read it.
 #   4. `compose logs -f` keeps each line whole, behind exactly one container
 #      prefix, and leaks no interactive key hint into redirected output.
+#   5. `cocker attach` keeps following after its initial backlog. The old
+#      daemon sent the last 20 lines, then only waited for the VM to stop;
+#      output produced after the client attached was silently lost.
 #
 # On (4): the line-splitting bug underneath it (Swift treats "\r\n" as a
 # single Character, so `contains("\n")` is false and CRLF output never
@@ -34,6 +37,7 @@ cleanup() {
     rc=$?
     pkill -f "compose up -a alpha" >/dev/null 2>&1 || true
     pkill -f "compose logs -f" >/dev/null 2>&1 || true
+    pkill -f "cocker attach $cname" >/dev/null 2>&1 || true
     ( cd "$tmp" && "$COCKER" compose down >/dev/null 2>&1 ) || true
     "$COCKER" rm -f "$cname" >/dev/null 2>&1 || true
     rm -rf "$tmp"
@@ -53,10 +57,20 @@ services:
     command: ["/bin/sh", "-c", "for i in 1 2 3 4 5 6; do echo BETA-$$i; sleep 1; done; sleep 120"]
 EOF
 
-# ---------------------------------------------------------------- 1/2
-echo " → 1/2 compose up -a restricts streaming (and works redirected)"
+# ---------------------------------------------------------------- 1/4
+echo " → 1/4 compose up -a restricts streaming (and works redirected)"
 ( cd "$tmp" && "$COCKER" compose up -a alpha ) >"$tmp/attached.log" 2>&1 &
-sleep 14
+seen_alpha=0
+for _ in $(seq 1 60); do
+    if grep -q 'ALPHA-' "$tmp/attached.log"; then
+        seen_alpha=1
+        break
+    fi
+    sleep 1
+done
+# Leave a short observation window in which an incorrectly attached beta
+# would also have time to print.
+sleep 3
 pkill -f "compose up -a alpha" >/dev/null 2>&1 || true
 sleep 1
 
@@ -64,7 +78,7 @@ if [ ! -s "$tmp/attached.log" ]; then
     echo "attached up wrote nothing when redirected (stdout never flushed)" >&2
     exit 1
 fi
-if ! grep -q 'ALPHA-' "$tmp/attached.log"; then
+if [ "$seen_alpha" -ne 1 ]; then
     echo "the attached service produced no output" >&2
     cat "$tmp/attached.log" >&2
     exit 1
@@ -77,10 +91,23 @@ fi
 
 ( cd "$tmp" && "$COCKER" compose down ) >/dev/null 2>&1 || true
 
-# ---------------------------------------------------------------- 2/3
-echo " → 2/3 compose logs -f: one prefix per line, clean when redirected"
+# ---------------------------------------------------------------- 2/4
+echo " → 2/4 compose logs -f: one prefix per line, clean when redirected"
 ( cd "$tmp" && "$COCKER" compose up -d ) >/dev/null 2>&1
-sleep 12
+logs_ready=0
+for _ in $(seq 1 60); do
+    ( cd "$tmp" && "$COCKER" compose logs ) >"$tmp/readiness.log" 2>&1 || true
+    if grep -q 'ALPHA-' "$tmp/readiness.log"; then
+        logs_ready=1
+        break
+    fi
+    sleep 1
+done
+if [ "$logs_ready" -ne 1 ]; then
+    echo "alpha never produced output before compose logs -f" >&2
+    cat "$tmp/readiness.log" >&2
+    exit 1
+fi
 ( cd "$tmp" && "$COCKER" compose logs -f ) >"$tmp/logs.log" 2>&1 &
 sleep 8
 pkill -f "compose logs -f" >/dev/null 2>&1 || true
@@ -138,16 +165,72 @@ fi
 
 ( cd "$tmp" && "$COCKER" compose down ) >/dev/null 2>&1 || true
 
-# ---------------------------------------------------------------- 3/3
-echo " → 3/3 start -a streams the container's output"
+# ---------------------------------------------------------------- 3/4
+echo " → 3/4 start -a streams the container's output"
 "$COCKER" run -d --name "$cname" alpine:latest \
     sh -c 'for i in 1 2 3; do echo TICK-$i; sleep 1; done' >/dev/null 2>&1
-# Let it run and exit so `start` has something stopped to restart.
-sleep 6
+# Let it exit so `start` has something stopped to restart. A fixed sleep was
+# flaky under VM load: boot itself can consume most of the budget, leaving the
+# three-second command still running when `start -a` arrives.
+status="running"
+for _ in $(seq 1 20); do
+    status=$("$COCKER" inspect "$cname" --format '{{.State.Status}}' 2>/dev/null || echo unknown)
+    [ "$status" != "running" ] && break
+    sleep 1
+done
+if [ "$status" = "running" ]; then
+    echo "container did not stop before the start -a check" >&2
+    exit 1
+fi
 
 "$COCKER" start -a "$cname" >"$tmp/start.log" 2>&1 || true
 if ! grep -q 'TICK-' "$tmp/start.log"; then
     echo "start -a printed no container output — the flag is being ignored" >&2
     cat "$tmp/start.log" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------- 4/4
+echo " → 4/4 direct attach follows output produced after attachment"
+"$COCKER" rm -f "$cname" >/dev/null 2>&1 || true
+"$COCKER" run -d --name "$cname" alpine:latest \
+    sh -c 'echo ATTACH-BEFORE; sleep 8; echo ATTACH-AFTER; sleep 120' \
+    >/dev/null 2>&1
+
+# VM boot time varies a lot when the complete suite has already exercised
+# nine scenarios. Start the follow window from an observed container line,
+# not from an arbitrary host-side sleep, so ATTACH-AFTER is guaranteed to be
+# produced after the client subscribed.
+seen_before=0
+for _ in $(seq 1 60); do
+    if "$COCKER" logs "$cname" 2>/dev/null | grep -q 'ATTACH-BEFORE'; then
+        seen_before=1
+        break
+    fi
+    sleep 0.5
+done
+if [ "$seen_before" -ne 1 ]; then
+    echo "container never produced ATTACH-BEFORE" >&2
+    exit 1
+fi
+
+"$COCKER" attach "$cname" >"$tmp/direct-attach.log" 2>&1 &
+sleep 15
+pkill -f "cocker attach $cname" >/dev/null 2>&1 || true
+sleep 1
+
+if ! grep -q 'ATTACH-BEFORE' "$tmp/direct-attach.log"; then
+    echo "direct attach did not replay its initial backlog" >&2
+    cat "$tmp/direct-attach.log" >&2
+    exit 1
+fi
+if ! grep -q 'ATTACH-AFTER' "$tmp/direct-attach.log"; then
+    echo "direct attach stopped after its backlog — live output was lost" >&2
+    cat "$tmp/direct-attach.log" >&2
+    exit 1
+fi
+if grep -q 'press d detach' "$tmp/direct-attach.log"; then
+    echo "interactive attach hint leaked into redirected output" >&2
+    cat "$tmp/direct-attach.log" >&2
     exit 1
 fi
