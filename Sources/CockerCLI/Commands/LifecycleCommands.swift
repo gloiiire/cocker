@@ -531,18 +531,29 @@ struct AttachCommand: AsyncParsableCommand {
         let payload = ContainerIDRequest(id: container)
         let request = try IPCRequest(type: .attach, payload: payload)
 
+        // Attach holds the terminal until the container stops, so it gets
+        // the same pinned footer as the other continuous viewers. Piped, the
+        // footer is inert and this is a plain pass-through.
+        let footer = InteractiveFooter()
+        footer.start(footer: { footerLines(detach: true) }, onDetach: { true },
+                     plainFallback: false)
+        let view = StreamingLogView(footer: footer)
+
         let fail = UX.FailFlag()
         try await client.sendStreaming(request) { event in
             switch event.stream {
-            case .stdout: UX.writeStreamChunk(event.data)
-            case .stderr: UX.writeStderr(event.data)
+            case .stdout, .stderr:
+                view.emit(event)
             case .status:
-                if !event.data.isEmpty { print(event.data, terminator: "") }
+                if !event.data.isEmpty { view.emitLine(event.data) }
             case .error:
                 fail.trip()
+                footer.clear()
                 UX.Failure.emit(headline: event.data)
             }
         }
+        view.finish()
+        footer.restore()
         try fail.throwIfTripped()
     }
 }
