@@ -49,7 +49,9 @@ public extension UX {
         }
 
         // Emit to stderr, matching Docker convention (errors don't pollute
-        // a command's stdout pipe).
+        // a command's stdout pipe). stdout is flushed first : it is
+        // block-buffered when redirected while stderr is not, so an
+        // unsynchronised write lands BEFORE the output it refers to.
         public static func emit(
             headline: String,
             reason: String? = nil,
@@ -57,6 +59,7 @@ public extension UX {
             details: String? = nil
         ) {
             let text = render(headline: headline, reason: reason, hint: hint, details: details) + "\n"
+            fflush(stdout)
             FileHandle.standardError.write(Data(text.utf8))
         }
 
@@ -89,6 +92,8 @@ public extension UX {
 
         public static func emit(_ headline: String, note: String? = nil) {
             let text = render(headline, note: note) + "\n"
+            // Same ordering rule as Failure.emit.
+            fflush(stdout)
             FileHandle.standardError.write(Data(text.utf8))
         }
     }
