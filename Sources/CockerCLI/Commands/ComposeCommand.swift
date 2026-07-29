@@ -193,7 +193,8 @@ struct ComposeUpCommand: AsyncParsableCommand {
             try await streamAttachedLogs(
                 composePath: stage.path,
                 projectName: proj,
-                downPath: downPath)
+                downPath: downPath,
+                urls: urls)
             return
         }
 
@@ -218,7 +219,9 @@ struct ComposeUpCommand: AsyncParsableCommand {
                     _ = try? await IPCClient().send(req)
                 }
                 print("\n" + UX.TTY.paint("Stopped and removed the project.", .dim))
-            })
+            },
+            // Piped: no keyboard, so no key hints in the output.
+            plainFallback: false)
         // Hold the terminal so the footer stays attached ; the key task exits
         // the process on `q` / Ctrl-C. Off-TTY we don't hold.
         if footer.animated {
@@ -234,7 +237,8 @@ struct ComposeUpCommand: AsyncParsableCommand {
     /// this only has to pick the services and hand the request over.
     private func streamAttachedLogs(composePath: String,
                                     projectName: String,
-                                    downPath: String) async throws {
+                                    downPath: String,
+                                    urls: ServiceURLs) async throws {
         let client = IPCClient()
 
         // Resolve the selection against the services that actually exist,
@@ -263,13 +267,21 @@ struct ComposeUpCommand: AsyncParsableCommand {
             return
         }
 
-        // `armStreaming` deliberately keeps no sticky region : a pinned
-        // footer fights an unbounded log stream.
+        // A pinned footer with the log stream scrolling ABOVE it — the same
+        // shape as `compose watch`, so the service URLs and the d/q keys
+        // stay visible no matter how much output goes by. Each incoming
+        // chunk clears the footer, prints, then redraws it at the bottom.
         let footer = InteractiveFooter()
-        footer.armStreaming(
-            footerLines(header: [" " + UX.TTY.paint("→ Attached", .progress)
-                                 + " " + UX.TTY.paint(selected.joined(separator: ", "), .accent)],
-                        detach: true, quit: true),
+        let attached = selected.joined(separator: ", ")
+        let footerContent: @Sendable () -> [String] = {
+            footerLines(
+                header: [" " + UX.TTY.paint("→ Attached", .progress)
+                         + " " + UX.TTY.paint(attached, .accent)],
+                services: urls.snapshot(),
+                detach: true, quit: true)
+        }
+        footer.start(
+            footer: footerContent,
             onDetach: {
                 print(UX.TTY.paint("Detached.", .dim) + " "
                     + UX.TTY.paint("Containers keep running — `cocker compose down` to stop.", .dim))
@@ -282,7 +294,9 @@ struct ComposeUpCommand: AsyncParsableCommand {
                     _ = try? await IPCClient().send(req)
                 }
                 print("\n" + UX.TTY.paint("Stopped and removed the project.", .dim))
-            })
+            },
+            // Piped: no keyboard, so no key hints in the output.
+            plainFallback: false)
 
         let logsPayload = ComposeRequest(composePath: composePath,
                                          projectName: projectName,
@@ -290,13 +304,16 @@ struct ComposeUpCommand: AsyncParsableCommand {
                                          follow: true,
                                          tail: 0)
         let logsRequest = try IPCRequest(type: .composeLogs, payload: logsPayload)
+        // The daemon forwards output as it arrives, so a single log line can
+        // span several events. Redrawing the footer between events would
+        // then tear the line in half and wedge the footer inside it, so
+        // StreamingLogView only emits once a line is complete.
+        let view = StreamingLogView(footer: footer)
         try await client.sendStreaming(logsRequest) { event in
-            switch event.stream {
-            case .stdout: UX.writeStreamChunk(event.data)
-            case .stderr: UX.writeStderr(event.data)
-            default: break
-            }
+            view.emit(event)
         }
+        // A last line without a trailing newline must not be swallowed.
+        view.finish()
         footer.restore()
     }
 
@@ -427,14 +444,17 @@ struct ComposeLogsCommand: AsyncParsableCommand {
         let request = try IPCRequest(type: .composeLogs, payload: payload)
 
         let footer = InteractiveFooter()
-        if follow { footer.armStreaming(footerLines(detach: true), onDetach: { true }) }
-        try await client.sendStreaming(request) { event in
-            switch event.stream {
-            case .stdout: UX.writeStreamChunk(event.data)
-            case .stderr: UX.writeStderr(event.data)
-            default: break
-            }
+        let view = StreamingLogView(footer: footer)
+        // Pinned footer while following, so the hint stays visible under a
+        // stream that never ends.
+        if follow {
+            footer.start(footer: { footerLines(detach: true) }, onDetach: { true },
+                         plainFallback: false)
         }
+        try await client.sendStreaming(request) { event in
+            view.emit(event)
+        }
+        view.finish()
         if follow { footer.restore() }
     }
 }
@@ -987,7 +1007,12 @@ struct ComposeEventsCommand: AsyncParsableCommand {
         let outputJSON = json
 
         let footer = InteractiveFooter()
-        if !outputJSON { footer.armStreaming(footerLines(detach: true), onDetach: { true }) }
+        let view = StreamingLogView(footer: footer)
+        // JSON output stays a clean machine-readable stream: no footer.
+        if !outputJSON {
+            footer.start(footer: { footerLines(detach: true) }, onDetach: { true },
+                         plainFallback: false)
+        }
         try await client.sendStreaming(request) { event in
             let ts = ISO8601DateFormatter().string(from: event.timestamp)
             // Filter events relevant to this project
@@ -999,7 +1024,7 @@ struct ComposeEventsCommand: AsyncParsableCommand {
                         print(str)
                     }
                 } else {
-                    print("\(ts) container \(event.data)")
+                    view.emitLine("\(ts) container \(event.data)")
                 }
             }
         }

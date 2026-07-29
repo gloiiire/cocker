@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 @testable import CockerCLI
+@testable import CockerCore
 
 // Covers the pure, deterministic parts of the shared interactive-footer
 // primitive (Sources/CockerCLI/UX/InteractiveFooter.swift): the footer-line
@@ -126,10 +127,64 @@ struct InteractiveFooterNonTTYTests {
         // mode or spawn a stdin reader.
         if !f.animated {
             f.start(footer: { footerLines(detach: true, quit: true) })
-            f.armStreaming(footerLines(detach: true))
             f.clear()
             f.refresh()
             f.restore()
         }
     }
+
+    /// Off-TTY the streaming view must be a plain pass-through, so
+    /// `logs -f | grep` keeps working.
+    @Test func streamingViewOffTTYWritesStraightThrough() {
+        let f = InteractiveFooter()
+        if !f.animated {
+            let view = StreamingLogView(footer: f)
+            view.emit(StreamEvent(stream: .stdout, data: "line\n"))
+            view.emitLine("event")
+            view.finish()
+        }
+    }
+
+    /// A continuous viewer must print no key hint when there is no keyboard.
+    /// Switching `logs -f` from armStreaming (silent off-TTY) to start()
+    /// (which prints the footer once) put "press d detach" at the top of
+    /// `cocker logs -f > file`, right in the middle of piped output.
+    /// `plainFallback: false` is what keeps a pipe clean.
+    @Test func continuousViewerPrintsNoHintOffTTY() {
+        let f = InteractiveFooter()
+        guard !f.animated else { return }
+        let printed = captureStdout {
+            f.start(footer: { footerLines(detach: true) },
+                    onDetach: { true },
+                    plainFallback: false)
+        }
+        #expect(printed.isEmpty, "a piped viewer must emit no footer, got: \(printed)")
+    }
+
+    /// The one-shot summary keeps its plain fallback: `compose up` off-TTY
+    /// still reports the URLs it just started.
+    @Test func oneShotSummaryStillPrintsOffTTY() {
+        let f = InteractiveFooter()
+        guard !f.animated else { return }
+        let printed = captureStdout {
+            f.start(footer: { ["   service   http://localhost:8080"] })
+        }
+        #expect(printed.contains("http://localhost:8080"))
+    }
+}
+
+/// Run `body` with stdout redirected to a pipe and return what was written.
+private func captureStdout(_ body: () -> Void) -> String {
+    let saved = dup(STDOUT_FILENO)
+    let pipe = Pipe()
+    dup2(pipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO)
+
+    body()
+    fflush(stdout)
+
+    dup2(saved, STDOUT_FILENO)
+    close(saved)
+    try? pipe.fileHandleForWriting.close()
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    return String(data: data, encoding: .utf8) ?? ""
 }

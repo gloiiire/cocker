@@ -702,10 +702,16 @@ final class DaemonServer {
         try await sendStreamingOperation(requestId: requestId, to: fd) { send in
             // Always emit the tail backlog first so the user sees context
             // even when nothing new is being printed.
+            //
+            // Backlog entries come from the JSON log, which stores one line
+            // per record with the trailing newline stripped. Emitting them
+            // as-is runs consecutive lines together, so terminate each one.
             for container in containers {
                 let backlog = self.engine.vmRuntime.logs(containerID: container.id, tail: req.tail)
                 for event in backlog {
-                    send(StreamEvent(stream: event.stream, data: "[\(container.name)] \(event.data)"))
+                    let line = LineEndings.terminated(event.data)
+                    send(StreamEvent(stream: event.stream,
+                                     data: Self.prefixEachLine(line, with: container.name)))
                 }
             }
             if !req.follow { return }
@@ -718,11 +724,26 @@ final class DaemonServer {
                     let id = container.id
                     group.addTask {
                         let logsReq = LogsRequest(id: id, follow: true, tail: 0)
+                        // Console output arrives in arbitrary chunks, so a
+                        // line can span several events. Prefixing per event
+                        // would stamp the name mid-line and leave the rest
+                        // of the line bare; buffer to line boundaries so
+                        // every line gets exactly one prefix.
+                        let assembler = LineBuffer()
                         do {
                             let stream = try await self.engine.logs(id: id, request: logsReq)
                             for try await event in stream {
                                 if Task.isCancelled { return }
-                                send(StreamEvent(stream: event.stream, data: "[\(name)] \(event.data)"))
+                                for line in assembler.feed(event.data) {
+                                    send(StreamEvent(stream: event.stream,
+                                                     data: Self.prefixEachLine(line, with: name)))
+                                }
+                            }
+                            // A final line with no trailing newline must
+                            // still reach the client.
+                            if let rest = assembler.flush() {
+                                send(StreamEvent(stream: .stdout,
+                                                 data: Self.prefixEachLine(rest, with: name)))
                             }
                         } catch {
                             send(StreamEvent(stream: .stderr, data: "[\(name)] log stream error: \(error)\n"))
@@ -732,6 +753,27 @@ final class DaemonServer {
                 await group.waitForAll()
             }
         }
+    }
+
+    /// Stamp `[name] ` on every line of `text`, keeping line endings (CRLF
+    /// included) exactly as the container emitted them. A multi-line chunk
+    /// would otherwise get a single prefix on its first line only.
+    ///
+    /// `nonisolated` because it is pure text work called from the detached
+    /// per-container log tasks.
+    nonisolated static func prefixEachLine(_ text: String, with name: String) -> String {
+        guard !text.isEmpty else { return text }
+        var out = String.UnicodeScalarView()
+        var atLineStart = true
+        for scalar in text.unicodeScalars {
+            if atLineStart {
+                out.append(contentsOf: "[\(name)] ".unicodeScalars)
+                atLineStart = false
+            }
+            out.append(scalar)
+            if scalar == "\n" { atLineStart = true }
+        }
+        return String(out)
     }
 
     private func handleComposeRestart(_ req: ComposeRequest) async throws {
