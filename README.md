@@ -606,9 +606,9 @@ swift test                  # unit tests
 Tests/e2e/run-all.sh        # end-to-end, needs a running cockerd
 ```
 
-**The e2e suite cannot run in CI, and that is a hardware limit.** Measured
-on a GitHub-hosted `macos-15` runner (reproduce with the `VM capability
-probe` workflow):
+**Hosted CI cannot boot containers, and that is a hardware limit.**
+Measured on a GitHub-hosted `macos-15` runner (reproduce with the `VM
+capability probe` workflow):
 
 ```
 chip                          = Apple M1 (Virtual)
@@ -623,10 +623,54 @@ Apple ships only on M3 and later (macOS 15+); GitHub's macOS fleet is
 M1/M2 and GitHub documents nested virtualization as unsupported. No Xcode
 or CLI tooling works around this.
 
-CI therefore compiles, cross-builds `cocker-init`, packs the initrd and
-verifies the signed artefacts. **Run `Tests/e2e/run-all.sh` on real
-hardware before tagging a release** — it is the only thing that exercises
-actual container behaviour.
+So CI splits in two:
+
+| Job | Runs on | Covers |
+| --- | --- | --- |
+| `build + package` | GitHub-hosted | compilation, `cocker-init` cross-build, initrd packing, entitlement embedded in the signed binary |
+| `e2e (self-hosted, real VMs)` | self-hosted Apple silicon | the full `Tests/e2e` suite, booting real containers |
+
+### Self-hosted runner
+
+The e2e job targets the labels `[self-hosted, macOS, ARM64, vm-capable]`.
+When no such machine is online the job simply stays queued, so the setup
+is optional and never blocks a PR.
+
+```bash
+mkdir -p ~/actions-runner && cd ~/actions-runner
+VER=$(gh api repos/actions/runner/releases/latest --jq .tag_name | sed 's/^v//')
+curl -fsSL -O "https://github.com/actions/runner/releases/download/v${VER}/actions-runner-osx-arm64-${VER}.tar.gz"
+tar xzf "actions-runner-osx-arm64-${VER}.tar.gz"
+
+TOKEN=$(gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token --jq .token)
+./config.sh --unattended --url https://github.com/<owner>/<repo> --token "$TOKEN" \
+  --name "$(scutil --get LocalHostName)" \
+  --labels self-hosted,macOS,ARM64,vm-capable --work _work
+
+# The launchd service does NOT inherit your shell PATH; zig lives in Homebrew.
+echo 'PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin' >> .env
+
+./svc.sh install && ./svc.sh start
+```
+
+Requirements: Apple silicon that is **not** itself virtualised (the job
+asserts `kern.hv_vmm_present = 0` and fails loudly otherwise), plus `zig`
+and a kernel at `~/.cocker/kernel/vmlinuz`. The job runs its daemon on an
+isolated `--root` under `RUNNER_TEMP`, so CI containers, images and build
+cache never touch the machine owner's own state.
+
+**Security — required on a public repository.** A self-hosted runner
+executes whatever a workflow asks it to, on your machine. Two protections
+are in place and must stay:
+
+- the e2e job refuses to run for a pull request coming from a fork;
+- the repository requires manual approval before any workflow runs for an
+  external contributor:
+
+```bash
+gh api -X PUT repos/<owner>/<repo>/actions/permissions/fork-pr-contributor-approval \
+  -f approval_policy=all_external_contributors
+```
 
 ## License
 
