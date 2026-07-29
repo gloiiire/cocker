@@ -92,6 +92,27 @@ public actor RegistryClient {
         return (manifest, digest)
     }
 
+    /// Human explanation for a non-200, non-404 registry response.
+    ///
+    /// Every one of these used to surface as "Manifest not found", which
+    /// named the wrong cause : the image existed, the request was refused.
+    /// Each case names what happened and what to do about it.
+    static func pullFailureExplanation(status: Int) -> String {
+        switch status {
+        case 401, 403:
+            return "not authorized (\(status)) — the registry refused the "
+                + "token; run `cocker login` if the image is private"
+        case 429:
+            return "rate limited by the registry (429) — wait, or "
+                + "authenticate with `cocker login` for a higher quota"
+        case 500...599:
+            return "registry error (\(status)) — this is on the registry "
+                + "side, retrying usually works"
+        default:
+            return "unexpected HTTP \(status) from the registry"
+        }
+    }
+
     private func fetchManifest(ref: ImageReference, token: String?, accept: [String]) async throws -> (Data, String) {
         let selector = ref.digest.map { "@\($0)" } ?? ":\(ref.tag)"
         guard let url = v2URL(ref: ref, path: "manifests/\(selector.dropFirst())") else {
@@ -106,8 +127,16 @@ public actor RegistryClient {
         guard let http = response as? HTTPURLResponse else {
             throw CockerError.imagePullFailed(ref.fullName, "Invalid response")
         }
+        // Only a real 404 means "this image does not exist". Reporting 401
+        // or 429 as "Manifest not found" sent people hunting for a typo in
+        // an image name that was perfectly correct — the actual causes are
+        // an expired/mis-scoped token and Docker Hub rate limiting.
         guard http.statusCode == 200 else {
-            throw CockerError.manifestNotFound(ref.fullName)
+            if http.statusCode == 404 {
+                throw CockerError.manifestNotFound(ref.fullName)
+            }
+            throw CockerError.imagePullFailed(
+                ref.fullName, Self.pullFailureExplanation(status: http.statusCode))
         }
 
         let digest = http.value(forHTTPHeaderField: "Docker-Content-Digest") ?? sha256(data)
@@ -290,11 +319,32 @@ public actor RegistryClient {
 
     // MARK: - Auth
 
+    /// Cache key for a bearer token.
+    ///
+    /// The repository is part of the key on purpose. Docker Hub issues a
+    /// token scoped to ONE repository, so reusing the token obtained for
+    /// `library/alpine` to fetch `library/busybox` gets a 401 — which
+    /// `fetchManifest` used to report as "Manifest not found", making a
+    /// perfectly existing image look absent. Symptom: the first pull of a
+    /// session works and every later one fails.
+    ///
+    /// Exposed (not private) so a test can pin the invariant without
+    /// reaching the network.
+    ///
+    /// Fields are length-prefixed rather than joined by a separator : a
+    /// registry named `r|x` with repository `d` would otherwise collide
+    /// with registry `r` and repository `x|d`, handing one context's token
+    /// to another. Unlikely on Docker Hub, cheap to make impossible.
+    static func tokenCacheKey(registry: String, repository: String, scope: String) -> String {
+        [registry, repository, scope]
+            .map { "\($0.count):\($0)" }
+            .joined(separator: "|")
+    }
+
     private func authenticate(registry: String, repository: String, scope: String = "pull") async throws -> String? {
-        // Cache key includes the scope so push and pull don't share tokens.
-        let cacheKey = "\(registry)|\(scope)"
+        let cacheKey = Self.tokenCacheKey(
+            registry: registry, repository: repository, scope: scope)
         if let cached = tokens[cacheKey] { return cached }
-        if let cached = tokens[registry], scope == "pull" { return cached }
 
         // Load from CredentialStore if not already set
         if credentials[registry] == nil {
