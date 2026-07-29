@@ -139,6 +139,11 @@ final class InteractiveFooter: @unchecked Sendable {
     private let sticky = UX.StickyView()
     private let lock = NSLock()
     private var builder: () -> [String] = { [] }
+    /// Ctrl-C / SIGTERM / SIGHUP handling on a dedicated queue. The
+    /// previous inline `DispatchSource(queue: .main)` never fired while a
+    /// rebuild occupied the main queue, which made Ctrl-C a no-op during
+    /// exactly the long operation users most want to interrupt.
+    private let trap = SignalTrap()
 
     init() {
         self.animated = UX.TTY.current.animationEnabled && isatty(fileno(stdin)) != 0
@@ -174,16 +179,10 @@ final class InteractiveFooter: @unchecked Sendable {
 
         // Ctrl-C = quit for real (same as `q`): restore cooked mode, run the
         // teardown, then exit. Darwin.exit skips defers, so restore here too.
-        let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        signal(SIGINT, SIG_IGN)
-        sig.setEventHandler {
-            raw.restore(); sticky.abandon()
-            Task.detached(priority: .userInitiated) {
-                if let onQuit { await onQuit() }
-                Darwin.exit(0)
-            }
-        }
-        sig.resume()
+        // A second Ctrl-C during teardown exits straight away.
+        trap.install(
+            onFirst: { raw.restore(); sticky.abandon() },
+            onTeardown: onQuit)
 
         Task.detached(priority: .userInitiated) {
             let fd = fileno(stdin)
@@ -223,16 +222,7 @@ final class InteractiveFooter: @unchecked Sendable {
         raw.enter()
         let raw = self.raw
         // Ctrl-C = quit for real (same as `q`): teardown then exit.
-        let sig = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        signal(SIGINT, SIG_IGN)
-        sig.setEventHandler {
-            raw.restore()
-            Task.detached(priority: .userInitiated) {
-                if let onQuit { await onQuit() }
-                Darwin.exit(0)
-            }
-        }
-        sig.resume()
+        trap.install(onFirst: { raw.restore() }, onTeardown: onQuit)
         Task.detached(priority: .userInitiated) {
             let fd = fileno(stdin)
             var b = [UInt8](repeating: 0, count: 1)
@@ -261,5 +251,8 @@ final class InteractiveFooter: @unchecked Sendable {
     func refresh() { if animated { sticky.render(currentFooter(), force: true) } }
 
     /// Restore the terminal on normal completion (no-op if never entered).
-    func restore() { raw.restore() }
+    func restore() {
+        trap.uninstall()
+        raw.restore()
+    }
 }

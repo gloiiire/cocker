@@ -79,10 +79,20 @@ jobs:
           #     under the in-process test runner. Its PURE logic (footerLines,
           #     ServiceURLs) IS unit-tested (InteractiveFooterTests) — the
           #     exclusion only spares the terminal-bound glue.
+          #   - SignalTrap : the handler bodies only execute when a real
+          #     SIGINT/SIGTERM is delivered, and delivering one inside the
+          #     runner kills it — the suite runs in parallel, so a sibling
+          #     test restoring the default disposition turns any signal into
+          #     an immediate kill (observed: the run died mid-flight).
+          #     Its PURE decision logic (`SignalTrap.decide`) IS unit-tested,
+          #     and actual delivery is proven end-to-end by
+          #     Tests/e2e/09-ctrl-c-during-build.sh, which sends a real
+          #     SIGINT to a real build and was verified RED against the old
+          #     main-queue handler.
           # EngineOperations was extracted from ContainerEngine without changing
           # behavior. It owns the same VM/filesystem integration paths, so keep
           # the coverage boundary stable instead of counting moved code as 0%.
-          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/EngineOperations|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/Ext4Image|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift|CockerCLI/UX/InteractiveFooter\.swift)'
+          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/EngineOperations|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/Ext4Image|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift|CockerCLI/UX/InteractiveFooter\.swift|CockerCLI/UX/SignalTrap\.swift)'
 
           xcrun llvm-cov report "$BIN" -instr-profile="$PROF" \
             -ignore-filename-regex="$IGNORE" \
