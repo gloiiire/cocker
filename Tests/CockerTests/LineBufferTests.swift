@@ -153,3 +153,47 @@ struct LineBufferTests {
         #expect(out == source)
     }
 }
+
+/// The same grapheme-cluster trap, one level up: asking whether a string
+/// ends in a newline. `"API-LOG-2\r\n"` ends in a single CRLF Character, so
+/// `hasSuffix("\n")` says false and a caller "helpfully" appends a second
+/// newline — or concludes the line was unterminated and runs it into the
+/// next one. That is what produced, in a real `compose logs -f`:
+///
+///     [footdemo_api_1] API-LOG-2[footdemo_api_1]
+@Suite("Line-ending detection")
+struct LineEndingsTests {
+
+    @Test func plainLFIsDetected() {
+        #expect(LineEndings.isTerminated("hello\n"))
+    }
+
+    /// The case `hasSuffix("\n")` gets wrong.
+    @Test func crlfIsDetected() {
+        #expect(LineEndings.isTerminated("API-LOG-2\r\n"),
+                "CRLF ends in a line feed — Character-level matching misses it")
+        #expect(!"API-LOG-2\r\n".hasSuffix("\n"),
+                "documents why the scalar-level check is needed")
+    }
+
+    @Test func unterminatedTextIsDetected() {
+        #expect(!LineEndings.isTerminated("no newline"))
+        #expect(!LineEndings.isTerminated(""))
+        #expect(!LineEndings.isTerminated("bare CR\r"), "a CR alone does not end a line")
+    }
+
+    @Test func terminatedAddsOnlyWhatIsMissing() {
+        #expect(LineEndings.terminated("a") == "a\n")
+        #expect(LineEndings.terminated("a\n") == "a\n")
+        #expect(LineEndings.terminated("a\r\n") == "a\r\n", "must not append a second newline")
+        #expect(LineEndings.terminated("a\r") == "a\r\n")
+    }
+
+    /// Backlog lines come out of the JSON log with the newline stripped;
+    /// terminating them is what keeps consecutive lines apart.
+    @Test func backlogLinesAreSeparated() {
+        let backlog = ["API-LOG-1", "API-LOG-2"]
+        let joined = backlog.map { LineEndings.terminated($0) }.joined()
+        #expect(joined == "API-LOG-1\nAPI-LOG-2\n")
+    }
+}

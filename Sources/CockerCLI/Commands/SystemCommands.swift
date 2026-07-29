@@ -280,8 +280,12 @@ struct SystemEventsCommand: AsyncParsableCommand {
         let allowedTypes = types
         let allowedIDs = ids
 
+        // Pinned footer: the `d` hint stays at the bottom while events
+        // scroll above it.
         let footer = InteractiveFooter()
-        footer.armStreaming(footerLines(detach: true), onDetach: { true })
+        footer.start(footer: { footerLines(detach: true) }, onDetach: { true },
+                     plainFallback: false)
+        let view = StreamingLogView(footer: footer)
         try await client.sendStreaming(request) { event in
             // Wire format engine→client : "<type>\t<action>\t<id>".
             let parts = event.data.split(separator: "\t", maxSplits: 2,
@@ -298,7 +302,7 @@ struct SystemEventsCommand: AsyncParsableCommand {
             if !allowedIDs.isEmpty && !allowedIDs.contains(where: { id.hasPrefix($0) }) { return }
 
             let ts = ISO8601DateFormatter().string(from: event.timestamp)
-            print("\(ts) \(type) \(action)\(id.isEmpty ? "" : " " + id)")
+            view.emitLine("\(ts) \(type) \(action)\(id.isEmpty ? "" : " " + id)")
         }
         footer.restore()
     }

@@ -202,8 +202,10 @@ struct RunCommand: AsyncParsableCommand {
             }
             let cid = result.containerID
             let footer = InteractiveFooter()
-            footer.armStreaming(
-                footerLines(header: header, detach: true, quit: true),
+            // Pinned footer: the container URLs and the d/q hints stay
+            // visible at the bottom while output scrolls above them.
+            footer.start(
+                footer: { footerLines(header: header, detach: true, quit: true) },
                 onDetach: {
                     // `d` = detach : leave the container running, return the shell.
                     print(UX.TTY.paint("Detached.", .dim) + " "
@@ -216,17 +218,17 @@ struct RunCommand: AsyncParsableCommand {
                         _ = try? await IPCClient().send(req)
                     }
                     print("\n" + UX.TTY.paint("Stopped \(name).", .dim))
-                })
+                },
+                // Piped: no keyboard, so no key hints in the output.
+                plainFallback: false)
 
+            let view = StreamingLogView(footer: footer)
             let logsReq = LogsRequest(id: result.containerID, follow: true, tail: 0)
             let streamReq = try IPCRequest(type: .logs, payload: logsReq)
             try await client.sendStreaming(streamReq) { event in
-                switch event.stream {
-                case .stdout: print(event.data, terminator: "")
-                case .stderr: UX.writeStderr(event.data)
-                default: break
-                }
+                view.emit(event)
             }
+            view.finish()
             footer.restore()
         }
     }

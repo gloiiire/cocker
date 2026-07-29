@@ -64,3 +64,21 @@ public final class LineBuffer: @unchecked Sendable {
         return pending.isEmpty
     }
 }
+
+/// Line-ending helpers that do not fall into the grapheme-cluster trap.
+public enum LineEndings {
+    /// True when `text` ends in a line feed.
+    ///
+    /// Must be asked at scalar level: `"API-LOG-2\r\n"` ends in a *single*
+    /// Character, the CRLF cluster, so `hasSuffix("\n")` answers false and
+    /// callers happily append a second newline — or, worse, skip appending
+    /// the one that was missing.
+    public static func isTerminated(_ text: String) -> Bool {
+        text.unicodeScalars.last == "\n"
+    }
+
+    /// `text` with a trailing newline, added only if there isn't one.
+    public static func terminated(_ text: String) -> String {
+        isTerminated(text) ? text : text + "\n"
+    }
+}

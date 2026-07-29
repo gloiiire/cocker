@@ -702,11 +702,16 @@ final class DaemonServer {
         try await sendStreamingOperation(requestId: requestId, to: fd) { send in
             // Always emit the tail backlog first so the user sees context
             // even when nothing new is being printed.
+            //
+            // Backlog entries come from the JSON log, which stores one line
+            // per record with the trailing newline stripped. Emitting them
+            // as-is runs consecutive lines together, so terminate each one.
             for container in containers {
                 let backlog = self.engine.vmRuntime.logs(containerID: container.id, tail: req.tail)
                 for event in backlog {
+                    let line = LineEndings.terminated(event.data)
                     send(StreamEvent(stream: event.stream,
-                                     data: Self.prefixEachLine(event.data, with: container.name)))
+                                     data: Self.prefixEachLine(line, with: container.name)))
                 }
             }
             if !req.follow { return }
