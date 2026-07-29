@@ -1,6 +1,7 @@
 import Testing
 import Foundation
 @testable import CockerCLI
+@testable import CockerCore
 
 // Covers the pure, deterministic parts of the shared interactive-footer
 // primitive (Sources/CockerCLI/UX/InteractiveFooter.swift): the footer-line
@@ -126,10 +127,44 @@ struct InteractiveFooterNonTTYTests {
         // mode or spawn a stdin reader.
         if !f.animated {
             f.start(footer: { footerLines(detach: true, quit: true) })
-            f.armStreaming(footerLines(detach: true))
             f.clear()
             f.refresh()
             f.restore()
         }
+    }
+
+    /// Off-TTY the streaming view must be a plain pass-through, so
+    /// `logs -f | grep` keeps working.
+    @Test func streamingViewOffTTYWritesStraightThrough() {
+        let f = InteractiveFooter()
+        if !f.animated {
+            let view = StreamingLogView(footer: f)
+            view.emit(StreamEvent(stream: .stdout, data: "line\n"))
+            view.emitLine("event")
+            view.finish()
+        }
+    }
+
+    /// A continuous viewer must print no key hint when there is no keyboard.
+    /// Switching `logs -f` from armStreaming (silent off-TTY) to start()
+    /// (which prints the footer once) put "press d detach" at the top of
+    /// `cocker logs -f > file`, right in the middle of piped output.
+    /// `plainFallback: false` is what keeps a pipe clean.
+    ///
+    /// Asserted on the pure rule rather than on captured stdout: the suite
+    /// runs in parallel, so redirecting the process-wide fd steals output
+    /// from whichever test happens to run alongside.
+    @Test func continuousViewerPrintsNoHintOffTTY() {
+        let hint = footerLines(detach: true)
+        #expect(!hint.isEmpty, "the footer must be non-empty for this test to mean anything")
+        #expect(InteractiveFooter.plainOutput(footer: hint, plainFallback: false).isEmpty,
+                "a piped viewer must emit no footer")
+    }
+
+    /// The one-shot summary keeps its plain fallback: `compose up` off-TTY
+    /// still reports the URLs it just started.
+    @Test func oneShotSummaryStillPrintsOffTTY() {
+        let summary = ["   service   http://localhost:8080"]
+        #expect(InteractiveFooter.plainOutput(footer: summary, plainFallback: true) == summary)
     }
 }

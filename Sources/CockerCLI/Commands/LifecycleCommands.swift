@@ -46,16 +46,20 @@ struct StartCommand: AsyncParsableCommand {
 
                 // Stream the container's output, exactly like `docker start -a`.
                 if attach {
+                    // Pinned footer so the `d`/`q` hint stays visible under
+                    // a stream that only ends when the container does.
+                    let footer = InteractiveFooter()
+                    footer.start(footer: { footerLines(detach: true) }, onDetach: { true },
+                                 plainFallback: false)
+                    let view = StreamingLogView(footer: footer)
                     let logsReq = try IPCRequest(
                         type: .logs,
                         payload: LogsRequest(id: id, follow: true, tail: 0))
                     try await client.sendStreaming(logsReq) { event in
-                        switch event.stream {
-                        case .stdout: UX.writeStreamChunk(event.data)
-                        case .stderr: UX.writeStderr(event.data)
-                        default: break
-                        }
+                        view.emit(event)
                     }
+                    view.finish()
+                    footer.restore()
                 }
             } catch let error as CockerError {
                 failed = true
@@ -298,25 +302,24 @@ struct LogsCommand: AsyncParsableCommand {
         let showTimestamps = timestamps
         // Uniform interactive hint : while following, `q` (or Ctrl-C) quits
         // the viewer and restores the terminal ; the container keeps running.
+        // The footer stays pinned at the bottom while logs scroll above it.
         let footer = InteractiveFooter()
-        if follow { footer.armStreaming(footerLines(detach: true), onDetach: { true }) }
+        let view = StreamingLogView(footer: footer)
+        if follow {
+            footer.start(footer: { footerLines(detach: true) }, onDetach: { true },
+                                 plainFallback: false)
+        }
         try await client.sendStreaming(request) { event in
             // stderr is painted dim red so the eye separates streams without
             // forcing the user to pipe to grep. Goes through UX.TTY.paint so
             // it stays plain text when redirected to a file.
             let kind: UX.StreamKind = (event.stream == .stderr) ? .stderr : .stdout
-            let body = UX.Stream.paint(event.data, stream: kind)
-            let prefix = showTimestamps
+            let stamp = showTimestamps
                 ? UX.TTY.paint(ISO8601DateFormatter().string(from: event.timestamp), .dim) + " "
                 : ""
-            switch event.stream {
-            case .stdout:
-                print("\(prefix)\(body)", terminator: "")
-            case .stderr:
-                fputs("\(prefix)\(body)", stderr)
-            default: break
-            }
+            view.emit(event) { stamp + UX.Stream.paint($0, stream: kind) }
         }
+        view.finish()
         if follow { footer.restore() }
     }
 }

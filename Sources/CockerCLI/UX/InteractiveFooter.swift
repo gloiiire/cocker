@@ -154,19 +154,38 @@ final class InteractiveFooter: @unchecked Sendable {
         return builder()
     }
 
+    /// What a non-animated footer prints when the session starts.
+    ///
+    /// Pulled out as a pure function so the rule can be tested directly.
+    /// The obvious alternative — capture the process's stdout and assert on
+    /// it — is not safe here: the suite runs in parallel, so a global fd
+    /// redirect swallows whatever a sibling test prints at the same moment.
+    /// That made two tests pass locally and fail in CI.
+    static func plainOutput(footer: [String], plainFallback: Bool) -> [String] {
+        plainFallback ? footer : []
+    }
+
     /// Begin the session. `footer` returns the up-to-date footer lines
     /// (re-evaluated on every refresh/re-arm). `onDetach`, if given, runs on
     /// `d` and returns true to exit the process or false to re-arm (used by
     /// compose watch when a detached watch already runs). When `onDetach` is
     /// nil, `d` is ignored and only `q` is offered. `onQuit` runs on `q`
     /// before the process exits.
+    ///
+    /// `plainFallback` controls what happens with no TTY. A one-shot summary
+    /// (`compose up`) still wants its lines printed. A continuous viewer
+    /// (`logs -f`) does not: a key hint has no meaning without a keyboard and
+    /// would land in the middle of `logs -f | grep`.
     func start(footer: @escaping @Sendable () -> [String],
                onDetach: (@Sendable () -> Bool)? = nil,
-               onQuit: (@Sendable () async -> Void)? = nil) {
+               onQuit: (@Sendable () async -> Void)? = nil,
+               plainFallback: Bool = true) {
         lock.lock(); builder = footer; lock.unlock()
 
         guard animated else {
-            for l in footer() { print(l) }
+            for line in Self.plainOutput(footer: footer(), plainFallback: plainFallback) {
+                print(line)
+            }
             return
         }
 
@@ -201,44 +220,6 @@ final class InteractiveFooter: @unchecked Sendable {
                     raw.enter(); sticky.render(build(), force: true)
                 default:
                     break  // ignore; Ctrl-C handled by the kernel via ISIG
-                }
-            }
-        }
-    }
-
-    /// For continuously-streaming commands (run, logs, attach, events, daemon
-    /// logs): print `lines` (URLs + a `q` hint) ONCE, then arm the `q` key and
-    /// the Ctrl-C terminal-restore — but keep NO sticky region, because a
-    /// bottom-pinned footer would fight a fast, unbounded log stream. `q` (and
-    /// Ctrl-C) restore the terminal and exit; the container/daemon keeps
-    /// running (we only detach the viewer). Off-TTY: print once, no keys.
-    func armStreaming(_ lines: [String],
-                      onDetach: (@Sendable () -> Bool)? = nil,
-                      onQuit: (@Sendable () async -> Void)? = nil) {
-        // Off-TTY (piped / CI) this is a total no-op — no hint line, no keys —
-        // so `logs -f | grep` stays clean.
-        guard animated else { return }
-        for l in lines { print(l) }
-        raw.enter()
-        let raw = self.raw
-        // Ctrl-C = quit for real (same as `q`): teardown then exit.
-        trap.install(onFirst: { raw.restore() }, onTeardown: onQuit)
-        Task.detached(priority: .userInitiated) {
-            let fd = fileno(stdin)
-            var b = [UInt8](repeating: 0, count: 1)
-            while read(fd, &b, 1) == 1 {
-                switch b[0] {
-                case UInt8(ascii: "q"), UInt8(ascii: "Q"):
-                    raw.restore()
-                    if let onQuit { await onQuit() }
-                    Darwin.exit(0)
-                case UInt8(ascii: "d"), UInt8(ascii: "D"):
-                    guard let onDetach else { break }  // d not offered
-                    raw.restore(); print("")
-                    if onDetach() { Darwin.exit(0) }
-                    raw.enter()  // refused → keep reading keys
-                default:
-                    break
                 }
             }
         }
