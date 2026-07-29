@@ -198,6 +198,9 @@ struct BuildCommand: AsyncParsableCommand {
             // Pre-header so users see "what is being built" before the
             // first Step event arrives from the daemon.
             print(" " + UX.TTY.paint("→ Building", .progress) + " " + UX.TTY.paint(config.tag, .accent) + " " + UX.TTY.paint("from \(dockerfileFullPath)", .dim))
+            // Animate from the start : a long RUN emits nothing for
+            // minutes, and an event-driven view freezes mid-frame.
+            view.startAnimating()
             try await client.sendStreaming(request) { event in
                 view.ingest(stream: event.stream, line: event.data)
             }

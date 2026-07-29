@@ -37,6 +37,10 @@ public extension UX {
         private var finalHash: String?
         private var finalTag: String?
         private let animated: Bool
+        /// Repaints while the daemon is silent. A `RUN cargo build
+        /// --release` emits nothing for minutes ; without this the spinner
+        /// and the step timer freeze and the build looks hung.
+        private var ticker: Ticker?
         // Buffer of raw stderr lines surfaced when a step fails so the user
         // sees the actual command output instead of a bare "exit 1".
         private var pendingErrors: [String] = []
@@ -45,9 +49,27 @@ public extension UX {
             self.animated = UX.TTY.current.animationEnabled
         }
 
+        /// Begin animating. Idempotent, and a no-op off-TTY.
+        public func startAnimating() {
+            guard animated, ticker == nil else { return }
+            let ticker = Ticker { [weak self] in self?.repaint() }
+            self.ticker = ticker
+            ticker.start()
+        }
+
+        /// Re-render current state without ingesting an event.
+        private func repaint() {
+            lock.lock()
+            guard !order.isEmpty else { lock.unlock(); return }
+            let frame = renderLocked()
+            lock.unlock()
+            sticky.render(frame)
+        }
+
         // Feed one event off the daemon's streaming pipe. `kind` is the
         // stream the event arrived on (.status / .stdout / .stderr / .error).
         public func ingest(stream: StreamEvent.Stream, line: String) {
+            startAnimating()
             let parsed = BuildEvent.parse(stream: stream, line: line)
             lock.lock()
             switch parsed {
@@ -92,6 +114,8 @@ public extension UX {
         // step to .done, draws the final summary, and prints any buffered
         // stderr below the table.
         public func finalize() {
+            ticker?.stop()
+            ticker = nil
             lock.lock()
             if let last = order.last, var step = steps[last], step.status == .running {
                 step.status = .done
@@ -128,7 +152,11 @@ public extension UX {
                 let arrow = step.status == .failed
                     ? UX.TTY.paint("✗", .failure)
                     : (step.status == .running
-                        ? UX.TTY.paint(UX.spinnerFrames[doneCount % UX.spinnerFrames.count], .progress)
+                        // Frame derived from elapsed time, not from the
+                        // number of completed steps : during a single long
+                        // RUN, doneCount never moves, so the old expression
+                        // rendered a frozen glyph.
+                        ? UX.TTY.paint(UX.spinnerFrame(since: startedAt), .progress)
                         : UX.TTY.paint("=>", .progress))
                 let stepIdx = UX.TTY.paint("[\(step.index)/\(step.total)]", .dim)
                 let inst = step.instruction.padding(toLength: max(widest, step.instruction.count), withPad: " ", startingAt: 0)
