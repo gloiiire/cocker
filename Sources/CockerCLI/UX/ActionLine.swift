@@ -14,6 +14,11 @@ import Foundation
 public extension UX {
     struct ActionLine: Sendable {
         public var icon: Icon
+        /// Replaces the icon glyph while keeping its semantic color. Used
+        /// by sticky views to animate an in-progress row : the `.progress`
+        /// token is a single static Braille glyph, so a live spinner has to
+        /// substitute the current frame here.
+        public var iconOverride: String?
         public var type: ObjectType?     // optional — some lines aren't object-scoped
         public var name: String
         public var status: String        // "Started", "Pulling", "Remove failed"...
@@ -22,6 +27,7 @@ public extension UX {
 
         public init(
             icon: Icon,
+            iconOverride: String? = nil,
             type: ObjectType? = nil,
             name: String,
             status: String,
@@ -29,6 +35,7 @@ public extension UX {
             statusColor: Color? = nil
         ) {
             self.icon = icon
+            self.iconOverride = iconOverride
             self.type = type
             self.name = name
             self.status = status
@@ -37,7 +44,7 @@ public extension UX {
         }
 
         public func render(nameWidth: Int? = nil, statusWidth: Int? = nil) -> String {
-            let iconStr = UX.TTY.paint(icon.rawValue, icon.color)
+            let iconStr = UX.TTY.paint(iconOverride ?? icon.rawValue, icon.color)
             let typeStr: String = type.map { UX.TTY.paint($0.padded, .dim) } ?? String(repeating: " ", count: ObjectType.labelWidth)
             let paddedName = name.padding(toLength: max(name.count, nameWidth ?? name.count), withPad: " ", startingAt: 0)
             let statusRaw = status.padding(toLength: max(status.count, statusWidth ?? status.count), withPad: " ", startingAt: 0)
