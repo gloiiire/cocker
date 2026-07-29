@@ -12,6 +12,14 @@
 #      `compose up -a web > log.txt` produced 0 bytes indefinitely.
 #      This scenario runs redirected on purpose — a TTY would hide it.
 #   3. `start -a` used to declare the flag and never read it.
+#   4. `compose logs -f` keeps each line whole, behind exactly one container
+#      prefix, and leaks no interactive key hint into redirected output.
+#
+# On (4): the line-splitting bug underneath it (Swift treats "\r\n" as a
+# single Character, so `contains("\n")` is false and CRLF output never
+# splits) is pinned precisely by LineBufferTests / LineEndingsTests, which
+# fail against the old implementation. Here the observable end-user
+# guarantee is asserted instead: whole lines, one prefix, clean pipe.
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib.sh
@@ -25,6 +33,7 @@ cname="cocker-e2e-attach-$$"
 cleanup() {
     rc=$?
     pkill -f "compose up -a alpha" >/dev/null 2>&1 || true
+    pkill -f "compose logs -f" >/dev/null 2>&1 || true
     ( cd "$tmp" && "$COCKER" compose down >/dev/null 2>&1 ) || true
     "$COCKER" rm -f "$cname" >/dev/null 2>&1 || true
     rm -rf "$tmp"
@@ -36,10 +45,12 @@ cat >"$tmp/docker-compose.yml" <<'EOF'
 services:
   alpha:
     image: alpine:latest
-    command: ["/bin/sh", "-c", "for i in 1 2 3 4 5 6; do echo ALPHA-$i; sleep 1; done; sleep 120"]
+    # $$i, not $i : compose expands $VAR itself, so $i would reach the shell
+    # empty and every line would print a bare "ALPHA-".
+    command: ["/bin/sh", "-c", "for i in 1 2 3 4 5 6; do echo ALPHA-$$i; sleep 1; done; sleep 120"]
   beta:
     image: alpine:latest
-    command: ["/bin/sh", "-c", "for i in 1 2 3 4 5 6; do echo BETA-$i; sleep 1; done; sleep 120"]
+    command: ["/bin/sh", "-c", "for i in 1 2 3 4 5 6; do echo BETA-$$i; sleep 1; done; sleep 120"]
 EOF
 
 # ---------------------------------------------------------------- 1/2
@@ -66,8 +77,69 @@ fi
 
 ( cd "$tmp" && "$COCKER" compose down ) >/dev/null 2>&1 || true
 
-# ---------------------------------------------------------------- 2/2
-echo " → 2/2 start -a streams the container's output"
+# ---------------------------------------------------------------- 2/3
+echo " → 2/3 compose logs -f: one prefix per line, clean when redirected"
+( cd "$tmp" && "$COCKER" compose up -d ) >/dev/null 2>&1
+sleep 12
+( cd "$tmp" && "$COCKER" compose logs -f ) >"$tmp/logs.log" 2>&1 &
+sleep 8
+pkill -f "compose logs -f" >/dev/null 2>&1 || true
+sleep 1
+
+# Container output ends in CRLF, and in Swift "\r\n" is a single Character,
+# so `contains("\n")` is false. Line splitting written in terms of Character
+# matched nothing at all: every line stayed buffered and the view was blank.
+if ! grep -q 'ALPHA-' "$tmp/logs.log"; then
+    echo "compose logs -f produced no output (CRLF line splitting regressed?)" >&2
+    head -20 "$tmp/logs.log" >&2
+    exit 1
+fi
+
+# The prefix is the CONTAINER name (project_service_1), stamped once per
+# line. It used to be stamped once per stream *event*, and one line spans
+# several events, so the name landed mid-line:
+#
+#     [proj_alpha_1] ALPHA-2[proj_alpha_1]
+#
+# Two prefixes on one line is the unambiguous signature. (A line holding
+# only a prefix is NOT: containers emit blank lines, and a blank line is
+# real output that gets prefixed like any other.)
+if grep -qE '\[[a-z0-9_]*alpha[a-z0-9_]*\].*\[[a-z0-9_]*alpha[a-z0-9_]*\]' "$tmp/logs.log"; then
+    echo "two container prefixes on one line — prefixing must be per line" >&2
+    grep -E '\[[a-z0-9_]*alpha[a-z0-9_]*\].*\[' "$tmp/logs.log" | head -5 >&2
+    exit 1
+fi
+
+# Every application line must arrive whole, on one line, behind exactly one
+# prefix. Which numbers land depends on timing, so assert the shape of all
+# of them rather than looking for a particular one.
+bad=$(grep 'ALPHA-' "$tmp/logs.log" \
+      | grep -cvE '^\[[a-z0-9_]*alpha[a-z0-9_]*\] ALPHA-[0-9]+[[:space:]]*$' || true)
+if [ "$bad" -ne 0 ]; then
+    echo "$bad ALPHA- line(s) are not a single whole prefixed line" >&2
+    grep 'ALPHA-' "$tmp/logs.log" \
+      | grep -vE '^\[[a-z0-9_]*alpha[a-z0-9_]*\] ALPHA-[0-9]+[[:space:]]*$' | head -5 >&2
+    exit 1
+fi
+good=$(grep -cE '^\[[a-z0-9_]*alpha[a-z0-9_]*\] ALPHA-[0-9]+[[:space:]]*$' "$tmp/logs.log" || true)
+if [ "$good" -lt 3 ]; then
+    echo "only $good well-formed ALPHA- lines — expected the stream to carry several" >&2
+    head -20 "$tmp/logs.log" >&2
+    exit 1
+fi
+
+# Redirected output has no keyboard, so the key hint must not appear in it.
+# Pinning the footer had put "press d detach" at the top of piped output.
+if grep -q 'press' "$tmp/logs.log"; then
+    echo "interactive key hint leaked into redirected output" >&2
+    grep -n 'press' "$tmp/logs.log" | head -3 >&2
+    exit 1
+fi
+
+( cd "$tmp" && "$COCKER" compose down ) >/dev/null 2>&1 || true
+
+# ---------------------------------------------------------------- 3/3
+echo " → 3/3 start -a streams the container's output"
 "$COCKER" run -d --name "$cname" alpine:latest \
     sh -c 'for i in 1 2 3; do echo TICK-$i; sleep 1; done' >/dev/null 2>&1
 # Let it run and exit so `start` has something stopped to restart.
