@@ -563,8 +563,14 @@ actor DockerfileBuilder {
         // explicit file via `-f`; an explicit `--file foo` wins.
         let dockerfilePath: String
         let userPickedFile = config.dockerfile != "Dockerfile"
+        // `-f` may legitimately point OUTSIDE the context (Docker allows
+        // it), in which case the CLI sends an absolute path. Joining it to
+        // the context would produce `/ctx//abs/Dockerfile`.
+        let dockerfileIsAbsolute = config.dockerfile.hasPrefix("/")
         if userPickedFile {
-            dockerfilePath = config.contextPath + "/" + config.dockerfile
+            dockerfilePath = dockerfileIsAbsolute
+                ? config.dockerfile
+                : config.contextPath + "/" + config.dockerfile
         } else {
             let cockerCandidate = config.contextPath + "/Cockerfile"
             if FileManager.default.fileExists(atPath: cockerCandidate) {
@@ -801,7 +807,19 @@ actor DockerfileBuilder {
                 log(.stdout, " ---> \(shortID())\n")
 
             case "RUN":
-                let command = resolveArg(instruction.args, env: substEnv())
+                // BuildKit `RUN --mount=...` flags. Without this the whole
+                // line went to /bin/sh, which tried to execute
+                // `--mount=type=cache,...` as a program : the step failed
+                // and the build looked like it had done nothing.
+                let mounts = RunMountFlags.parse(instruction.args)
+                if !mounts.unsupportedTypes.isEmpty {
+                    throw CockerError.buildFailed(
+                        RunMountFlags.failure(for: mounts.unsupportedTypes))
+                }
+                if !mounts.ignoredTypes.isEmpty {
+                    log(.stdout, " ---> \(RunMountFlags.warning(for: mounts.ignoredTypes))\n")
+                }
+                let command = resolveArg(mounts.command, env: substEnv())
                 log(.stdout, " ---> Running: \(command)\n")
                 guard let rootfs = currentRootfsPath else {
                     log(.stderr, "Error: RUN before FROM — skipping\n")
@@ -1201,7 +1219,26 @@ actor DockerfileBuilder {
                         // multi-entry branch above keeps its echo because it also
                         // reports entry / ignored counts, which the header can't.
                     } else {
-                        log(.stderr, "Warning: source \(src) not found in build context\n")
+                        // Docker fails the build here, and it must : a COPY
+                        // whose source is missing silently produces an image
+                        // without the file, which only explodes at runtime.
+                        // A warning was not enough — `cocker build` still
+                        // exited 0, so CI and scripts saw a success.
+                        //
+                        // The most common cause by far is a `-f` pointing
+                        // outside the context, since paths resolve against
+                        // the context and not against the Dockerfile.
+                        let hint = FileManager.default.fileExists(
+                            atPath: URL(fileURLWithPath: config.dockerfile)
+                                .deletingLastPathComponent()
+                                .appendingPathComponent(srcRel).path)
+                            ? " — it exists next to the Dockerfile but not in the "
+                              + "build context '\(config.contextPath)'; COPY paths "
+                              + "resolve against the context, not the Dockerfile"
+                            : ""
+                        throw CockerError.buildFailed(
+                            "COPY \(src): no such file or directory in the build "
+                            + "context\(hint)")
                     }
                 }
 

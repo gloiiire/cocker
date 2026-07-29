@@ -165,7 +165,14 @@ struct BuildCommand: AsyncParsableCommand {
         // inside the daemon process) ; the CLI has full TCC access and
         // can copy via rsync. Same staging mechanism `cocker compose up`
         // uses ; benefits from the same incremental cache on repeat runs.
-        let stage = try await ICloudStaging.stageIfNeeded(originalPath: dockerfileFullPath) { msg in
+        //
+        // Stage the CONTEXT, not the Dockerfile's directory. Deriving the
+        // context from `-f` made `cocker build -f other/Dockerfile ctx/`
+        // copy from `other/` and ignore `ctx/` entirely — the opposite of
+        // Docker, where COPY always resolves against the context. A build
+        // then silently produced an image built from the wrong files.
+        let stage = try await ICloudStaging.stageIfNeeded(
+            originalPath: absContext + "/." ) { msg in
             // bird (iCloud) staging is one of the macOS-daemon touch-points
             // the charter §12 says we name explicitly so users see what's
             // happening behind a slow first build.
@@ -173,12 +180,20 @@ struct BuildCommand: AsyncParsableCommand {
         }
         let effectiveContext = (stage.path as NSString).deletingLastPathComponent
 
+        // Where the daemon will read the Dockerfile from. When `-f` points
+        // inside the context we pass the relative path so a staged copy
+        // resolves correctly ; when it points outside (a legitimate Docker
+        // usage) we pass it verbatim, because only the context is staged.
+        let dockerfileForDaemon: String = {
+            let ctxPrefix = absContext.hasSuffix("/") ? absContext : absContext + "/"
+            if dockerfileFullPath.hasPrefix(ctxPrefix) {
+                return String(dockerfileFullPath.dropFirst(ctxPrefix.count))
+            }
+            return dockerfileFullPath
+        }()
+
         var config = BuildConfig(contextPath: effectiveContext, tag: tag.isEmpty ? "cocker-image:\(Int(Date().timeIntervalSince1970))" : tag)
-        // The daemon joins `contextPath + "/" + dockerfile`, so send just the
-        // filename — `effectiveContext` already points at the Dockerfile's
-        // staged directory. Sending the raw (possibly absolute) `file` here
-        // was the other half of the PRO-78 path-concatenation bug.
-        config.dockerfile = (stage.path as NSString).lastPathComponent
+        config.dockerfile = dockerfileForDaemon
         config.buildArgs = try parseKV(buildArgs)
         config.noCache = noCache
         config.target = target
@@ -211,11 +226,19 @@ struct BuildCommand: AsyncParsableCommand {
             try await client.sendStreaming(request) { event in
                 switch event.stream {
                 case .stdout: print(event.data, terminator: "")
-                case .stderr: fputs(event.data, stderr)
+                case .stderr:
+                    // stdout is block-buffered when redirected while stderr
+                    // is not, so an unsynchronised write puts the failure
+                    // diagnostic BEFORE the step list it explains.
+                    UX.writeStderr(event.data)
                 case .status: print(event.data, terminator: event.data.hasSuffix("\n") ? "" : "\n")
-                case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
+                case .error:
+                    UX.syncStdout()
+                    fail.trip()
+                    UX.Failure.emit(headline: event.data)
                 }
             }
+            UX.syncStdout()
             try fail.throwIfTripped()
         }
     }

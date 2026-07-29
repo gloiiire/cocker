@@ -275,7 +275,7 @@ struct TopCommand: AsyncParsableCommand {
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
-            case .stderr: fputs(event.data, stderr)
+            case .stderr: UX.writeStderr(event.data)
             case .error: fputs("Error: \(event.data)\n", stderr)
             case .status: break
             }
