@@ -594,10 +594,39 @@ Sources/
   CockerCore/      — Shared types: models, IPC protocol, OCI client
   CockerCLI/       — CLI commands (ArgumentParser)
   CockerDaemon/    — Daemon: engine, VM runtime, DNS, Docker API
-Tests/             — 681 unit tests (90.91 % line coverage)
+Tests/             — unit tests + end-to-end scenarios
 Formula/           — Homebrew formula
 entitlements/      — codesign entitlements for cockerd
 ```
+
+## Testing
+
+```bash
+swift test                  # unit tests
+Tests/e2e/run-all.sh        # end-to-end, needs a running cockerd
+```
+
+**The e2e suite cannot run in CI, and that is a hardware limit.** Measured
+on a GitHub-hosted `macos-15` runner (reproduce with the `VM capability
+probe` workflow):
+
+```
+chip                          = Apple M1 (Virtual)
+kern.hv_vmm_present           = 1      ← the runner is itself a VM
+nestedVirtualizationSupported = false  ← nested virt requires M3+
+VZVirtualMachineConfiguration.validate()
+  → VZErrorDomain Code=2 "Virtualization is not available on this hardware."
+```
+
+Booting a guest from inside a VM requires nested virtualization, which
+Apple ships only on M3 and later (macOS 15+); GitHub's macOS fleet is
+M1/M2 and GitHub documents nested virtualization as unsupported. No Xcode
+or CLI tooling works around this.
+
+CI therefore compiles, cross-builds `cocker-init`, packs the initrd and
+verifies the signed artefacts. **Run `Tests/e2e/run-all.sh` on real
+hardware before tagging a release** — it is the only thing that exercises
+actual container behaviour.
 
 ## License
 

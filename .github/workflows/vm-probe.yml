@@ -11,13 +11,12 @@ name: VM capability probe
 #   3. Is the runner itself a VM ? If so, booting a guest needs nested virt.
 #   4. Where does `apple/container/container` actually drop its kernel ?
 #
-# Manual trigger, plus a push trigger on the probe branch itself :
-# `workflow_dispatch` is only selectable once the file lives on the
-# default branch, which it does not yet.
+# Manual trigger only : this answers a question, it does not gate
+# anything. Re-run it whenever GitHub changes its macOS fleet — the day
+# the runners move to M3, hosted e2e becomes possible and the `smoke`
+# job in ci.yml can be revisited.
 on:
   workflow_dispatch:
-  push:
-    branches: [probe/vm-capability]
 
 jobs:
   probe:
