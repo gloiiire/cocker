@@ -150,41 +150,21 @@ struct InteractiveFooterNonTTYTests {
     /// (which prints the footer once) put "press d detach" at the top of
     /// `cocker logs -f > file`, right in the middle of piped output.
     /// `plainFallback: false` is what keeps a pipe clean.
+    ///
+    /// Asserted on the pure rule rather than on captured stdout: the suite
+    /// runs in parallel, so redirecting the process-wide fd steals output
+    /// from whichever test happens to run alongside.
     @Test func continuousViewerPrintsNoHintOffTTY() {
-        let f = InteractiveFooter()
-        guard !f.animated else { return }
-        let printed = captureStdout {
-            f.start(footer: { footerLines(detach: true) },
-                    onDetach: { true },
-                    plainFallback: false)
-        }
-        #expect(printed.isEmpty, "a piped viewer must emit no footer, got: \(printed)")
+        let hint = footerLines(detach: true)
+        #expect(!hint.isEmpty, "the footer must be non-empty for this test to mean anything")
+        #expect(InteractiveFooter.plainOutput(footer: hint, plainFallback: false).isEmpty,
+                "a piped viewer must emit no footer")
     }
 
     /// The one-shot summary keeps its plain fallback: `compose up` off-TTY
     /// still reports the URLs it just started.
     @Test func oneShotSummaryStillPrintsOffTTY() {
-        let f = InteractiveFooter()
-        guard !f.animated else { return }
-        let printed = captureStdout {
-            f.start(footer: { ["   service   http://localhost:8080"] })
-        }
-        #expect(printed.contains("http://localhost:8080"))
+        let summary = ["   service   http://localhost:8080"]
+        #expect(InteractiveFooter.plainOutput(footer: summary, plainFallback: true) == summary)
     }
-}
-
-/// Run `body` with stdout redirected to a pipe and return what was written.
-private func captureStdout(_ body: () -> Void) -> String {
-    let saved = dup(STDOUT_FILENO)
-    let pipe = Pipe()
-    dup2(pipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO)
-
-    body()
-    fflush(stdout)
-
-    dup2(saved, STDOUT_FILENO)
-    close(saved)
-    try? pipe.fileHandleForWriting.close()
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    return String(data: data, encoding: .utf8) ?? ""
 }

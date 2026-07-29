@@ -154,6 +154,17 @@ final class InteractiveFooter: @unchecked Sendable {
         return builder()
     }
 
+    /// What a non-animated footer prints when the session starts.
+    ///
+    /// Pulled out as a pure function so the rule can be tested directly.
+    /// The obvious alternative — capture the process's stdout and assert on
+    /// it — is not safe here: the suite runs in parallel, so a global fd
+    /// redirect swallows whatever a sibling test prints at the same moment.
+    /// That made two tests pass locally and fail in CI.
+    static func plainOutput(footer: [String], plainFallback: Bool) -> [String] {
+        plainFallback ? footer : []
+    }
+
     /// Begin the session. `footer` returns the up-to-date footer lines
     /// (re-evaluated on every refresh/re-arm). `onDetach`, if given, runs on
     /// `d` and returns true to exit the process or false to re-arm (used by
@@ -172,7 +183,9 @@ final class InteractiveFooter: @unchecked Sendable {
         lock.lock(); builder = footer; lock.unlock()
 
         guard animated else {
-            if plainFallback { for l in footer() { print(l) } }
+            for line in Self.plainOutput(footer: footer(), plainFallback: plainFallback) {
+                print(line)
+            }
             return
         }
 
