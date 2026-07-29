@@ -223,7 +223,7 @@ struct RunCommand: AsyncParsableCommand {
             try await client.sendStreaming(streamReq) { event in
                 switch event.stream {
                 case .stdout: print(event.data, terminator: "")
-                case .stderr: fputs(event.data, stderr)
+                case .stderr: UX.writeStderr(event.data)
                 default: break
                 }
             }

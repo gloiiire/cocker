@@ -195,7 +195,7 @@ struct ComposeUpCommand: AsyncParsableCommand {
 private func renderComposeEvent(_ event: StreamEvent) {
     switch event.stream {
     case .stdout: print(event.data, terminator: "")
-    case .stderr: fputs(event.data, stderr)
+    case .stderr: UX.writeStderr(event.data)
     case .status: print(UX.TTY.paint(event.data, .progress))
     case .error:  UX.Failure.emit(headline: event.data)
     }
@@ -318,7 +318,7 @@ struct ComposeLogsCommand: AsyncParsableCommand {
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
-            case .stderr: fputs(event.data, stderr)
+            case .stderr: UX.writeStderr(event.data)
             default: break
             }
         }
@@ -427,7 +427,7 @@ struct ComposeExecCommand: AsyncParsableCommand {
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
-            case .stderr: fputs(event.data, stderr)
+            case .stderr: UX.writeStderr(event.data)
             default: break
             }
         }
@@ -465,7 +465,7 @@ struct ComposeRunCommand: AsyncParsableCommand {
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
-            case .stderr: fputs(event.data, stderr)
+            case .stderr: UX.writeStderr(event.data)
             case .status: print(UX.TTY.paint(event.data, .progress))
             case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
             }
@@ -500,7 +500,7 @@ struct ComposeBuildCommand: AsyncParsableCommand {
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
-            case .stderr: fputs(event.data, stderr)
+            case .stderr: UX.writeStderr(event.data)
             case .status: print(UX.TTY.paint(event.data, .progress))
             case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
             }
@@ -531,7 +531,7 @@ struct ComposePullCommand: AsyncParsableCommand {
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
-            case .stderr: fputs(event.data, stderr)
+            case .stderr: UX.writeStderr(event.data)
             case .status: print(UX.TTY.paint(event.data, .progress))
             case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
             }

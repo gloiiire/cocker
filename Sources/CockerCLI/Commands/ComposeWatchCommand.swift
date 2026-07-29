@@ -513,7 +513,7 @@ struct ComposeWatchCommand: AsyncParsableCommand {
             case .stdout:
                 print(event.data, terminator: "")
                 urls?.capture(fromStdout: event.data)
-            case .stderr: fputs(event.data, stderr)
+            case .stderr: UX.writeStderr(event.data)
             case .status: print(UX.TTY.paint(event.data, .progress))
             case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
             }

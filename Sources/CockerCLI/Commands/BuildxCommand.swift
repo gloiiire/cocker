@@ -236,7 +236,7 @@ struct BuildxBuildCommand: AsyncParsableCommand {
             try await client.sendStreaming(request) { event in
                 switch event.stream {
                 case .stdout: print(event.data, terminator: "")
-                case .stderr: fputs(event.data, stderr)
+                case .stderr: UX.writeStderr(event.data)
                 case .status: print(UX.TTY.paint(event.data, .dim))
                 case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
                 }
