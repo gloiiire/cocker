@@ -21,11 +21,29 @@ fi
 
 echo "==> E2E suite ($($COCKER --version 2>/dev/null || echo '?'))"
 
-# Leftovers from an interrupted run make later scenarios fail with
-# "Container name already in use", which looks like a product bug.
-for c in cocker-e2e-srv cocker-e2e-srv2 cocker-e2e-pf cocker-e2e-db cocker-e2e-web; do
-    $COCKER rm -f "$c" >/dev/null 2>&1 || true
-done
+# Leftovers make later scenarios fail with "Container name already in use" or
+# "port already allocated", which looks like a product bug and sends whoever
+# is reading the report hunting a regression that isn't there. Observed: 04,
+# 05 and 09 failing in-suite while every one of them passed on its own.
+#
+# So: sweep before the suite AND between scenarios. A scenario that dies hard
+# (or gets killed mid-stream) never runs its own trap, and the next one pays
+# for it.
+sweep() {
+    for c in cocker-e2e-srv cocker-e2e-srv2 cocker-e2e-pf cocker-e2e-db cocker-e2e-web; do
+        $COCKER rm -f "$c" >/dev/null 2>&1 || true
+    done
+    # Compose scenarios run out of `mktemp -d`, so their containers are named
+    # after the temp directory (tmpXXXX_service_1) and the fixed list above
+    # never matches them. Match the name column instead.
+    $COCKER ps --all 2>/dev/null \
+        | awk 'NR > 1 && ($NF ~ /^tmp[a-z0-9]+_/ || $NF ~ /^cocker-e2e-/) { print $1 }' \
+        | while read -r id; do
+            [ -n "$id" ] && $COCKER rm -f "$id" >/dev/null 2>&1
+        done
+    return 0
+}
+sweep
 
 pass=0
 fail=0
@@ -59,6 +77,9 @@ for script in "$DIR"/[0-9]*.sh; do
         pass=$((pass + 1))
         echo " ✓ $name"
     fi
+
+    # Leave the next scenario a clean machine whatever happened to this one.
+    sweep
 done
 
 echo
