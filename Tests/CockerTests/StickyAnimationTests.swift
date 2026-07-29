@@ -61,38 +61,57 @@ struct StickyAnimationTests {
         #expect(UX.tickerInterval < UX.spinnerFrameInterval)
     }
 
+    /// The property under test is "it keeps firing on its own", not "it
+    /// fires N times per second". Asserting a tick count made the test
+    /// flaky on a loaded CI machine (observed: 2 ticks where 3 were
+    /// expected), so wait for the ticks instead of assuming a cadence.
     @Test func tickerFiresRepeatedlyWithoutAnyEvent() async throws {
         let counter = TickCounter()
         let ticker = UX.Ticker(interval: 0.01) { counter.bump() }
         ticker.start()
-        try await Task.sleep(nanoseconds: 200_000_000)
-        ticker.stop()
-        let ticks = counter.value
-        // ~20 expected ; assert a floor that a frozen ticker cannot reach.
-        #expect(ticks >= 3)
+        defer { ticker.stop() }
+
+        // Generous ceiling: this only bounds how long a genuinely broken
+        // ticker takes to fail, never how fast a healthy one must be.
+        let deadline = Date().addingTimeInterval(10)
+        while counter.value < 3 && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(counter.value >= 3)
     }
 
     @Test func tickerStopsFiringAfterStop() async throws {
         let counter = TickCounter()
         let ticker = UX.Ticker(interval: 0.01) { counter.bump() }
         ticker.start()
-        try await Task.sleep(nanoseconds: 100_000_000)
+        // Wait for proof it started rather than for a fixed delay.
+        let deadline = Date().addingTimeInterval(10)
+        while counter.value == 0 && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(counter.value > 0, "ticker never started")
         ticker.stop()
+        // Let any in-flight tick land before sampling the baseline.
+        try await Task.sleep(nanoseconds: 50_000_000)
         let afterStop = counter.value
-        try await Task.sleep(nanoseconds: 100_000_000)
+        try await Task.sleep(nanoseconds: 150_000_000)
         #expect(counter.value == afterStop)
     }
 
     @Test func tickerStartIsIdempotent() async throws {
         let counter = TickCounter()
-        let ticker = UX.Ticker(interval: 0.02) { counter.bump() }
+        // A long interval keeps the assertion meaningful : a triple-started
+        // ticker would fire ~3x, which stays far above this ceiling even
+        // when the machine is slow.
+        let ticker = UX.Ticker(interval: 0.05) { counter.bump() }
         ticker.start()
         ticker.start()
         ticker.start()
-        try await Task.sleep(nanoseconds: 120_000_000)
+        try await Task.sleep(nanoseconds: 250_000_000)
         ticker.stop()
-        // Three starts must not triple the cadence.
-        #expect(counter.value <= 12)
+        // ~5 ticks expected from one ticker ; three would give ~15. The
+        // bound only has to separate those two cases.
+        #expect(counter.value <= 10)
     }
 
     // MARK: - Rendering
