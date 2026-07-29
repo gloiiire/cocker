@@ -674,16 +674,24 @@ final class DaemonServer {
 
     // MARK: - Attach / history / compose helpers (A2)
 
+    /// `attach` is a log follower, not a one-shot backlog reader. Keeping the
+    /// request construction in one testable place pins the two parts of that
+    /// contract: replay the last 20 events, then remain subscribed to live
+    /// console output until the VM exits or the client disconnects.
+    nonisolated static func attachLogsRequest(for id: String) -> LogsRequest {
+        LogsRequest(id: id, follow: true, tail: 20)
+    }
+
     private func handleAttach(_ req: ContainerIDRequest, requestId: String, to fd: Int32) async throws {
-        guard let container = await engine.state.container(id: req.id) else {
-            throw CockerError.containerNotFound(req.id)
-        }
-        let historical = engine.vmRuntime.logs(containerID: container.id, tail: 20)
-        let containerID = container.id
+        let logsRequest = Self.attachLogsRequest(for: req.id)
         try await sendStreamingOperation(requestId: requestId, to: fd) { [self] send in
-            for event in historical { send(event) }
-            while self.engine.vmRuntime.isRunning(containerID: containerID) {
-                try? await Task.sleep(nanoseconds: 200_000_000)
+            // ContainerEngine.logs subscribes to VMRuntime's live stream
+            // before returning its backlog snapshot, so output cannot fall
+            // into a history/live race window during attachment.
+            let events = try await self.engine.logs(id: req.id, request: logsRequest)
+            for await event in events {
+                if Task.isCancelled { return }
+                send(event)
             }
         }
     }
