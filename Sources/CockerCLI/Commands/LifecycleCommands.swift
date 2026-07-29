@@ -326,6 +326,9 @@ struct ExecCommand: AsyncParsableCommand {
     var command: [String]
 
     mutating func run() async throws {
+        // Same POSIX terminator rule as `run` : `cocker exec c -- sh -c ...`
+        // must execute `sh`, not `--`.
+        let command = CommandSeparator.strippingLeadingSeparator(self.command)
         var config = ExecConfig(containerID: container, command: command)
         config.interactive = interactive
         config.tty = tty

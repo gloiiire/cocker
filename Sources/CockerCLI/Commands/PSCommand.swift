@@ -129,6 +129,14 @@ struct InspectCommand: AsyncParsableCommand {
     @Argument(help: "Container ID or name", completion: .none)
     var containers: [String]
 
+    /// Docker-compatible `--format`. Supports field paths
+    /// (`{{.State.Status}}`) and `{{json .X}}`. Without it, every script
+    /// and helper written against `docker inspect --format` fails on
+    /// cocker with "Unknown option".
+    @Option(name: .customLong("format"),
+            help: "Format output with a Go template, e.g. '{{.State.Status}}'")
+    var format: String?
+
     mutating func run() async throws {
         let client = IPCClient()
         var results: [InspectView] = []
@@ -145,6 +153,19 @@ struct InspectCommand: AsyncParsableCommand {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(results)
+
+        // `--format` renders against the very JSON we would have printed,
+        // so the two outputs can never disagree.
+        if let format {
+            let decoded = try JSONSerialization.jsonObject(
+                with: data, options: [.fragmentsAllowed])
+            // Docker renders one line per inspected object.
+            let items = (decoded as? [Any]) ?? [decoded]
+            for item in items {
+                print(try GoTemplate.render(format, value: item))
+            }
+            return
+        }
         print(String(data: data, encoding: .utf8) ?? "")
     }
 }
@@ -158,10 +179,24 @@ struct InspectCommand: AsyncParsableCommand {
 struct InspectView: Encodable {
     let container: Container
 
-    enum CodingKeys: String, CodingKey { case State }
+    enum CodingKeys: String, CodingKey { case State, NetworkSettings }
 
     struct StateView: Encodable {
+        // Docker's canonical State block. `cocker inspect` used to expose
+        // only Health here, so `{{.State.Status}}` — the single most common
+        // template in scripts and health checks — resolved to nothing.
+        let Status: String
+        let Running: Bool
+        let ExitCode: Int
+        let StartedAt: String?
         let Health: HealthView?
+    }
+    /// Docker's network block. Scripts read `.NetworkSettings.IPAddress`
+    /// to reach a container ; cocker only had the flat `cockerIP`.
+    struct NetworkSettingsView: Encodable {
+        let IPAddress: String
+        let MacAddress: String
+        let Gateway: String
     }
     struct HealthView: Encodable {
         let Status: String
@@ -200,7 +235,21 @@ struct InspectView: Encodable {
         } else {
             health = nil
         }
-        try c.encode(StateView(Health: health), forKey: .State)
+        try c.encode(StateView(
+            Status: container.status.rawValue,
+            Running: container.status == .running,
+            ExitCode: Int(container.exitCode ?? 0),
+            StartedAt: container.startedAt.map(rfc3339Nano),
+            Health: health
+        ), forKey: .State)
+        // `cockerIP` is the address reachable from other containers ; `ip`
+        // is the NAT-side lease. Prefer the former, which is what a script
+        // asking for `.NetworkSettings.IPAddress` wants to talk to.
+        try c.encode(NetworkSettingsView(
+            IPAddress: container.cockerIP ?? container.ip ?? "",
+            MacAddress: container.cockerMAC ?? container.natMAC ?? "",
+            Gateway: container.cockerIP != nil ? "10.42.0.1" : ""
+        ), forKey: .NetworkSettings)
     }
 }
 

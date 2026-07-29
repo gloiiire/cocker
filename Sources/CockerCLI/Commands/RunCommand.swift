@@ -124,6 +124,10 @@ struct RunCommand: AsyncParsableCommand {
     var command: [String] = []
 
     mutating func run() async throws {
+        // `cocker run alpine -- sh -c '...'` : the POSIX terminator is a
+        // separator, not argv[0]. Left in place it reached the guest and
+        // cocker-init exited 127 with `execvp --`.
+        let command = CommandSeparator.strippingLeadingSeparator(self.command)
         var config = RunConfig(image: image, command: command)
         config.name = name
         config.detach = detach
