@@ -24,8 +24,11 @@ YAML
 
 (cd "$tmp" && $COCKER compose up -d) >/dev/null
 
-# Clean up either via compose down or by removing both containers individually.
-trap '$COCKER rm -f cocker-e2e-web cocker-e2e-db >/dev/null 2>&1 || true; rm -rf "$tmp"' EXIT
+# Clean up either via compose down or by removing both containers
+# individually. `on_exit` MUST stay in the handler : replacing the trap
+# installed by init_test without it silently swallowed the PASS/FAIL
+# verdict, so this scenario reported nothing at all.
+trap 'rc=$?; $COCKER rm -f cocker-e2e-web cocker-e2e-db >/dev/null 2>&1 || true; rm -rf "$tmp"; on_exit "$rc"' EXIT
 
 wait_running cocker-e2e-db
 wait_running cocker-e2e-web
