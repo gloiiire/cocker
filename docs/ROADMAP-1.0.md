@@ -87,7 +87,7 @@ failed, or losing data. Shipped in #357.
 
 | | |
 |---|---|
-| ⬜ | **Decide the punt.** `ROADMAP.md` said to cut `swarm`/`stack`/`service`/`node` in v0.5 and it never happened — 23 commands still ship, still lead the help screen, and some invent data (`node ls` returns a fresh UUID per call). This is a breaking change for anyone scripting them, so it needs a decision, not a patch |
+| ✅ | **The punt, decided.** Not a deletion. The family splits in two once you look: `stack deploy`/`ls`/`rm` and `service create`/`rm`/`ls` genuinely delegate to compose and to `run`, and deleting them would break working behaviour for no correctness gain. `swarm init`/`join`/`leave` and `service update`/`scale` were pure theatre — `swarm init` printed a plausible `SWMTKN-1-…` join token that joins nothing — and now fail with `notImplemented` (exit 126). All of them stay out of `-h`. The surface is truthful; a further deletion is a product choice, not a 1.0 blocker |
 | ✅ | README leads with the iCloud positioning, documents Dev Containers / JetBrains, and states the `apple/container` split |
 | ✅ | `docs/man/` regenerated (145 → 159 pages) and `bump-version.sh` keeps it current |
 | ✅ | **`*.md` policy decided.** `CHANGELOG.md` and `SECURITY.md` are exceptions in `.gitignore`, alongside the spec docs. A user needs to know what changed before upgrading, and cocker installs a root LaunchDaemon and stores registry passwords in cleartext — neither is discoverable from the README. `CONTRIBUTING.md` stays out: the promotion chain and branch rules live in the repo's own tooling |
@@ -97,7 +97,7 @@ failed, or losing data. Shipped in #357.
 
 | | |
 |---|---|
-| ⬜ | **Run the e2e suite in CI.** The job targets a self-hosted `vm-capable` runner that doesn't exist, and is explicitly designed never to block a PR. Needs one M-series Mac — hosted runners are M1/M2 VMs and nested virtualisation is M3+, so this is hardware, not configuration |
+| ⬜ | **Run the e2e suite in CI.** Still needs one M-series Mac as a self-hosted runner — hosted runners are M1/M2 VMs and nested virtualisation is M3+, so this is hardware, not configuration. Mitigated meanwhile: a status job now states in the run summary whether e2e actually ran, so a green check can't be mistaken for e2e coverage, and `Tests/e2e/README.md` documents running it by hand |
 | ✅ | **Releases gated on tests.** `build-and-sign` now `needs: test` — `swift test` plus a cocker-init cross-compile and its C test, which `swift test` never covered |
 | 🚧 | e2e coverage. Added `11-exit-codes` and `12-exec-after-start`; suite is 12/12 green on real hardware. Still uncovered: registry push/pull, block volumes, `compose down`, `logs -f`, volume/network lifecycle |
 | ✅ | Coverage reports two numbers — the gated scope and all of `Sources/` — and says which is which |
