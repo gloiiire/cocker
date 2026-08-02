@@ -74,6 +74,38 @@ struct StartCommand: AsyncParsableCommand {
     }
 }
 
+struct WaitCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "wait",
+        abstract: "Block until one or more containers stop, then print their exit codes"
+    )
+
+    @Argument(help: "Container ID(s) or name(s)")
+    var containers: [String]
+
+    mutating func run() async throws {
+        let client = IPCClient()
+        var failed = false
+        for id in containers {
+            do {
+                let request = try IPCRequest(type: .wait, payload: ContainerIDRequest(id: id))
+                let response = try await client.send(request)
+                // Docker prints one code per line and exits 0 itself — the
+                // code is data here, not this command's own status.
+                print(try response.decode(WaitResponse.self).exitCode)
+            } catch let error as CockerError {
+                failed = true
+                UX.Failure.emit(
+                    headline: "Cannot wait on container \(id)",
+                    reason: error.description,
+                    hint: "check `cocker ps -a` to confirm it exists"
+                )
+            }
+        }
+        if failed { throw ExitCode.failure }
+    }
+}
+
 struct StopCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "stop",
@@ -417,13 +449,19 @@ struct ExecCommand: AsyncParsableCommand {
         let payload = ExecRequest(config: config)
         let request = try IPCRequest(type: .exec, payload: payload)
 
+        // Docker parity : `cocker exec` exits with the command's code. The
+        // `.status` event carrying `exit:<n>` used to be dropped here, so
+        // `cocker exec c false` reported success.
+        let status = ExitStatusBox()
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: UX.writeStreamChunk(event.data)
             case .stderr: UX.writeStderr(event.data)
-            default: break
+            case .status: status.consume(statusPayload: event.data)
+            case .error: UX.writeStderr(event.data)
             }
         }
+        if status.code != 0 { throw ExitCode(status.code) }
     }
 }
 

@@ -7,6 +7,8 @@ public enum IPCRequestType: String, Codable, Sendable {
     case run, start, stop, kill, restart, rm, pause, unpause
     // Container info
     case ps, inspect, logs, top
+    // Block until a container exits, then report its code
+    case wait
     // Exec
     case exec
     // Copy
@@ -190,6 +192,28 @@ public struct ContainerIDRequest: Codable, Sendable {
     public init(id: String, signal: String? = nil, force: Bool? = nil) {
         self.id = id; self.signal = signal; self.force = force
     }
+}
+
+/// The daemon reports a finished `exec` as a `.status` stream event whose
+/// payload is `exit:<n>`. Both the CLI and the Docker-API server have to read
+/// it back, and both used to drop it — so `cocker exec c false` and
+/// `docker exec c false` each reported success. One parser, so the two can't
+/// drift apart.
+public enum ExitMarker {
+    /// `exit:<n>` → n. Tolerates the trailing newline the guest may leave on
+    /// the marker. Any other status payload (pull progress and the like)
+    /// returns nil and must be left for the caller to handle.
+    public static func parse(_ raw: String) -> Int32? {
+        guard raw.hasPrefix("exit:") else { return nil }
+        return Int32(raw.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
+/// Reply to `.wait` — the container's real exit code, readable even after
+/// `--rm` has removed the container.
+public struct WaitResponse: Codable, Sendable {
+    public let exitCode: Int32
+    public init(exitCode: Int32) { self.exitCode = exitCode }
 }
 
 public struct PSRequest: Codable, Sendable {

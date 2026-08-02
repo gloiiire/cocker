@@ -557,13 +557,18 @@ struct ComposeExecCommand: AsyncParsableCommand {
         let payload = ExecRequest(config: config)
         let request = try IPCRequest(type: .exec, payload: payload)
 
+        // Same contract as `cocker exec` : propagate the command's exit code
+        // instead of swallowing the `exit:<n>` status event.
+        let status = ExitStatusBox()
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: UX.writeStderr(event.data)
-            default: break
+            case .status: status.consume(statusPayload: event.data)
+            case .error: UX.writeStderr(event.data)
             }
         }
+        if status.code != 0 { throw ExitCode(status.code) }
     }
 }
 
