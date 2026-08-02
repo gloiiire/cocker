@@ -74,6 +74,22 @@ struct ContextCreateCommand: AsyncParsableCommand {
         } else {
             host = "unix://\(NSHomeDirectory())/.cocker/cocker.sock"
         }
+        // Only `unix://` is actually routable. `CockerContext.socketPath`
+        // returns nil for anything else and `currentSocketPath` then falls
+        // back to the default socket — so `context create --docker
+        // host=tcp://remote:2376` was accepted, `context use` reported
+        // success, and every command afterwards silently talked to the
+        // *local* daemon. Refuse it instead of pretending.
+        guard host.hasPrefix("unix://") else {
+            UX.Failure.emit(
+                headline: "Cannot create context \(name)",
+                reason: "only unix:// endpoints are supported (got \(host))",
+                hint: "cocker has no remote transport yet — a tcp:// context would "
+                    + "silently route back to the local daemon"
+            )
+            throw ExitCode.failure
+        }
+
         let ctx = CockerContext(name: name, description: description, dockerHost: host)
         store.contexts.append(ctx)
         try store.save()
