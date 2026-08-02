@@ -309,14 +309,19 @@ final class DockerAPIServer {
             await handleImagePull(req: req, fd: fd)
             response = nil
 
-        case ("GET", "images") where segments.count == 3 && segments[2] == "json":
-            response = await handleImageInspect(name: segments[1])
+        // `>= 3` and a rejoined name : a registry- or namespace-qualified
+        // reference (`ghcr.io/org/app`, `library/redis`) contributes several
+        // path segments, so the old `== 3` guard sent every one of them to
+        // the 501 fallback. Compose inspects an image right after pulling it.
+        case ("GET", "images") where segments.count >= 3 && segments.last == "json":
+            response = await handleImageInspect(name: Self.imageName(from: segments))
 
-        case ("DELETE", "images") where segments.count == 2:
-            response = await handleImageRemove(name: segments[1], req: req)
+        case ("DELETE", "images") where segments.count >= 2:
+            response = await handleImageRemove(
+                name: Self.imageName(from: segments, hasVerbSuffix: false), req: req)
 
-        case ("POST", "images") where segments.count == 3 && segments[2] == "tag":
-            response = await handleImageTag(name: segments[1], req: req)
+        case ("POST", "images") where segments.count >= 3 && segments.last == "tag":
+            response = await handleImageTag(name: Self.imageName(from: segments), req: req)
 
         case ("POST", "build"):
             await handleImageBuild(req: req, fd: fd)
@@ -326,7 +331,11 @@ final class DockerAPIServer {
             response = .json([DockerEmpty]())
 
         // ── Networks ────────────────────────────────────────────
-        case ("GET", "networks"):
+        // `segments.count == 1` matters : without it this case also matched
+        // `/networks/{id}`, shadowing the inspect case below into dead code.
+        // `compose up` does a NetworkInspect on every run and got a JSON
+        // *array* where it expected an object.
+        case ("GET", "networks") where segments.count == 1:
             response = await handleNetworkList(req: req)
 
         case ("POST", "networks") where segments.count == 2 && segments[1] == "create":
@@ -349,7 +358,8 @@ final class DockerAPIServer {
                                     body: Data(#"{"NetworksDeleted":[]}"#.utf8))
 
         // ── Volumes ─────────────────────────────────────────────
-        case ("GET", "volumes"):
+        // Same shadowing bug as `/networks` above.
+        case ("GET", "volumes") where segments.count == 1:
             response = await handleVolumeList(req: req)
 
         case ("POST", "volumes") where segments.count == 2 && segments[1] == "create":
@@ -379,8 +389,8 @@ final class DockerAPIServer {
         // history yet ; we synthesise one entry per layer digest so the
         // common consumer (a UI listing layer sizes) gets a reasonable
         // shape instead of a 501.
-        case ("GET", "images") where segments.count == 3 && segments[2] == "history":
-            response = await handleImageHistory(name: segments[1])
+        case ("GET", "images") where segments.count >= 3 && segments.last == "history":
+            response = await handleImageHistory(name: Self.imageName(from: segments))
 
         // ── Container filesystem diff (no-op) ────────────────────
         // `docker container diff <id>` lists files added/changed/deleted
@@ -967,6 +977,23 @@ final class DockerAPIServer {
     }
 
     // MARK: - Image handlers
+
+    /// Rebuild an image reference from the path segments it was split across.
+    ///
+    /// `/images/ghcr.io/org/app/json` arrives as
+    /// `["images", "ghcr.io", "org", "app", "json"]`. Taking `segments[1]`
+    /// yielded "ghcr.io" and the `== 3` count guards missed entirely, so
+    /// every namespaced or registry-qualified reference 501'd.
+    ///
+    /// `hasVerbSuffix` is false for routes whose last segment is part of the
+    /// name (DELETE) rather than an action (`json`, `tag`, `history`).
+    /// Clients that percent-encode the slashes instead are handled too.
+    nonisolated static func imageName(from segments: [String], hasVerbSuffix: Bool = true) -> String {
+        let upper = hasVerbSuffix ? segments.count - 1 : segments.count
+        guard upper > 1 else { return "" }
+        let joined = segments[1..<upper].joined(separator: "/")
+        return joined.removingPercentEncoding ?? joined
+    }
 
     private func handleImageList(req: HTTPRequest) async -> HTTPResponse {
         let filters: DockerFilters
