@@ -538,7 +538,10 @@ final class DaemonServer {
                 sendErrorResponse(requestId: request.id, error: "Unknown request type: \(request.type.rawValue)", to: fd)
             }
         } catch let error as CockerError {
-            sendErrorResponse(requestId: request.id, error: error.description, to: fd)
+            // Send the kind alongside the message so the CLI can exit 127 for
+            // "no such container" rather than a blanket 1.
+            sendErrorResponse(requestId: request.id, error: error.description,
+                              code: error.exitCode, to: fd)
         } catch {
             sendErrorResponse(requestId: request.id, error: error.localizedDescription, to: fd)
         }
@@ -552,8 +555,9 @@ final class DaemonServer {
         try IPCFramer.write(data, to: fd)
     }
 
-    private func sendErrorResponse(requestId: String, error: String, to fd: Int32) {
-        let response = IPCResponse(requestId: requestId, error: error)
+    private func sendErrorResponse(requestId: String, error: String, code: Int32? = nil,
+                                   to fd: Int32) {
+        let response = IPCResponse(requestId: requestId, error: error, errorCode: code)
         if let data = try? JSONEncoder().encode(response) {
             try? IPCFramer.write(data, to: fd)
         }

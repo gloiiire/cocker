@@ -70,4 +70,15 @@ case "$out" in
     *)              echo "  FAIL exec stdout : unexpected ($out)" >&2; fail=1 ;;
 esac
 
+# --- the documented taxonomy ---------------------------------------------
+# docs/UX-CHARTER.md promises 127 no-such-object / 126 found-but-not-runnable
+# / 125 cocker-itself-failed. It never reached a script: commands caught the
+# error to print their failure block and then threw a blanket 1, and the IPC
+# layer dropped the error's kind on the way back anyway.
+check "stop: no such container"   127 "$(status_of $COCKER stop cocker-e2e-nosuch-$$)"
+check "rm: no such container"     127 "$(status_of $COCKER rm cocker-e2e-nosuch-$$)"
+check "rmi: no such image"        127 "$(status_of $COCKER rmi cocker-e2e-nosuch-$$:latest)"
+check "volume rm: no such volume" 127 "$(status_of $COCKER volume rm cocker-e2e-nosuch-$$)"
+check "unimplemented command"     126 "$(status_of $COCKER node ls)"
+
 exit $fail

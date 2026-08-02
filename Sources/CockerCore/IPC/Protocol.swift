@@ -82,6 +82,16 @@ public struct IPCResponse: Codable, Sendable {
     public let success: Bool
     public let payload: Data
     public let error: String?
+    /// The failing `CockerError`'s exit code, so the CLI can keep the
+    /// taxonomy the charter documents.
+    ///
+    /// Only the message used to cross the socket, and the client re-wrapped
+    /// it as `CockerError.daemon(String)` — which has no kind, so every
+    /// daemon-side failure arrived as a plain 1. "No such container" and
+    /// "the daemon is wedged" were indistinguishable to a script, which is
+    /// precisely what the taxonomy exists to prevent. Optional: an older
+    /// daemon doesn't send it and the client falls back to 1.
+    public let errorCode: Int32?
     public let isStreaming: Bool
     public let isLast: Bool
 
@@ -95,15 +105,17 @@ public struct IPCResponse: Codable, Sendable {
         self.success = true
         self.payload = try JSONEncoder().encode(payload)
         self.error = nil
+        self.errorCode = nil
         self.isStreaming = isStreaming
         self.isLast = isLast
     }
 
-    public init(requestId: String, error: String) {
+    public init(requestId: String, error: String, errorCode: Int32? = nil) {
         self.requestId = requestId
         self.success = false
         self.payload = Data()
         self.error = error
+        self.errorCode = errorCode
         self.isStreaming = false
         self.isLast = true
     }
@@ -651,8 +663,10 @@ public struct UpdateRequest: Codable, Sendable {
 // MARK: - Version
 
 public enum CockerVersion {
-    // Bumped manually with each tag. TODO : drive from a Version.generated.swift
-    // produced by the release workflow so this can't drift again.
+    // Both are rewritten by scripts/bump-version.sh, which release.yml then
+    // re-validates against the tag. `buildTime` used to be hand-maintained
+    // alongside an automated `version` and had already drifted: 0.7.13.26
+    // shipped claiming a build date seven weeks older than the release.
     public static let version = "0.7.13.26"
     public static let apiVersion = "1.0"
     public static let buildTime = "2026-06-13"
