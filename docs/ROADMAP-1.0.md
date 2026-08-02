@@ -97,7 +97,7 @@ failed, or losing data. Shipped in #357.
 
 | | |
 |---|---|
-| ⬜ | **Run the e2e suite in CI.** The job targets a self-hosted `vm-capable` runner that doesn't exist, and is explicitly designed never to block a PR. Needs one M-series Mac — hosted runners are M1/M2 VMs and nested virtualisation is M3+, so this is hardware, not configuration |
+| ⬜ | **Run the e2e suite in CI.** Still needs one M-series Mac as a self-hosted runner — hosted runners are M1/M2 VMs and nested virtualisation is M3+, so this is hardware, not configuration. Mitigated meanwhile: a status job now states in the run summary whether e2e actually ran, so a green check can't be mistaken for e2e coverage, and `Tests/e2e/README.md` documents running it by hand |
 | ✅ | **Releases gated on tests.** `build-and-sign` now `needs: test` — `swift test` plus a cocker-init cross-compile and its C test, which `swift test` never covered |
 | 🚧 | e2e coverage. Added `11-exit-codes` and `12-exec-after-start`; suite is 12/12 green on real hardware. Still uncovered: registry push/pull, block volumes, `compose down`, `logs -f`, volume/network lifecycle |
 | ✅ | Coverage reports two numbers — the gated scope and all of `Sources/` — and says which is which |

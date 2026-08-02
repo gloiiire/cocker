@@ -498,3 +498,51 @@ jobs:
           ./.build/release/cocker system prune -f >/dev/null 2>&1 || true
           pkill -f "cockerd --root $COCKER_CI_ROOT" || true
           rm -rf "$COCKER_CI_ROOT"
+
+  e2e-status:
+    # Say out loud whether the e2e suite actually ran.
+    #
+    # The `e2e` job targets a `vm-capable` self-hosted runner. With no such
+    # runner online it is reported as *skipped*, and a skipped job doesn't
+    # fail anything — so a pull request went green while the only tests that
+    # boot a real VM never executed. Every path this project cares most about
+    # (mount failures, exit codes, the interactive terminal) lives behind that
+    # job, and its absence was invisible.
+    #
+    # This never fails the build either — a missing runner isn't the
+    # contributor's fault. It writes the state into the run summary so a green
+    # checkmark can't be mistaken for e2e coverage.
+    name: e2e coverage status
+    runs-on: ubuntu-latest
+    needs: [e2e]
+    if: always()
+    steps:
+      - name: Report whether the e2e suite ran
+        run: |
+          result='${{ needs.e2e.result }}'
+          {
+            echo '## End-to-end suite'
+            echo ''
+            case "$result" in
+              success)
+                echo '✅ **Ran, and passed.** Real VMs booted on a self-hosted Apple-silicon runner.'
+                ;;
+              failure)
+                echo '❌ **Ran, and failed.** See the `e2e` job.'
+                ;;
+              skipped|cancelled|"")
+                echo '⚠️ **Did not run.** No `vm-capable` self-hosted runner was available.'
+                echo ''
+                echo 'Everything that boots a VM is therefore unverified by this run:'
+                echo 'volume mounts, exit-code propagation through a real container,'
+                echo 'the interactive terminal, compose, and the build cache.'
+                echo ''
+                echo 'A green check on this pull request means the **unit** tests passed.'
+                echo 'Run `bash Tests/e2e/run-all.sh` against a local daemon before tagging.'
+                ;;
+              *)
+                echo "⚠️ **Unknown state:** $result"
+                ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "e2e result: $result"

@@ -41,3 +41,47 @@ These would be valuable but require infrastructure we don't have today :
 - **Memory pressure** — needs sustained load infrastructure
 
 If you do soak-test postgres/redis and find issues, please file a bug under the `e2e` label with the daemon log.
+
+## Running it by hand
+
+CI cannot run this suite — it needs a self-hosted Apple-silicon runner that can
+use Virtualization.framework, and hosted runners are themselves VMs. Until one
+exists, a maintainer running this before tagging is the only thing standing
+between a regression and a release.
+
+Against an isolated daemon, so your own containers are untouched:
+
+```bash
+swift build -c release
+codesign --force --sign - --entitlements entitlements/cockerd.entitlements \
+  .build/release/cockerd
+
+# cocker-init is cross-compiled and packed into the initrd the daemon boots.
+(cd cocker-init && \
+  zig cc -target aarch64-linux-musl -static -O2 -Wall -o cocker-init \
+    init.c cmdline.c net.c dns_proxy.c qemu.c spec.c exec_listener.c \
+    caps.c health_poll.c etc_overlay.c dhcp_min.c && \
+  cp cocker-init initrd-staging/init && \
+  (cd initrd-staging && find . | cpio -o -H newc 2>/dev/null) | gzip -9 > initrd.img)
+
+ROOT=/private/tmp/cocker-e2e            # keep it SHORT — see below
+rm -rf "$ROOT" && mkdir -p "$ROOT/kernel"
+cp -L ~/.cocker/kernel/vmlinuz "$ROOT/kernel/vmlinuz"
+cp cocker-init/initrd.img "$ROOT/kernel/initrd.img"
+
+COCKER_DNS_PORT=5399 ./.build/release/cockerd \
+  --root "$ROOT" --socket "$ROOT/cocker.sock" &
+
+export COCKER_HOST="unix://$ROOT/cocker.sock"
+./.build/release/cocker pull alpine:latest
+COCKER="$(pwd)/.build/release/cocker" COCKER_ROOT="$ROOT" bash Tests/e2e/run-all.sh
+```
+
+Two things that will waste your afternoon otherwise:
+
+- **`COCKER_DNS_PORT` is not optional.** `--root` and `--socket` do *not* fully
+  isolate a test daemon: the DNS listener binds a fixed port and fights the
+  machine's real daemon (`WARN [dns] TCP listener bind failed`). Results go
+  flaky rather than failing outright, which is worse.
+- **Keep the root path short.** A Unix socket path is capped at 103 bytes, and
+  a nested temp directory blows through it with a confusing error.
