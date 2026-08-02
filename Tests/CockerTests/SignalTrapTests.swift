@@ -25,26 +25,57 @@ struct SignalTrapTests {
     /// The regression, reproduced without any signal: block the main queue,
     /// then check that work scheduled the way SignalTrap schedules it still
     /// runs. Written to FAIL against a `queue: .main` handler.
-    @Test func handlerRunsWhileTheMainQueueIsBlocked() async throws {
-        let mainQueueRan = LockedFlag()
+    @Test func handlerRunsWhileTheMainQueueIsBlocked() async {
         let dedicatedRan = LockedFlag()
+        let mainRanBeforeDedicated = LockedFlag()
 
-        // Occupy the main queue the way a rebuild does.
-        DispatchQueue.main.async { Thread.sleep(forTimeInterval: 1.5) }
-        // Give it a moment to actually start blocking.
-        try await Task.sleep(nanoseconds: 100_000_000)
+        // Everything that decides the verdict happens INSIDE the blocking
+        // window, on queues whose ordering is guaranteed. Two earlier
+        // versions of this test failed under load for reasons that had
+        // nothing to do with SignalTrap:
+        //
+        //  1. It dispatched the blocker, slept 100 ms hoping it had started,
+        //     and probed. Under load the blocker had not started yet.
+        //  2. It waited for proof the blocker had started, then probed from
+        //     the test's own thread. Under load — two concurrent `swift
+        //     test` processes saturating the cooperative pool — the test
+        //     thread was itself resumed *after* the window closed, so it
+        //     probed a main queue that was free again.
+        //
+        // Both share one flaw: they assume the test thread gets to act
+        // while the window is open, and nothing guarantees that. So the
+        // observation is taken by the dedicated handler itself, at the
+        // instant it runs. The main queue is serial and is sitting inside
+        // this block, so a handler scheduled on it provably cannot have run
+        // yet — no timing assumption left to violate.
+        await withCheckedContinuation { (k: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async {
+                let mainQueueRan = LockedFlag()
+                let dedicatedFinished = DispatchSemaphore(value: 0)
 
-        // How the old code scheduled its handler.
-        DispatchQueue.main.async { mainQueueRan.set(true) }
-        // How SignalTrap schedules its handler.
-        DispatchQueue(label: "test.dedicated").async { dedicatedRan.set(true) }
+                // How the old code scheduled its handler.
+                DispatchQueue.main.async { mainQueueRan.set(true) }
+                // How SignalTrap schedules its handler.
+                DispatchQueue(label: "test.dedicated").async {
+                    dedicatedRan.set(true)
+                    mainRanBeforeDedicated.set(mainQueueRan.value)
+                    dedicatedFinished.signal()
+                }
 
-        try await Task.sleep(nanoseconds: 400_000_000)
+                // Occupy the main queue the way a rebuild does — until the
+                // dedicated handler has actually run, rather than for a
+                // fixed duration. A slow machine now makes this test
+                // slower, never wrong. The timeout only stops a hang from
+                // becoming an infinite one.
+                _ = dedicatedFinished.wait(timeout: .now() + 30)
+                k.resume()
+            }
+        }
 
-        #expect(!mainQueueRan.value,
-                "a main-queue handler is starved — this is the bug")
         #expect(dedicatedRan.value,
                 "a dedicated-queue handler must still run — this is the fix")
+        #expect(!mainRanBeforeDedicated.value,
+                "a main-queue handler is starved — this is the bug")
     }
 
     /// A command that finishes normally hands the terminal back, so the trap
