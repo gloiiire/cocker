@@ -98,9 +98,22 @@ jobs:
             -ignore-filename-regex="$IGNORE" \
             | tee coverage.txt
 
+          # The same report WITHOUT the exclusion list. Every entry in
+          # $IGNORE is individually defensible — Virtualization.framework,
+          # raw sockets, termios, ArgumentParser glue: things a unit test
+          # cannot drive — but together they leave most of the product
+          # outside the gated number. Publishing only that figure invites
+          # "90% covered" to be read as a claim about the whole engine,
+          # which it is not. Report both; gate on one.
+          xcrun llvm-cov report "$BIN" -instr-profile="$PROF" \
+            -ignore-filename-regex='(\.build/|Tests/|cocker-init/)' \
+            > coverage-full.txt
+
           # Extract the TOTAL line coverage percentage (last column after lines column)
           COV=$(awk '/^TOTAL/ { gsub("%","",$10); print $10 }' coverage.txt)
-          echo "Line coverage: ${COV}%"
+          COV_FULL=$(awk '/^TOTAL/ { gsub("%","",$10); print $10 }' coverage-full.txt)
+          echo "Line coverage (gated scope): ${COV}%"
+          echo "Line coverage (all of Sources/): ${COV_FULL}%"
           # Use python for float comparison so we don't depend on bc
           MEET=$(python3 -c "print('yes' if float('${COV}') >= 90 else 'no')")
           if [ "$MEET" != "yes" ]; then
@@ -109,6 +122,17 @@ jobs:
           fi
           {
             echo '## Test coverage'
+            echo ''
+            echo "**Gated scope: ${COV}%** (threshold 90%)"
+            echo ''
+            echo "**All of Sources/: ${COV_FULL}%**"
+            echo ''
+            echo 'The gate excludes code a unit test cannot drive:'
+            echo 'Virtualization.framework, raw sockets, termios,'
+            echo 'ArgumentParser glue. Those live in Tests/e2e instead,'
+            echo 'which needs a vm-capable runner. The second number is'
+            echo 'the honest answer to "how much of cocker do unit tests'
+            echo 'actually touch".'
             echo ''
             echo '```'
             cat coverage.txt
