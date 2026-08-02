@@ -7,7 +7,7 @@ Notable changes per release. Versions are `MAJOR.MINOR.PATCH.BUILD` — see
 Entries describe what changed for *you*, not what moved in the code. A user
 should be able to read one line and know whether it affects them.
 
-## Unreleased
+## 1.0.0.0 — 2026-08-02
 
 The 1.0 correctness pass. Almost everything here is a case where cocker either
 reported success for something that failed, or lost data quietly. Verified on
@@ -34,6 +34,16 @@ Apple silicon against real VMs.
   BuildKit builder that doesn't exist; `container diff` marked the whole
   filesystem as changed; `/containers/{id}/top` reported the same fake process
   for every container. All either implemented properly or failing honestly.
+- **`cocker daemon clear-leases` cleared nothing and exited 0.** macOS stops
+  handing out container IP addresses past ~256 leases, and this is the command
+  the daemon's own error message tells you to run. It asked a root helper that
+  wasn't listening, ignored the failure, printed the *unchanged* count and
+  reported success — measured: 317 leases before, "Leases now: 317 entries.",
+  exit 0, 317 after. The safety net around it had the same flaw and was worse:
+  because it treated "the helper's config file exists" as "the helper works",
+  an installed-but-never-loaded helper silenced *both* the automatic cleanup
+  and the warning, so containers failed to get an IP with nothing logged at
+  all. All three now report whether the helper actually answered.
 
 ### Fixed — data loss
 
