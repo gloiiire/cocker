@@ -44,6 +44,7 @@ DerivedData/
 # Exceptions : long-lived spec docs that the codebase points to.
 !docs/UX-CHARTER.md
 !docs/APPLE-FEEDBACK-VSOCK-CALLBACK.md
+!docs/ROADMAP-1.0.md
 node_modules/
 package.json
 package-lock.json
