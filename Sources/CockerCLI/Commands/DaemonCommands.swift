@@ -895,21 +895,63 @@ struct DaemonHelperInstallCommand: AsyncParsableCommand {
             .appendingPathComponent("cocker-leases-helper.plist")
         try plist.write(to: tmp, atomically: true, encoding: .utf8)
         print("Installing LaunchDaemon at \(plistPath) (sudo will prompt for your password)…")
+        // Prove the helper is alive instead of assuming it. Writing the
+        // plist and calling `launchctl` is not the same as having a
+        // running job, and the old version could not tell the difference:
+        // it printed "✓ Helper installed and running." whenever the shell
+        // exited 0, and `launchctl load` exits 0 even when it loads
+        // nothing. Observed consequence — a plist installed in June, never
+        // present in `launchctl list`, a 0-byte helper log, and a user who
+        // had been told it was running. Everything downstream then treated
+        // the file's existence as proof the helper worked, so a saturated
+        // lease pool produced no diagnostics at all.
+        //
+        // The check is end-to-end: ask for a clear and see whether the
+        // trigger gets consumed. Only a live helper removes that file, so
+        // this cannot pass on a dead one — and as a side effect the pool
+        // is actually cleared, which is why you ran this command.
+        //
+        // Exit codes from the script: 0 = helper answered, 2 = installed
+        // but silent, anything else = the install itself failed.
         let install = Process()
         install.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
-        install.arguments = ["sh", "-c",
-            "install -m 644 -o root -g wheel \(tmp.path) \(plistPath) && " +
-            "launchctl bootstrap system \(plistPath) 2>/dev/null || launchctl load \(plistPath)"]
+        install.arguments = ["sh", "-c", """
+            install -m 644 -o root -g wheel \(tmp.path) \(plistPath) || exit 1
+            launchctl bootstrap system \(plistPath) 2>/dev/null \
+              || launchctl load \(plistPath) 2>/dev/null
+            touch /var/run/cocker-clear-leases || exit 1
+            i=0
+            while [ $i -lt 10 ]; do
+              [ -f /var/run/cocker-clear-leases ] || exit 0
+              sleep 1
+              i=$((i+1))
+            done
+            exit 2
+            """]
         try install.run()
         install.waitUntilExit()
         try? FileManager.default.removeItem(at: tmp)
-        guard install.terminationStatus == 0 else {
+
+        switch install.terminationStatus {
+        case 0:
+            let remaining = (try? String(contentsOfFile: "/var/db/dhcpd_leases", encoding: .utf8))
+                .map { $0.components(separatedBy: "ip_address=").count - 1 }
+            print("✓ Helper installed, running, and verified — it answered a clear request.")
+            if let remaining { print("  Lease pool now at \(remaining) entries.") }
+            print("  Subsequent `cocker daemon clear-leases` calls will skip the sudo prompt.")
+        case 2:
+            UX.Failure.emit(
+                headline: "Helper installed but not responding",
+                reason: "the plist is in place, but nothing consumed the trigger file "
+                      + "within 10 s — the job is not actually running",
+                hint: "inspect it with `sudo launchctl print system/com.cocker.leases-helper`; "
+                    + "meanwhile `cocker daemon clear-leases` still works via sudo")
+            throw ExitCode.failure
+        default:
             UX.Failure.emit(headline: "Install failed",
                             reason: "exit \(install.terminationStatus)")
             throw ExitCode.failure
         }
-        print("✓ Helper installed and running.")
-        print("  Subsequent `cocker daemon clear-leases` calls will skip the sudo prompt.")
     }
 }
 
