@@ -560,9 +560,23 @@ final class DockerAPIServer {
     // MARK: - Container handlers
 
     private func handleContainerList(req: HTTPRequest) async -> HTTPResponse {
-        let all = req.query["all"] == "true" || req.query["all"] == "1"
+        var all = req.query["all"] == "true" || req.query["all"] == "1"
+        let filters: DockerFilters
+        do {
+            filters = try DockerFilters.parse(req.query["filters"])
+            try filters.requireSupported(DockerFilters.containerKeys)
+        } catch {
+            return .error("\(error)", status: 400)
+        }
+        // Asking for a non-running status implies looking past running
+        // containers, exactly as Docker does — otherwise
+        // `--filter status=exited` returns nothing without `-a`.
+        if filters.values("status").contains(where: { $0 != "running" }) || !filters.values("exited").isEmpty {
+            all = true
+        }
         let containers = await engine.list(all: all)
-        let summaries = containers.map { DockerContainerSummary(from: $0) }
+        let summaries = containers.filter { filters.matches(container: $0) }
+                                  .map { DockerContainerSummary(from: $0) }
         return .json(summaries)
     }
 
@@ -955,8 +969,16 @@ final class DockerAPIServer {
     // MARK: - Image handlers
 
     private func handleImageList(req: HTTPRequest) async -> HTTPResponse {
+        let filters: DockerFilters
+        do {
+            filters = try DockerFilters.parse(req.query["filters"])
+            try filters.requireSupported(DockerFilters.imageKeys)
+        } catch {
+            return .error("\(error)", status: 400)
+        }
         let images = await engine.images.list()
-        return .json(images.map { DockerImageSummary(from: $0) })
+        return .json(images.filter { filters.matches(image: $0) }
+                           .map { DockerImageSummary(from: $0) })
     }
 
     private func handleImagePull(req: HTTPRequest, fd: Int32) async {
@@ -1096,8 +1118,19 @@ final class DockerAPIServer {
     // MARK: - Network handlers
 
     private func handleNetworkList(req: HTTPRequest) async -> HTTPResponse {
+        let filters: DockerFilters
+        do {
+            filters = try DockerFilters.parse(req.query["filters"])
+            // `label` is absent from the supported set on purpose: NetworkInfo
+            // carries no labels, so accepting the key would answer with
+            // networks that were never checked against it.
+            try filters.requireSupported(DockerFilters.networkKeys.filter { $0 != "label" })
+        } catch {
+            return .error("\(error)", status: 400)
+        }
         let networks = await engine.networks.list()
-        return .json(networks.map { DockerNetworkResource(from: $0) })
+        return .json(networks.filter { filters.matches(network: $0) }
+                             .map { DockerNetworkResource(from: $0) })
     }
 
     private func handleNetworkCreate(req: HTTPRequest) async -> HTTPResponse {
@@ -1156,9 +1189,17 @@ final class DockerAPIServer {
     // MARK: - Volume handlers
 
     private func handleVolumeList(req: HTTPRequest) async -> HTTPResponse {
+        let filters: DockerFilters
+        do {
+            filters = try DockerFilters.parse(req.query["filters"])
+            try filters.requireSupported(DockerFilters.volumeKeys)
+        } catch {
+            return .error("\(error)", status: 400)
+        }
         let volumes = await engine.volumes.list()
         return .json(DockerVolumeListResponse(
-            Volumes: volumes.map { DockerVolumeResource(from: $0) },
+            Volumes: volumes.filter { filters.matches(volume: $0) }
+                            .map { DockerVolumeResource(from: $0) },
             Warnings: []
         ))
     }

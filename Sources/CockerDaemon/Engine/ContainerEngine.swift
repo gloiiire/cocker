@@ -1023,13 +1023,24 @@ final class ContainerEngine {
 
         for (key, value) in filter {
             switch key {
-            case "status": containers = containers.filter { $0.status.rawValue == value }
+            case "status":
+                // Accept both vocabularies : cocker's state machine says
+                // `stopped` where Docker says `exited`, and users type the
+                // Docker one.
+                containers = containers.filter {
+                    $0.status.rawValue == value || DockerFilters.dockerStatusName($0.status) == value
+                }
             case "name": containers = containers.filter { $0.name.contains(value) }
             case "image": containers = containers.filter { $0.image.contains(value) }
             case "label":
+                // `label=key=value` (exact) or `label=key` (presence). The
+                // presence form used to be dropped, so `--filter label=foo`
+                // silently returned every container.
                 let kv = value.split(separator: "=", maxSplits: 1)
                 if kv.count == 2 {
                     containers = containers.filter { $0.labels[String(kv[0])] == String(kv[1]) }
+                } else {
+                    containers = containers.filter { $0.labels[value] != nil }
                 }
             default: break
             }
