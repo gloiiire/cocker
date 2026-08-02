@@ -771,17 +771,50 @@ struct DaemonClearLeasesCommand: AsyncParsableCommand {
         // the clear without prompting for a sudo password.
         let trigger = "/var/run/cocker-clear-leases"
         let triggerURL = URL(fileURLWithPath: trigger)
-        if FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/com.cocker.leases-helper.plist") {
-            try? Data().write(to: triggerURL)
-            // Wait briefly for the helper to consume the trigger and clear.
-            for _ in 0..<20 {
-                if !FileManager.default.fileExists(atPath: trigger) { break }
-                try? await Task.sleep(nanoseconds: 100_000_000)
-            }
-            if let s = try? String(contentsOfFile: path, encoding: .utf8) {
-                let n = s.components(separatedBy: "ip_address=").count - 1
-                print("Leases now: \(n) entries.")
-                return
+        func leaseCount() -> Int {
+            guard let s = try? String(contentsOfFile: path, encoding: .utf8) else { return 0 }
+            return s.components(separatedBy: "ip_address=").count - 1
+        }
+        let before = leaseCount()
+        if before == 0 {
+            print("Leases now: 0 entries.")
+            return
+        }
+        // Fast path, but only if the helper actually does the work.
+        //
+        // This used to write the trigger with `try?`, discard the failure,
+        // wait for a file that was never created (so the loop exited on
+        // its first iteration), then print the *unchanged* count and
+        // return 0. Measured on a real machine: 317 leases before, "Leases
+        // now: 317 entries.", exit 0, 317 after. The one command the
+        // daemon's own error message tells you to run was a no-op that
+        // reported success, and it never reached the sudo path below
+        // because the early `return` sat inside the helper branch.
+        //
+        // `/var/run` is root-owned and `cocker` runs as you, so that write
+        // fails whenever the helper's LaunchDaemon isn't loaded to create
+        // a path you can reach. Success is now measured by the pool
+        // actually shrinking, not by the plist existing.
+        let helperPlist = "/Library/LaunchDaemons/com.cocker.leases-helper.plist"
+        if FileManager.default.fileExists(atPath: helperPlist) {
+            if (try? Data().write(to: triggerURL)) != nil {
+                // Wait briefly for the helper to consume the trigger and clear.
+                for _ in 0..<20 {
+                    if !FileManager.default.fileExists(atPath: trigger) { break }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                let after = leaseCount()
+                if after < before {
+                    print("Leases now: \(after) entries.")
+                    return
+                }
+                print("The lease helper did not clear the pool (\(after) entries) — "
+                      + "falling back to sudo.")
+            } else {
+                print("The lease helper is installed but could not be reached: "
+                      + "\(trigger) is not writable, so it is probably not loaded. "
+                      + "Reinstall it with `cocker daemon helper-install`. "
+                      + "Falling back to sudo for this run.")
             }
         }
         // Slow path : sudo prompt.

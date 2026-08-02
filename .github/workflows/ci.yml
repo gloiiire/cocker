@@ -72,10 +72,15 @@ jobs:
           # real coverage comes from integration smoke runs (compose up
           # on a known iCloud project).
           # 0.6.0 audit additions :
-          #   - LeasePoolMonitor : reads /var/db/dhcpd_leases + touches a
-          #     /var/run trigger ; not exercisable inside swift test.
           #   - AuditLog : writes ~/.cocker/audit.log with rotation ; the
           #     real coverage comes from the smoke runs.
+          # LeasePoolMonitor used to be excluded here on the grounds that it
+          # "reads /var/db/dhcpd_leases + touches a /var/run trigger ; not
+          # exercisable inside swift test". That was a property of the code,
+          # not of the test runner: the paths were hardcoded. They're
+          # parameters now, so the whole module — including the saturated
+          # pool with an unreachable helper, which shipped broken precisely
+          # because nothing exercised it — is unit-tested and gated.
           # 0.7.0 UX foundation additions :
           #   - Spinner : drives a Task that writes ANSI cursor moves to
           #     stdout in a 80 ms loop ; deterministic testing would require
@@ -100,7 +105,7 @@ jobs:
           # EngineOperations was extracted from ContainerEngine without changing
           # behavior. It owns the same VM/filesystem integration paths, so keep
           # the coverage boundary stable instead of counting moved code as 0%.
-          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/EngineOperations|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/Ext4Image|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift|CockerCLI/UX/InteractiveFooter\.swift|CockerCLI/UX/SignalTrap\.swift|CockerCLI/UX/Confirm\.swift|CockerCLI/InteractiveSession\.swift)'
+          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/EngineOperations|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/Ext4Image|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift|CockerCLI/UX/InteractiveFooter\.swift|CockerCLI/UX/SignalTrap\.swift|CockerCLI/UX/Confirm\.swift|CockerCLI/InteractiveSession\.swift)'
 
           xcrun llvm-cov report "$BIN" -instr-profile="$PROF" \
             -ignore-filename-regex="$IGNORE" \
@@ -477,6 +482,17 @@ jobs:
       - name: Start a daemon on an isolated root
         # A dedicated --root keeps CI containers, images and build cache
         # away from whatever the machine's owner is running.
+        #
+        # --root and --socket do NOT isolate the DNS listener, which binds
+        # a fixed port (default 5300). The self-hosted runner is somebody's
+        # actual Mac, so their own cockerd is usually up and already holds
+        # it: the CI daemon then logs `WARN [dns] TCP listener bind failed`,
+        # both daemons end up bound to the same UDP port on the same
+        # bridge, and container DHCP becomes a coin flip. Results go flaky
+        # rather than failing outright, which is worse — this cost a full
+        # e2e run reporting four failures that had nothing to do with the
+        # commit. `Tests/e2e/README.md` has said "COCKER_DNS_PORT is not
+        # optional" for a while; this is the workflow finally obeying it.
         run: |
           ROOT="$RUNNER_TEMP/cocker-ci-root"
           rm -rf "$ROOT" && mkdir -p "$ROOT/kernel"
@@ -485,7 +501,9 @@ jobs:
           cp cocker-init/initrd.img "$ROOT/kernel/initrd.img"
           echo "COCKER_CI_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "COCKER_HOST=unix://$ROOT/cocker.sock" >> "$GITHUB_ENV"
-          nohup ./.build/release/cockerd --root "$ROOT" --socket "$ROOT/cocker.sock" \
+          echo "COCKER_DNS_PORT=5399" >> "$GITHUB_ENV"
+          nohup env COCKER_DNS_PORT=5399 \
+            ./.build/release/cockerd --root "$ROOT" --socket "$ROOT/cocker.sock" \
             > "$RUNNER_TEMP/cockerd.log" 2>&1 &
           for _ in $(seq 1 30); do
             COCKER_HOST="unix://$ROOT/cocker.sock" ./.build/release/cocker info >/dev/null 2>&1 && break
