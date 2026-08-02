@@ -8,7 +8,7 @@
 .Sh SYNOPSIS
 .Nm
 .Op Fl -detach
-.Op Fl -file Ar file
+.Op Fl -file Ar file...
 .Op Fl -project-name Ar project-name
 .Op Fl -build
 .Op Fl -remove-orphans
@@ -22,8 +22,8 @@
 .Bl -tag -width 6n
 .It Fl d , -detach
 Run in background
-.It Fl f , -file Ar file
-Compose file path
+.It Fl f , -file Ar file...
+Compose file path (repeatable; later files override earlier)
 .It Fl p , -project-name Ar project-name
 Project name
 .It Fl -build

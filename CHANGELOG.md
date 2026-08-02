@@ -7,7 +7,7 @@ Notable changes per release. Versions are `MAJOR.MINOR.PATCH.BUILD` — see
 Entries describe what changed for *you*, not what moved in the code. A user
 should be able to read one line and know whether it affects them.
 
-## Unreleased
+## 1.0.0.0 — 2026-08-02
 
 The 1.0 correctness pass. Almost everything here is a case where cocker either
 reported success for something that failed, or lost data quietly. Verified on
