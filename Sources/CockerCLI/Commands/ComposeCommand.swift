@@ -36,8 +36,12 @@ struct ComposeUpCommand: AsyncParsableCommand {
     @Flag(name: [.short, .customLong("detach")], help: "Run in background")
     var detach = false
 
-    @Option(name: [.short, .customLong("file")], help: "Compose file path")
-    var file: String = "cocker-compose.yml"
+    /// Repeatable, like Docker's. The first is the base; each subsequent one
+    /// is merged on top in order. A single `-f` was accepted before and every
+    /// extra file was dropped without a word.
+    @Option(name: [.short, .customLong("file")],
+            help: "Compose file path (repeatable; later files override earlier)")
+    var files: [String] = []
 
     @Option(name: [.short, .customLong("project-name")], help: "Project name")
     var projectName: String?
@@ -86,9 +90,18 @@ struct ComposeUpCommand: AsyncParsableCommand {
     }
 
     mutating func run() async throws {
-        let originalPath = resolvePath(file)
+        // First `-f` is the base; the rest are merged on top in order. With
+        // no `-f` at all we fall back to the conventional filenames and pick
+        // up `*.override.*` automatically, as Docker does.
+        let explicitFiles = !files.isEmpty
+        let originalPath = resolvePath(files.first ?? "cocker-compose.yml")
         guard FileManager.default.fileExists(atPath: originalPath) else {
             throw CockerError.invalidComposeFile("File not found: \(originalPath)")
+        }
+        var overridePaths = files.dropFirst().map { resolvePath($0) }
+        overridePaths += discoverOverrideFiles(base: originalPath, explicit: explicitFiles)
+        for override in overridePaths where !FileManager.default.fileExists(atPath: override) {
+            throw CockerError.invalidComposeFile("File not found: \(override)")
         }
 
         // `-d` means "don't hold the terminal", so there is nothing to
@@ -140,7 +153,8 @@ struct ComposeUpCommand: AsyncParsableCommand {
             // Declared and referenced nowhere before, so a renamed or deleted
             // service left its container running with no way to reach it
             // through compose.
-            removeOrphans: removeOrphans
+            removeOrphans: removeOrphans,
+            overrideFiles: overridePaths.isEmpty ? nil : overridePaths
         )
         let request = try IPCRequest(type: .composeUp, payload: payload)
 
@@ -1114,6 +1128,37 @@ struct ComposeEventsCommand: AsyncParsableCommand {
         }
         if !outputJSON { footer.restore() }
     }
+}
+
+/// Override files that apply on top of `base`.
+///
+/// `docker-compose.override.yml` is loaded automatically by Docker Compose,
+/// and it is one of the most common things in a real project — a dev-only
+/// port, a bind mount, an extra env var. Cocker read a single file and never
+/// merged, so all of that was **silently ignored**: the project came up,
+/// looked healthy, and was not configured the way its author wrote it.
+///
+/// Only auto-discovered when the user didn't pass `-f` explicitly, matching
+/// Docker: naming a file means you're taking control of the file list.
+func discoverOverrideFiles(base: String, explicit: Bool) -> [String] {
+    guard !explicit else { return [] }
+    let dir = (base as NSString).deletingLastPathComponent
+    let stem = (base as NSString).lastPathComponent
+    // `compose.yaml` → `compose.override.yaml`, and so on for each spelling.
+    let candidates: [String]
+    switch stem {
+    case "compose.yaml":            candidates = ["compose.override.yaml", "compose.override.yml"]
+    case "compose.yml":             candidates = ["compose.override.yml", "compose.override.yaml"]
+    case "docker-compose.yaml":     candidates = ["docker-compose.override.yaml", "docker-compose.override.yml"]
+    case "docker-compose.yml":      candidates = ["docker-compose.override.yml", "docker-compose.override.yaml"]
+    case "cocker-compose.yml":      candidates = ["cocker-compose.override.yml", "cocker-compose.override.yaml"]
+    default:                        candidates = []
+    }
+    for candidate in candidates {
+        let path = dir + "/" + candidate
+        if FileManager.default.fileExists(atPath: path) { return [path] }
+    }
+    return []
 }
 
 private func resolvePath(_ path: String) -> String {

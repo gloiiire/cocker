@@ -358,3 +358,112 @@ struct ComposeProfileFlagTests {
         #expect(decoded.activeProfiles == ["debug"])
     }
 }
+
+/// `docker-compose.override.yml` is loaded automatically by Docker Compose
+/// and is one of the most common things in a real project — a dev-only port,
+/// a bind mount, an extra env var. Cocker read a single file and never
+/// merged, so all of it was silently ignored: the project came up, looked
+/// healthy, and wasn't configured the way its author wrote it.
+@Suite("Compose override merging")
+struct ComposeOverrideTests {
+
+    // MARK: - Merge semantics
+
+    @Test func mappingsMergeKeyByKey() {
+        let merged = ComposeEngine.deepMerge(
+            base: ["services": ["web": ["image": "nginx", "user": "root"]]],
+            override: ["services": ["web": ["image": "nginx:1.25"]]])
+        let web = ((merged["services"] as? [String: Any])?["web"]) as? [String: Any]
+        #expect(web?["image"] as? String == "nginx:1.25")
+        // A key the override didn't mention survives.
+        #expect(web?["user"] as? String == "root")
+    }
+
+    @Test func anOverrideCanAddAService() {
+        let merged = ComposeEngine.deepMerge(
+            base: ["services": ["web": ["image": "nginx"]]],
+            override: ["services": ["debug": ["image": "busybox"]]])
+        let services = merged["services"] as? [String: Any]
+        #expect(services?.keys.sorted() == ["debug", "web"])
+    }
+
+    /// Compose replaces sequences rather than appending — that's what lets an
+    /// override shorten a `command:` or swap a `ports:` list outright.
+    @Test func sequencesAreReplacedNotAppended() {
+        let merged = ComposeEngine.deepMerge(
+            base: ["services": ["web": ["ports": ["8080:80", "8443:443"]]]],
+            override: ["services": ["web": ["ports": ["3000:80"]]]])
+        let web = ((merged["services"] as? [String: Any])?["web"]) as? [String: Any]
+        #expect(web?["ports"] as? [String] == ["3000:80"])
+    }
+
+    @Test func scalarsAreReplaced() {
+        let merged = ComposeEngine.deepMerge(base: ["version": "3.8"], override: ["version": "3.9"])
+        #expect(merged["version"] as? String == "3.9")
+    }
+
+    @Test func anEmptyOverrideChangesNothing() {
+        let base: [String: Any] = ["services": ["web": ["image": "nginx"]]]
+        let merged = ComposeEngine.deepMerge(base: base, override: [:])
+        #expect(((merged["services"] as? [String: Any])?["web"] as? [String: Any])?["image"] as? String == "nginx")
+    }
+
+    // MARK: - Discovery
+
+    private func inTempDir(_ files: [String], _ body: (String) throws -> Void) throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("cocker-override-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for f in files {
+            try "services: {}\n".write(to: dir.appendingPathComponent(f),
+                                       atomically: true, encoding: .utf8)
+        }
+        try body(dir.path)
+    }
+
+    @Test func findsTheConventionalOverride() throws {
+        try inTempDir(["docker-compose.yml", "docker-compose.override.yml"]) { dir in
+            let found = discoverOverrideFiles(base: dir + "/docker-compose.yml", explicit: false)
+            #expect(found == [dir + "/docker-compose.override.yml"])
+        }
+    }
+
+    @Test func matchesTheBaseFileSpelling() throws {
+        try inTempDir(["compose.yaml", "compose.override.yaml"]) { dir in
+            #expect(discoverOverrideFiles(base: dir + "/compose.yaml", explicit: false)
+                    == [dir + "/compose.override.yaml"])
+        }
+    }
+
+    @Test func noOverrideFileMeansNoOverrides() throws {
+        try inTempDir(["docker-compose.yml"]) { dir in
+            #expect(discoverOverrideFiles(base: dir + "/docker-compose.yml", explicit: false).isEmpty)
+        }
+    }
+
+    /// Naming files with `-f` means you're taking control of the list, so
+    /// auto-discovery stands down — same as Docker.
+    @Test func explicitFilesSuppressDiscovery() throws {
+        try inTempDir(["docker-compose.yml", "docker-compose.override.yml"]) { dir in
+            #expect(discoverOverrideFiles(base: dir + "/docker-compose.yml", explicit: true).isEmpty)
+        }
+    }
+
+    // MARK: - Wire contract
+
+    @Test func requestCarriesTheOverrides() throws {
+        let request = try IPCRequest(
+            type: .composeUp,
+            payload: ComposeRequest(composePath: "/x/compose.yml",
+                                    overrideFiles: ["/x/compose.override.yml"]))
+        let decoded = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
+        #expect(decoded.overrideFiles == ["/x/compose.override.yml"])
+    }
+
+    @Test func legacyRequestsHaveNoOverrides() throws {
+        let legacy = #"{"composePath":"/x/compose.yml","services":[],"detach":false,"removeVolumes":false,"follow":false,"tail":50,"forceBuild":false,"noCache":false}"#
+        let decoded = try JSONDecoder().decode(ComposeRequest.self, from: Data(legacy.utf8))
+        #expect(decoded.overrideFiles == nil)
+    }
+}

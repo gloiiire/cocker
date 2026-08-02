@@ -1145,8 +1145,19 @@ final class ContainerEngine {
         guard container.status == .running else {
             throw CockerError.containerNotRunning(config.containerID)
         }
+        // Docker's `exec` runs inside the container's environment. Ours passed
+        // only what the caller supplied with `-e`, so
+        // `cocker exec c sh -c 'echo $DATABASE_URL'` printed nothing even
+        // though the variable was right there in the running container — and
+        // anything the image's ENV or compose's `environment:` set was
+        // invisible to every exec'd command.
+        //
+        // Caller-supplied values still win, which is what `-e` is for.
+        var env = container.env
+        for (key, value) in config.env { env[key] = value }
+
         return try await vmRuntime.exec(
-            containerID: container.id, command: config.command, env: config.env,
+            containerID: container.id, command: config.command, env: env,
             tty: config.tty, stdin: config.stdin,
             workdir: config.workdir, user: config.user,
             sessionID: config.sessionID, rows: config.rows, cols: config.cols)
