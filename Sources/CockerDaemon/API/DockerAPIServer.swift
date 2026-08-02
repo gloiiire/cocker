@@ -278,6 +278,16 @@ final class DockerAPIServer {
         case ("DELETE", "containers") where segments.count == 2:
             response = await handleContainerRemove(id: segments[1], req: req)
 
+        case ("POST", "containers") where segments.count == 3 && segments[2] == "attach":
+            await handleContainerAttach(id: segments[1], req: req, fd: fd)
+            response = nil
+
+        case ("POST", "containers") where segments.count == 3 && segments[2] == "resize":
+            response = await handleResize(id: segments[1], req: req, isExec: false)
+
+        case ("POST", "exec") where segments.count == 3 && segments[2] == "resize":
+            response = await handleResize(id: segments[1], req: req, isExec: true)
+
         // ── Archive (docker cp, Dev Containers, Testcontainers) ──
         case ("GET", "containers") where segments.count == 3 && segments[2] == "archive":
             response = await handleArchiveGet(id: segments[1], req: req)
@@ -1039,8 +1049,13 @@ final class DockerAPIServer {
             return
         }
 
-        let writer = HTTPStreamWriter(fd: fd)
-        writer.writeHeaders(contentType: "application/octet-stream")
+        // Docker hijacks this connection: after the response head it reads
+        // the socket raw. Chunked framing put chunk-size lines inside the
+        // stdcopy stream, so clients saw "unrecognized input header" or
+        // corrupted output.
+        var writer = HTTPStreamWriter(fd: fd)
+        writer.isRaw = true
+        writer.writeHijackHeaders(upgrade: Self.wantsUpgrade(req))
 
         var exitCode: Int32 = 0
         do {
@@ -1082,6 +1097,70 @@ final class DockerAPIServer {
         // it here is what made the CLI's post-attach inspect 404 and fall
         // back to a hardcoded 0.
         execSessions[id]?.exitCode = exitCode
+    }
+
+    /// Docker sends `Connection: Upgrade` + `Upgrade: tcp` and expects a
+    /// `101 UPGRADED`; older clients just POST and read the body. Answer in
+    /// whichever dialect was asked for.
+    nonisolated static func wantsUpgrade(_ req: HTTPRequest) -> Bool {
+        (req.headers["upgrade"]?.lowercased().contains("tcp") ?? false)
+            || (req.headers["connection"]?.lowercased().contains("upgrade") ?? false)
+    }
+
+    /// `POST /containers/{id}/attach` — the container's live output, and its
+    /// stdin when the client asked for it.
+    ///
+    /// This was 501, so `docker run` without `-d` (the default!),
+    /// `compose up` on a `tty:`/`stdin_open:` service, JetBrains' "attach
+    /// console" and a dev-container terminal all failed outright.
+    private func handleContainerAttach(id: String, req: HTTPRequest, fd: Int32) async {
+        guard let container = await engine.state.container(id: id) else {
+            _ = HTTPResponse.notFound(id).write(to: fd)
+            return
+        }
+        var writer = HTTPStreamWriter(fd: fd)
+        writer.isRaw = true
+        writer.writeHijackHeaders(upgrade: Self.wantsUpgrade(req))
+
+        // A tty container's output is a raw terminal stream; a non-tty one is
+        // multiplexed with the 8-byte stdcopy header, exactly as Docker does.
+        let multiplexed = container.tty != true
+        do {
+            let stream = try await engine.logs(id: container.id,
+                                               request: LogsRequest(id: container.id,
+                                                                    follow: true, tail: 0))
+            for await event in stream {
+                let data = Data(event.data.utf8)
+                if multiplexed {
+                    writer.writeLogFrame(stream: event.stream == .stderr ? 2 : 1, data: data)
+                } else {
+                    writer.writeChunk(data)
+                }
+            }
+        } catch {
+            writer.writeChunk(Data("attach failed: \(error)\n".utf8))
+        }
+    }
+
+    /// `POST /containers/{id}/resize` and `POST /exec/{id}/resize`.
+    ///
+    /// Both were 501, so every interactive terminal opened through the Docker
+    /// socket stayed at whatever size it started with — 80x24 for an exec —
+    /// and anything that redraws wrapped at the wrong column.
+    private func handleResize(id: String, req: HTTPRequest, isExec: Bool) async -> HTTPResponse {
+        let rows = Int(req.query["h"] ?? "") ?? 0
+        let cols = Int(req.query["w"] ?? "") ?? 0
+        guard rows > 0, cols > 0 else {
+            return .error("h and w must be positive", status: 400)
+        }
+        // An exec session resize targets the container it runs in.
+        let containerID = isExec ? execSessions[id]?.containerID : id
+        guard let containerID,
+              let container = await engine.state.container(id: containerID) else {
+            return .notFound(id)
+        }
+        await engine.vmRuntime.resizeTerminal(containerID: container.id, rows: rows, cols: cols)
+        return .noContent()
     }
 
     private func handleExecInspect(id: String) -> HTTPResponse {

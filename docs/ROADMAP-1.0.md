@@ -80,7 +80,7 @@ failed, or losing data. Shipped in #357.
 | ✅ | Compose long syntax, `build:` shorthand, `entrypoint:`, shell-form `command:`, udp/range/host-IP ports (#358) |
 | ✅ | `/containers/{id}/archive` — Dev Containers can't inject the VS Code server without it |
 | ✅ | **Interactive TTY** — `run -it`, `exec -it` and `compose exec -it` work. Verified on an M3 Max: 5/5 interactive shell sessions, exit codes propagate through the shell (`exit 7` → 7), Ctrl-D reaches the container. `attach` and SIGWINCH mid-session work too |
-| ⬜ | Hijacked raw streams on the API side, plus `/attach` and `/resize`. Today exec output is chunk-framed, so chunk headers land inside the stdcopy stream and corrupt it. (The *native* CLI path works — this is the Docker-socket surface) |
+| ✅ | Hijacked raw streams on the API side, plus `/attach` and `/resize` |
 | ✅ | Multiple `-f` / `override.yml` merging, and `--profile` |
 
 ### v0.10 — "Focus"
