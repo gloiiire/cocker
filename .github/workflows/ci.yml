@@ -58,6 +58,14 @@ jobs:
           # registry HTTPS / filesystem rootfs layout. They have full
           # live-test coverage via Sprint 3 smoke tests, but cannot be
           # exercised by the in-process `swift test` runner.
+          # `run -it` additions : InteractiveSession is termios raw mode, a
+          # blocking read(2) loop on a real fd and a SIGWINCH DispatchSource ;
+          # Confirm.swift prompts on a tty. Neither can be driven by the
+          # in-process runner, same as SignalTrap / StickyView /
+          # InteractiveFooter above. The parts that *are* testable — session
+          # identity, the `.execInput` wire contract, degrading when stdin
+          # isn't a terminal, idempotent restore — are covered by
+          # InteractiveExecTests ; the rest is exercised by Tests/e2e.
           # 0.5.13.x additions : CLI-side helpers that shell out to rsync
           # / brctl, use FSEvents, or twiddle termios. None can be unit-
           # tested in-process without elaborate FS / subprocess mocks ;
@@ -92,7 +100,7 @@ jobs:
           # EngineOperations was extracted from ContainerEngine without changing
           # behavior. It owns the same VM/filesystem integration paths, so keep
           # the coverage boundary stable instead of counting moved code as 0%.
-          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/EngineOperations|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/Ext4Image|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift|CockerCLI/UX/InteractiveFooter\.swift|CockerCLI/UX/SignalTrap\.swift)'
+          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/EngineOperations|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/Ext4Image|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift|CockerCLI/UX/InteractiveFooter\.swift|CockerCLI/UX/SignalTrap\.swift|CockerCLI/UX/Confirm\.swift|CockerCLI/InteractiveSession\.swift)'
 
           xcrun llvm-cov report "$BIN" -instr-profile="$PROF" \
             -ignore-filename-regex="$IGNORE" \
