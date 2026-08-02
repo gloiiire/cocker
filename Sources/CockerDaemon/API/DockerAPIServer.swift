@@ -278,6 +278,16 @@ final class DockerAPIServer {
         case ("DELETE", "containers") where segments.count == 2:
             response = await handleContainerRemove(id: segments[1], req: req)
 
+        // ── Archive (docker cp, Dev Containers, Testcontainers) ──
+        case ("GET", "containers") where segments.count == 3 && segments[2] == "archive":
+            response = await handleArchiveGet(id: segments[1], req: req)
+
+        case ("HEAD", "containers") where segments.count == 3 && segments[2] == "archive":
+            response = await handleArchiveHead(id: segments[1], req: req)
+
+        case ("PUT", "containers") where segments.count == 3 && segments[2] == "archive":
+            response = await handleArchivePut(id: segments[1], req: req)
+
         case ("GET", "containers") where segments.count == 3 && segments[2] == "top":
             response = await handleContainerTop(id: segments[1])
 
@@ -871,6 +881,76 @@ final class DockerAPIServer {
             ContainersDeleted: result?.containersDeleted ?? [],
             SpaceReclaimed: Int64(result?.spaceReclaimed ?? 0)
         ))
+    }
+
+    // MARK: - Archive handlers
+
+    /// `GET /containers/{id}/archive?path=…` → a tar of that path.
+    private func handleArchiveGet(id: String, req: HTTPRequest) async -> HTTPResponse {
+        guard let path = req.query["path"], !path.isEmpty else {
+            return .error("path parameter is required", status: 400)
+        }
+        do {
+            let target = try await engine.archiveTarget(containerID: id, path: path,
+                                                        forWriting: false)
+            guard FileManager.default.fileExists(atPath: target.path) else {
+                return .error("Could not find the file \(path) in container \(id)", status: 404)
+            }
+            var headers = ["Content-Type": "application/x-tar"]
+            if let stat = ContainerArchive.statHeader(for: target) {
+                headers["X-Docker-Container-Path-Stat"] = stat
+            }
+            return HTTPResponse(status: 200, headers: headers,
+                                body: try ContainerArchive.pack(target))
+        } catch let error as CockerError {
+            return .error(error.description, status: 404)
+        } catch {
+            return .error("\(error)", status: 500)
+        }
+    }
+
+    /// `HEAD` is how clients probe whether a path exists and whether it is a
+    /// directory, before deciding how to unpack into it.
+    private func handleArchiveHead(id: String, req: HTTPRequest) async -> HTTPResponse {
+        guard let path = req.query["path"], !path.isEmpty else {
+            return .error("path parameter is required", status: 400)
+        }
+        do {
+            let target = try await engine.archiveTarget(containerID: id, path: path,
+                                                        forWriting: false)
+            guard FileManager.default.fileExists(atPath: target.path),
+                  let stat = ContainerArchive.statHeader(for: target) else {
+                return .error("Could not find the file \(path) in container \(id)", status: 404)
+            }
+            return HTTPResponse(status: 200,
+                                headers: ["X-Docker-Container-Path-Stat": stat])
+        } catch let error as CockerError {
+            return .error(error.description, status: 404)
+        } catch {
+            return .error("\(error)", status: 500)
+        }
+    }
+
+    /// `PUT /containers/{id}/archive?path=…` extracts the tar body there.
+    /// The context arrives chunked from most clients, which is why this
+    /// needed the parser's chunked branch first.
+    private func handleArchivePut(id: String, req: HTTPRequest) async -> HTTPResponse {
+        guard let path = req.query["path"], !path.isEmpty else {
+            return .error("path parameter is required", status: 400)
+        }
+        guard !req.body.isEmpty else {
+            return .error("empty archive body", status: 400)
+        }
+        do {
+            let target = try await engine.archiveTarget(containerID: id, path: path,
+                                                        forWriting: true)
+            try ContainerArchive.unpack(req.body, into: target)
+            return HTTPResponse(status: 200)
+        } catch let error as CockerError {
+            return .error(error.description, status: 400)
+        } catch {
+            return .error("\(error)", status: 500)
+        }
     }
 
     // MARK: - Exec handlers

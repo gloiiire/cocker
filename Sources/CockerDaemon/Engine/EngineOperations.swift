@@ -69,6 +69,26 @@ extension ContainerEngine {
         }
     }
 
+    // MARK: - archive (Docker's /containers/{id}/archive)
+
+    /// Resolve a container-relative path to a confined host URL inside that
+    /// container's rootfs.
+    ///
+    /// `forWriting` picks the confinement flavour: the read side walks
+    /// symlinks and refuses any target escaping the root, because a container
+    /// rootfs is attacker-controlled (the image author and any process in it
+    /// can plant symlinks). The write side is lexical — the destination
+    /// doesn't exist yet, or we're replacing it.
+    func archiveTarget(containerID: String, path: String, forWriting: Bool) async throws -> URL {
+        guard let container = await state.container(id: containerID) else {
+            throw CockerError.containerNotFound(containerID)
+        }
+        let rootfs = try await effectiveRootfs(for: container)
+        return forWriting
+            ? try PathConfinement.confine(path, to: rootfs)
+            : try PathConfinement.confineRead(path, to: rootfs)
+    }
+
     // MARK: - diff
 
     func diff(containerID: String) async throws -> DiffResponse {
