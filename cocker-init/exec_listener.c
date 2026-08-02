@@ -148,12 +148,16 @@ static int top_level_string_copy(char *buf, const char *key,
 static int parse_exec_request(char *buf, size_t buf_len,
                               char **argv, int argv_max,
                               char **env_out, int env_max,
-                              int *tty_out) {
+                              int *tty_out, int *rows_out, int *cols_out) {
     /* NUL-terminate */
     if (buf_len >= EXEC_BUF_SIZE) buf_len = EXEC_BUF_SIZE - 1;
     buf[buf_len] = '\0';
 
     *tty_out = 0;
+    /* 0 means "the host didn't say" — openpty then uses its default and the
+     * child sees the usual 80x24. */
+    *rows_out = 0;
+    *cols_out = 0;
     argv[0] = NULL;
     env_out[0] = NULL;
 
@@ -169,6 +173,14 @@ static int parse_exec_request(char *buf, size_t buf_len,
 
     char *t = top_level_value(buf, "tty");
     if (t && *t == 't') *tty_out = 1;  /* value is the literal `true` */
+
+    /* Terminal geometry, so a `-t` exec starts at the caller's real size
+     * instead of the 80x24 openpty default. Anything that redraws — vim,
+     * top, a shell prompt — is wrong until the first resize otherwise. */
+    char *r = top_level_value(buf, "rows");
+    if (r) *rows_out = atoi(r);
+    char *c = top_level_value(buf, "cols");
+    if (c) *cols_out = atoi(c);
 
     char *env_field = top_level_value(buf, "env");
 
@@ -309,6 +321,43 @@ static void handle_one(int client_fd) {
      * its main child's PID there right after fork). Replies with one
      * line — "__COCKER_SIGNAL_OK__\n" on success or
      * "__COCKER_SIGNAL_ERR__<reason>\n" otherwise — and closes. */
+    /* Terminal resize : {"resize":true,"rows":N,"cols":N}.
+     *
+     * `cocker run -it` sets the console's winsize once at start, from the
+     * spec. Resizing the host window afterwards left the container at the
+     * old size, so anything that redraws — vim, top, a shell's line editor —
+     * wrapped at the wrong column for the rest of the session. There is no
+     * room for a control message in the console byte stream (it belongs to
+     * the application), so it comes over the same vsock the exec listener
+     * already serves.
+     *
+     * Applies to /dev/console, which init made the main process's
+     * controlling terminal; the kernel then sends SIGWINCH to its
+     * foreground process group for us. */
+    if (strstr(buf, "\"resize\"") && !strstr(buf, "\"cmd\"")) {
+        int rows = 0, cols = 0;
+        char *rp = strstr(buf, "\"rows\"");
+        if (rp && (rp = strchr(rp, ':'))) rows = atoi(rp + 1);
+        char *cp = strstr(buf, "\"cols\"");
+        if (cp && (cp = strchr(cp, ':'))) cols = atoi(cp + 1);
+
+        const char *reply = "__COCKER_RESIZE_ERR__\n";
+        if (rows > 0 && cols > 0) {
+            int fd = open("/dev/console", O_RDWR | O_NOCTTY);
+            if (fd >= 0) {
+                struct winsize ws;
+                memset(&ws, 0, sizeof(ws));
+                ws.ws_row = (unsigned short)rows;
+                ws.ws_col = (unsigned short)cols;
+                if (ioctl(fd, TIOCSWINSZ, &ws) == 0) reply = "__COCKER_RESIZE_OK__\n";
+                close(fd);
+            }
+        }
+        write(client_fd, reply, strlen(reply));
+        close(client_fd);
+        return;
+    }
+
     if (strstr(buf, "\"signal\"") && !strstr(buf, "\"cmd\"")) {
         char *sp = strstr(buf, "\"signal\"");
         sp = strchr(sp, ':');
@@ -367,9 +416,11 @@ static void handle_one(int client_fd) {
     char workdir[4096] = "";
     char user[256] = "";
     int tty = 0;
+    int rows = 0, cols = 0;
     (void)top_level_string_copy(buf, "workdir", workdir, sizeof(workdir));
     (void)top_level_string_copy(buf, "user", user, sizeof(user));
-    int argc = parse_exec_request(buf, (size_t)r, argv, MAX_ARGV, env_out, MAX_ENV, &tty);
+    int argc = parse_exec_request(buf, (size_t)r, argv, MAX_ARGV, env_out, MAX_ENV,
+                                  &tty, &rows, &cols);
     if (argc == 0) {
         const char *err = "parse error\n__COCKER_EXIT__2\n";
         write(client_fd, err, strlen(err));
@@ -384,7 +435,15 @@ static void handle_one(int client_fd) {
          * listener side and gets relayed to the client socket ; the slave
          * is dup'd into the child's stdin/stdout/stderr after setsid +
          * TIOCSCTTY so the child sees a real controlling terminal. */
-        if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) != 0) {
+        struct winsize ws;
+        struct winsize *wsp = NULL;
+        if (rows > 0 && cols > 0) {
+            memset(&ws, 0, sizeof(ws));
+            ws.ws_row = (unsigned short)rows;
+            ws.ws_col = (unsigned short)cols;
+            wsp = &ws;
+        }
+        if (openpty(&master_fd, &slave_fd, NULL, NULL, wsp) != 0) {
             const char *err = "openpty failed\n__COCKER_EXIT__3\n";
             write(client_fd, err, strlen(err));
             close(client_fd);
@@ -459,11 +518,19 @@ static void handle_one(int client_fd) {
          * any error / EOF, then we'll waitpid the child and emit marker. */
         fd_set rfds;
         char buf[4096];
+        /* The host may close its stdin long before the command finishes —
+         * `printf … | cocker exec -it c sh`, or a user pressing Ctrl-D. That
+         * must not end the session: the child keeps running and its output
+         * still has to reach the host. Breaking the loop here abandoned that
+         * output and closed the socket the host was still reading, which it
+         * saw as ECONNRESET. */
+        int client_eof = 0;
         for (;;) {
             FD_ZERO(&rfds);
             FD_SET(master_fd, &rfds);
-            FD_SET(client_fd, &rfds);
-            int maxfd = master_fd > client_fd ? master_fd : client_fd;
+            if (!client_eof) FD_SET(client_fd, &rfds);
+            int maxfd = master_fd;
+            if (!client_eof && client_fd > maxfd) maxfd = client_fd;
             struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
             int rv = select(maxfd + 1, &rfds, NULL, NULL, &tv);
             if (rv < 0) { if (errno == EINTR) continue; break; }
@@ -472,10 +539,18 @@ static void handle_one(int client_fd) {
                 if (n <= 0) break;
                 write(client_fd, buf, (size_t)n);
             }
-            if (FD_ISSET(client_fd, &rfds)) {
+            if (!client_eof && FD_ISSET(client_fd, &rfds)) {
                 ssize_t n = read(client_fd, buf, sizeof(buf));
-                if (n <= 0) break;
-                write(master_fd, buf, (size_t)n);
+                if (n <= 0) {
+                    /* Deliver EOF to the child the way a terminal does — ^D
+                     * on the master — then stop watching this side and keep
+                     * pumping the child's output until it exits. */
+                    client_eof = 1;
+                    char eot = 0x04;
+                    write(master_fd, &eot, 1);
+                } else {
+                    write(master_fd, buf, (size_t)n);
+                }
             }
             /* Detect child exit non-blocking : if waitpid would reap, break. */
             int wstat;

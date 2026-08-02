@@ -16,14 +16,17 @@ import CockerCore
 /// Off-TTY (`logs -f | grep`) `InteractiveFooter` is inert, clear/refresh do
 /// nothing, and this writes the stream straight through.
 final class StreamingLogView: @unchecked Sendable {
-    private let footer: InteractiveFooter
+    private let footer: InteractiveFooter?
     // One assembler per stream: stdout and stderr are independent, and
     // sharing a buffer would splice a half-written stderr line onto stdout.
     private let outBuffer = LineBuffer()
     private let errBuffer = LineBuffer()
     private let lock = NSLock()
 
-    init(footer: InteractiveFooter) {
+    /// `footer` is optional: `run -it` hands the terminal to the container,
+    /// so there is no sticky footer to clear and redraw around each line —
+    /// doing so would fight the container's own cursor control.
+    init(footer: InteractiveFooter?) {
         self.footer = footer
     }
 
@@ -57,10 +60,10 @@ final class StreamingLogView: @unchecked Sendable {
         let err = errBuffer.flush().map(transform)
         guard out != nil || err != nil else { return }
         lock.lock(); defer { lock.unlock() }
-        footer.clear()
+        footer?.clear()
         if let out { UX.writeStreamChunk(out) }
         if let err { UX.writeStderr(err) }
-        footer.refresh()
+        footer?.refresh()
     }
 
     private func write(_ lines: [String], isError: Bool) {
@@ -68,10 +71,10 @@ final class StreamingLogView: @unchecked Sendable {
         // Serialised: concurrent containers stream through one footer, and
         // interleaving a clear/refresh pair would leave the region orphaned.
         lock.lock(); defer { lock.unlock() }
-        footer.clear()
+        footer?.clear()
         for line in lines {
             if isError { UX.writeStderr(line) } else { UX.writeStreamChunk(line) }
         }
-        footer.refresh()
+        footer?.refresh()
     }
 }

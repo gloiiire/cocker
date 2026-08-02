@@ -44,6 +44,12 @@ DerivedData/
 # Exceptions : long-lived spec docs that the codebase points to.
 !docs/UX-CHARTER.md
 !docs/APPLE-FEEDBACK-VSOCK-CALLBACK.md
+!docs/ROADMAP-1.0.md
+# A 1.0 needs a changelog a user can read to decide whether to upgrade, and a
+# security file — cocker installs a root LaunchDaemon and stores registry
+# passwords in cleartext, and neither is discoverable from the README.
+!CHANGELOG.md
+!SECURITY.md
 node_modules/
 package.json
 package-lock.json

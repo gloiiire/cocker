@@ -258,6 +258,7 @@ public enum Banner {
         out += row("stop",      "Stop one or more running containers")
         out += row("kill",      "Send a signal to running containers")
         out += row("restart",   "Restart one or more containers")
+        out += row("wait",      "Block until containers stop, print exit codes")
         out += row("pause",     "Pause processes in container(s)")
         out += row("unpause",   "Unpause processes in container(s)")
         out += row("rm",        "Remove one or more containers")
@@ -285,7 +286,10 @@ public enum Banner {
         out += row("load",      "Load an image from a tar archive")
         out += row("export",    "Export a container's filesystem to a tarball")
         out += row("import",    "Import a tarball as an image")
-        out += row("buildx",    "Multi-platform build (cross-arch)")
+        // `buildx` omitted for the same reason : there is no BuildKit in
+        // cocker, the multi-arch path is unverified, and its builder-
+        // management subcommands are stubs. Still available, no longer
+        // advertised.
 
         out += header("NETWORK & VOLUMES")
         out += row("network",   "Manage networks")
@@ -293,10 +297,20 @@ public enum Banner {
 
         out += header("ORCHESTRATION")
         out += row("compose",   "Define and run multi-container applications")
-        out += row("swarm",     "Manage Swarm (cluster mode)")
-        out += row("stack",     "Deploy stacks to a Swarm")
-        out += row("service",   "Manage Swarm services")
-        out += row("node",      "Manage Swarm nodes")
+        // `swarm` / `stack` / `service` / `node` are deliberately absent.
+        //
+        // Nobody runs cluster orchestration on a single Mac, and cocker's
+        // implementations are single-node theatre — `swarm join` is a no-op,
+        // `service scale` past one replica does nothing. Leading the help
+        // screen with them advertised the wrong product: the actual
+        // differentiator (iCloud-aware compose, block-storage volumes) sat
+        // below them.
+        //
+        // The commands still exist and still parse, so nothing that scripts
+        // them breaks; they just stop being recommended. This is what
+        // ROADMAP.md asked for in v0.5 — "remove from -h, redirect in docs"
+        // — and it stayed undone for two minor versions. Deleting them
+        // outright is a separate, breaking decision.
 
         out += header("ICLOUD (macOS)")
         out += row("icloud",     "Inspect & control iCloud-aware behavior (status, prefetch, cache-clear)")

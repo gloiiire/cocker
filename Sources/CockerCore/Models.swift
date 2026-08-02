@@ -62,6 +62,11 @@ public struct Container: Codable, Sendable, Identifiable {
     /// device" errors. Plumbed through the kernel cmdline so cocker-init
     /// can size the shm mount before the user process starts.
     public var shmSizeMB: UInt64?
+    /// `run -it` : the main process gets the console as a controlling
+    /// terminal. Optional so containers written by an older daemon decode.
+    public var tty: Bool?
+    public var ttyRows: Int?
+    public var ttyCols: Int?
 
     public init(
         id: String = UUID().uuidString.prefix(12).lowercased(),
@@ -165,6 +170,15 @@ public struct Container: Codable, Sendable, Identifiable {
         self.capAdd = try c.decodeIfPresent([String].self, forKey: .capAdd) ?? []
         self.capDrop = try c.decodeIfPresent([String].self, forKey: .capDrop) ?? []
         self.stopSignal = try c.decodeIfPresent(String.self, forKey: .stopSignal)
+        // Container has an explicit decoder, so a new property is invisible
+        // until it is listed here. `shmSizeMB` and the tty trio were added as
+        // stored properties and silently dropped on every round-trip —
+        // `cocker attach` couldn't tell a `-t` container from a plain one
+        // because `tty` came back nil no matter what was stored.
+        self.shmSizeMB = try c.decodeIfPresent(UInt64.self, forKey: .shmSizeMB)
+        self.tty = try c.decodeIfPresent(Bool.self, forKey: .tty)
+        self.ttyRows = try c.decodeIfPresent(Int.self, forKey: .ttyRows)
+        self.ttyCols = try c.decodeIfPresent(Int.self, forKey: .ttyCols)
     }
 }
 
@@ -265,7 +279,7 @@ public enum ContainerStatus: String, Codable, Sendable {
     public var description: String { rawValue }
 }
 
-public struct PortMapping: Codable, Sendable, CustomStringConvertible {
+public struct PortMapping: Codable, Sendable, Equatable, CustomStringConvertible {
     public let hostPort: UInt16
     public let containerPort: UInt16
     public let proto: TransportProto
@@ -279,16 +293,63 @@ public struct PortMapping: Codable, Sendable, CustomStringConvertible {
     public var description: String { "0.0.0.0:\(hostPort)->\(containerPort)/\(proto.rawValue)" }
 
     public static func parse(_ s: String) throws -> PortMapping {
-        let parts = s.split(separator: ":", maxSplits: 1)
-        if parts.count == 2 {
-            guard let host = UInt16(parts[0]), let container = UInt16(parts[1]) else {
+        guard let first = try parseSpec(s).first else {
+            throw CockerError.invalidPortMapping(s)
+        }
+        return first
+    }
+
+    /// Parse one `ports:` entry into every mapping it describes.
+    ///
+    /// Only `HOST:CONTAINER` and a bare `PORT` used to parse. Everything else
+    /// — `8080:80/udp`, `127.0.0.1:8080:80`, `8000-8010:8000-8010` — threw,
+    /// and compose `compactMap`'d the throw away, so the port was simply
+    /// never published and nothing said so.
+    ///
+    /// A host IP is accepted and ignored: cocker's forwarder binds all
+    /// interfaces, and dropping the whole mapping over an unsupported bind
+    /// address is worse than binding it more widely than asked.
+    public static func parseSpec(_ s: String) throws -> [PortMapping] {
+        var body = s
+        var proto: TransportProto = .tcp
+        if let slash = body.lastIndex(of: "/") {
+            let suffix = String(body[body.index(after: slash)...]).lowercased()
+            guard let parsed = TransportProto(rawValue: suffix) else {
                 throw CockerError.invalidPortMapping(s)
             }
-            return PortMapping(hostPort: host, containerPort: container)
-        } else if let port = UInt16(s) {
-            return PortMapping(hostPort: port, containerPort: port)
+            proto = parsed
+            body = String(body[..<slash])
         }
-        throw CockerError.invalidPortMapping(s)
+
+        var fields = body.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        // `IP:HOST:CONTAINER` — drop the bind address (see above).
+        if fields.count == 3 { fields.removeFirst() }
+        guard fields.count == 1 || fields.count == 2 else {
+            throw CockerError.invalidPortMapping(s)
+        }
+
+        let hostRange = try portRange(fields[0], in: s)
+        let containerRange = try portRange(fields.count == 2 ? fields[1] : fields[0], in: s)
+        guard hostRange.count == containerRange.count else {
+            throw CockerError.invalidPortMapping(s)
+        }
+        return zip(hostRange, containerRange).map {
+            PortMapping(hostPort: $0, containerPort: $1, proto: proto)
+        }
+    }
+
+    /// `8080` → [8080] ; `8000-8010` → [8000…8010].
+    private static func portRange(_ field: String, in spec: String) throws -> [UInt16] {
+        if let dash = field.firstIndex(of: "-") {
+            guard let lo = UInt16(field[..<dash]),
+                  let hi = UInt16(field[field.index(after: dash)...]),
+                  lo <= hi else {
+                throw CockerError.invalidPortMapping(spec)
+            }
+            return Array(lo...hi)
+        }
+        guard let port = UInt16(field) else { throw CockerError.invalidPortMapping(spec) }
+        return [port]
     }
 }
 
@@ -405,6 +466,11 @@ public struct NetworkInfo: Codable, Sendable, Identifiable {
     public var gateway6: String
     public var containers: [String]
     public var createdAt: Date
+    /// `network create --label`. Optional so networks written by an older
+    /// daemon still decode; read it through `labelMap`.
+    public var labels: [String: String]?
+
+    public var labelMap: [String: String] { labels ?? [:] }
 
     public init(
         id: String = UUID().uuidString.prefix(12).lowercased(),
@@ -412,7 +478,8 @@ public struct NetworkInfo: Codable, Sendable, Identifiable {
         driver: NetworkDriver = .bridge,
         subnet: String = "172.20.0.0/16",
         gateway: String = "172.20.0.1",
-        containers: [String] = []
+        containers: [String] = [],
+        labels: [String: String] = [:]
     ) {
         self.id = String(id.prefix(12))
         self.name = name
@@ -422,6 +489,7 @@ public struct NetworkInfo: Codable, Sendable, Identifiable {
         self.subnet6 = "fd00:c0c4::/48"
         self.gateway6 = "fd00:c0c4::1"
         self.containers = containers
+        self.labels = labels
         self.createdAt = Date()
     }
 }
@@ -439,18 +507,30 @@ public struct VolumeInfo: Codable, Sendable, Identifiable {
     public var driver: String
     public var labels: [String: String]
     public var createdAt: Date
+    /// True when cocker invented this volume rather than the user naming it
+    /// — an auto-created mount source, or a compose service's anonymous
+    /// volume. Only these are eligible for `docker rm -v`; a named volume
+    /// outlives its containers by definition.
+    ///
+    /// Optional so volumes written by an older daemon still decode; read it
+    /// through `isAnonymous`.
+    public var anonymous: Bool?
+
+    public var isAnonymous: Bool { anonymous ?? false }
 
     public init(
         id: String = UUID().uuidString.prefix(12).lowercased(),
         name: String,
         mountpoint: String = "",
         driver: String = "local",
-        labels: [String: String] = [:]
+        labels: [String: String] = [:],
+        anonymous: Bool = false
     ) {
         self.id = String(id.prefix(12))
         self.name = name
         self.driver = driver
         self.labels = labels
+        self.anonymous = anonymous
         self.createdAt = Date()
         self.mountpoint = mountpoint.isEmpty
             ? "\(NSHomeDirectory())/.cocker/volumes/\(name)/_data"
@@ -463,6 +543,15 @@ public struct VolumeInfo: Codable, Sendable, Identifiable {
 public struct RunConfig: Codable, Sendable {
     public var image: String
     public var command: [String]
+    /// Overrides the image's ENTRYPOINT (compose `entrypoint:`, Docker API
+    /// `Entrypoint`). nil means "keep the image's". There was no field at
+    /// all before, so both paths decoded the value and discarded it and an
+    /// ENTRYPOINT override was simply impossible.
+    public var entrypoint: [String]?
+    /// Terminal geometry for `run -it`, so the container's main process
+    /// starts at the caller's real size.
+    public var rows: Int?
+    public var cols: Int?
     public var name: String?
     public var detach: Bool
     public var interactive: Bool
@@ -514,6 +603,9 @@ public struct RunConfig: Codable, Sendable {
     public init(image: String, command: [String] = []) {
         self.image = image
         self.command = command
+        self.entrypoint = nil
+        self.rows = nil
+        self.cols = nil
         self.name = nil
         self.detach = false
         self.interactive = false
@@ -603,11 +695,28 @@ public struct ExecConfig: Codable, Sendable {
     /// Empty / nil means "no stdin forwarded" (the legacy behaviour).
     public var stdin: Data?
 
+    /// Identifies this exec on the daemon so a *second* connection can stream
+    /// stdin into it while the first one streams output back.
+    ///
+    /// The daemon's per-connection loop can't read another frame while it is
+    /// streaming a response, so live stdin can't share the request's
+    /// connection without deadlocking. The CLI mints the id, opens a side
+    /// channel, and the daemon routes those bytes onto the same vsock fd the
+    /// guest is already relaying to the PTY master.
+    public var sessionID: String?
+    /// Terminal geometry for `-t`, so the PTY starts at the caller's real
+    /// size instead of openpty's 80x24 default.
+    public var rows: Int?
+    public var cols: Int?
+
     public init(containerID: String, command: [String]) {
         self.containerID = containerID
         self.command = command
         self.interactive = false
         self.tty = false
+        self.sessionID = nil
+        self.rows = nil
+        self.cols = nil
         self.user = nil
         self.workdir = nil
         self.env = [:]

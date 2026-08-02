@@ -48,7 +48,10 @@ public enum CockerError: Error, CustomStringConvertible {
     /// message VERBATIM — unlike `requestFailed`, its `description` adds no
     /// prefix, so the CLI doesn't stack "Request failed: Build failed: …".
     /// The transport throws this instead of re-wrapping daemon errors.
-    case daemon(String)
+    /// A failure reported by cockerd. The `Int32?` is the daemon's own
+    /// `exitCode` for that error, so the taxonomy survives the socket —
+    /// without it every remote failure collapsed to a plain 1.
+    case daemon(String, Int32? = nil)
 
     // Config errors
     case invalidPortMapping(String)
@@ -61,6 +64,10 @@ public enum CockerError: Error, CustomStringConvertible {
     case permissionDenied(String)
     case diskFull
     case unsupportedPlatform(String)
+    /// A command cocker ships but does not implement. Reported instead of a
+    /// fabricated success, so a script can tell the difference. The payload
+    /// is the command name.
+    case notImplemented(String)
     case internalError(String)
     /// state.json was written by a NEWER cockerd (schemaVersion > what this
     /// binary understands). Loading it would violate invariants we don't
@@ -102,7 +109,7 @@ public enum CockerError: Error, CustomStringConvertible {
         case .connectionFailed(let msg): return "Connection failed: \(msg)"
         case .requestFailed(let msg): return "Request failed: \(msg)"
         case .responseDecodingFailed(let msg): return "Response decoding failed: \(msg)"
-        case .daemon(let msg): return msg
+        case .daemon(let msg, _): return msg
         case .invalidPortMapping(let s): return "Invalid port mapping: \(s) (expected format: host:container)"
         case .invalidVolumeSpec(let s): return "Invalid volume spec: \(s) (expected format: source:dest[:ro])"
         case .invalidEnvironmentVar(let s): return "Invalid environment variable: \(s)"
@@ -112,6 +119,9 @@ public enum CockerError: Error, CustomStringConvertible {
         case .permissionDenied(let op): return "Permission denied: \(op)"
         case .diskFull: return "No space left on device"
         case .unsupportedPlatform(let p): return "Unsupported platform: \(p)"
+        case .notImplemented(let what):
+            return "\(what) is not implemented — cocker targets a single Mac, "
+                 + "not a cluster. Use `apple/container` or Docker Desktop if you need it." 
         case .internalError(let msg): return "Internal error: \(msg)"
         case .stateSchemaTooNew(let found, let supported):
             return "state.json schemaVersion=\(found) exceeds this cockerd's max (\(supported)). Upgrade cockerd or roll back the file."
@@ -140,7 +150,7 @@ public enum CockerError: Error, CustomStringConvertible {
             return ("Invalid port mapping: \(s)", nil, "expected `host:container`")
         case .invalidVolumeSpec(let s):
             return ("Invalid volume spec: \(s)", nil, "expected `source:dest[:ro]`")
-        case .daemon(let msg):
+        case .daemon(let msg, _):
             // The daemon already wrote a good message. Lift a leading
             // "Xxx failed: …" into headline + reason so it reads as a block
             // (e.g. "Build failed: RUN … exited 1" → what/why), otherwise
@@ -164,8 +174,12 @@ public enum CockerError: Error, CustomStringConvertible {
         case .containerNotFound, .imageNotFound, .networkNotFound, .volumeNotFound,
              .manifestNotFound, .dockerfileNotFound:
             return 127  // no such object
-        case .permissionDenied:
+        case .permissionDenied, .notImplemented:
             return 126  // found but not runnable
+        case .daemon(_, let code):
+            // The daemon told us what kind of failure this was ; keep it.
+            // An older daemon sends nothing, so a plain failure it is.
+            return code ?? 1
         case .daemonNotRunning, .connectionFailed, .responseDecodingFailed,
              .kernelNotFound, .initrdNotFound, .vmStartFailed, .vmStopFailed,
              .vmCommunicationFailed:

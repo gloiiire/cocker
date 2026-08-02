@@ -90,8 +90,8 @@ struct ComposeFile: Decodable {
         var command: StringOrArray?
         var entrypoint: StringOrArray?
         var environment: EnvSpec?
-        var ports: [String]?
-        var volumes: [String]?
+        var ports: PortsSpec?
+        var volumes: VolumesSpec?
         var networks: NetworksSpec?
         var depends_on: DependsOnSpec?
         var restart: String?
@@ -106,15 +106,199 @@ struct ComposeFile: Decodable {
         var healthcheck: ComposeHealthcheck?
         var deploy: ComposeDeploy?
         var container_name: String?
-        var env_file: StringOrArray?
+        var env_file: EnvFileSpec?
         var extra_hosts: [String]?
         var profiles: [String]?
     }
 
+    /// `ports:` entries are either the short string form (`"8080:80/udp"`)
+    /// or a mapping. Only `[String]` was modelled, so a file using the long
+    /// syntax — which is what `docker compose config` emits — was rejected
+    /// outright. Both normalise to the short form the rest of the code reads.
+    struct PortsSpec: Decodable {
+        var specs: [String]
+
+        struct LongForm: Decodable {
+            var target: Int?
+            var published: PublishedValue?
+            var protocolName: String?
+            var host_ip: String?
+
+            enum CodingKeys: String, CodingKey {
+                case target, published, host_ip
+                case protocolName = "protocol"
+            }
+
+            /// `published:` is a number in the spec but quoted by plenty of
+            /// generators, and may be a range.
+            enum PublishedValue: Decodable {
+                case int(Int), text(String)
+                init(from decoder: Decoder) throws {
+                    if let i = try? decoder.singleValueContainer().decode(Int.self) { self = .int(i) }
+                    else { self = .text(try decoder.singleValueContainer().decode(String.self)) }
+                }
+                var string: String {
+                    switch self {
+                    case .int(let i): return String(i)
+                    case .text(let t): return t
+                    }
+                }
+            }
+
+            var shortForm: String? {
+                guard let target else { return nil }
+                var out = ""
+                if let host_ip, !host_ip.isEmpty { out += "\(host_ip):" }
+                if let published { out += "\(published.string):" }
+                out += String(target)
+                if let proto = protocolName?.lowercased(), proto != "tcp" { out += "/\(proto)" }
+                return out
+            }
+        }
+
+        init(from decoder: Decoder) throws {
+            var container = try decoder.unkeyedContainer()
+            var collected: [String] = []
+            while !container.isAtEnd {
+                if let short = try? container.decode(String.self) {
+                    collected.append(short)
+                } else if let long = try? container.decode(LongForm.self), let short = long.shortForm {
+                    collected.append(short)
+                } else if let number = try? container.decode(Int.self) {
+                    // `- 8080` unquoted.
+                    collected.append(String(number))
+                } else {
+                    _ = try? container.decode(AnyIgnored.self)
+                }
+            }
+            self.specs = collected
+        }
+    }
+
+    /// Same story for `volumes:` — long syntax rejected the whole file, so
+    /// `type: tmpfs` and `read_only: true` were unreachable.
+    struct VolumesSpec: Decodable {
+        var specs: [String]
+
+        struct LongForm: Decodable {
+            var type: String?
+            var source: String?
+            var target: String?
+            var read_only: Bool?
+
+            var shortForm: String? {
+                guard let target else { return nil }
+                // A tmpfs mount has no source; the short form can't express
+                // it, so it's dropped here rather than mounted as a bind of
+                // an empty path. Callers see it missing, not wrong.
+                guard let source, !source.isEmpty else { return nil }
+                return read_only == true ? "\(source):\(target):ro" : "\(source):\(target)"
+            }
+        }
+
+        init(from decoder: Decoder) throws {
+            var container = try decoder.unkeyedContainer()
+            var collected: [String] = []
+            while !container.isAtEnd {
+                if let short = try? container.decode(String.self) {
+                    collected.append(short)
+                } else if let long = try? container.decode(LongForm.self), let short = long.shortForm {
+                    collected.append(short)
+                } else {
+                    _ = try? container.decode(AnyIgnored.self)
+                }
+            }
+            self.specs = collected
+        }
+    }
+
+    /// `env_file:` accepts a string, a list of strings, or a list of
+    /// `{path:, required:}` mappings. Only the first two decoded.
+    struct EnvFileSpec: Decodable {
+        var paths: [String]
+
+        struct LongForm: Decodable {
+            var path: String
+            var required: Bool?
+        }
+
+        init(from decoder: Decoder) throws {
+            if let single = try? decoder.singleValueContainer().decode(String.self) {
+                self.paths = [single]
+                return
+            }
+            var container = try decoder.unkeyedContainer()
+            var collected: [String] = []
+            while !container.isAtEnd {
+                if let short = try? container.decode(String.self) {
+                    collected.append(short)
+                } else if let long = try? container.decode(LongForm.self) {
+                    collected.append(long.path)
+                } else {
+                    _ = try? container.decode(AnyIgnored.self)
+                }
+            }
+            self.paths = collected
+        }
+    }
+
+    /// Placeholder that consumes one unkeyed element we can't interpret, so
+    /// the decoder advances instead of spinning.
+    struct AnyIgnored: Decodable {
+        init(from decoder: Decoder) throws { _ = try? decoder.singleValueContainer() }
+    }
+
+    /// `build:` accepts either a bare context path (`build: ./frontend`) or a
+    /// mapping. Only the mapping was modelled, so the short form — which is
+    /// what most compose files use — made the YAML decode fail and took the
+    /// *entire file* down with `invalidComposeFile`.
     struct ComposeBuild: Decodable {
         var context: String?
         var dockerfile: String?
-        var args: [String: String]?
+        var args: ArgsSpec?
+        /// Multi-stage target. Silently absent before, so a compose file
+        /// naming a stage built the last one instead.
+        var target: String?
+
+        init(from decoder: Decoder) throws {
+            if let shorthand = try? decoder.singleValueContainer().decode(String.self) {
+                self.context = shorthand
+                return
+            }
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.context = try c.decodeIfPresent(String.self, forKey: .context)
+            self.dockerfile = try c.decodeIfPresent(String.self, forKey: .dockerfile)
+            self.args = try c.decodeIfPresent(ArgsSpec.self, forKey: .args)
+            self.target = try c.decodeIfPresent(String.self, forKey: .target)
+        }
+
+        enum CodingKeys: String, CodingKey { case context, dockerfile, args, target }
+
+        /// `args:` is a map or a `KEY=value` list, like `environment:`.
+        /// Only the map form decoded, so the list form rejected the file.
+        enum ArgsSpec: Decodable {
+            case map([String: String])
+            case list([String])
+
+            init(from decoder: Decoder) throws {
+                if let m = try? [String: String](from: decoder) { self = .map(m) }
+                else { self = .list(try [String](from: decoder)) }
+            }
+
+            var dictionary: [String: String] {
+                switch self {
+                case .map(let m): return m
+                case .list(let l):
+                    var out: [String: String] = [:]
+                    for entry in l {
+                        let parts = entry.split(separator: "=", maxSplits: 1)
+                        if parts.count == 2 { out[String(parts[0])] = String(parts[1]) }
+                        else { out[entry] = "" }
+                    }
+                    return out
+                }
+            }
+        }
     }
 
     struct ComposeNetwork: Decodable {
@@ -246,10 +430,31 @@ actor ComposeEngine {
     }
 
     func up(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
-        let compose = try loadComposeFile(at: request.composePath)
+        let compose = try loadComposeFile(at: request.composePath, overrides: request.overrideFiles ?? [])
         let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
 
         progressHandler(StreamEvent(stream: .status, data: "Starting project: \(projectName)\n"))
+
+        // `--remove-orphans` : drop containers still labelled for this project
+        // whose service the compose file no longer declares. The flag was
+        // declared on both `up` and `down` and referenced nowhere, so a
+        // renamed or deleted service left its container running forever with
+        // no way to reach it through compose.
+        //
+        // `down` needs no equivalent — it already sweeps every container
+        // carrying the project label, orphan or not.
+        if request.removeOrphans {
+            let known = Set(compose.services.keys)
+            let all = await containerEngine.list(all: true)
+            for container in all where container.labels["com.cocker.project"] == projectName {
+                guard let service = container.labels["com.cocker.service"],
+                      !known.contains(service) else { continue }
+                try? await containerEngine.stop(id: container.id)
+                try? await containerEngine.remove(id: container.id, force: true)
+                progressHandler(StreamEvent(stream: .status,
+                    data: "Removed orphan container: \(container.name)\n"))
+            }
+        }
 
         // Create networks first
         if let networks = compose.networks {
@@ -325,7 +530,10 @@ actor ComposeEngine {
             progressHandler(StreamEvent(stream: .status, data: "Building \(serviceName)...\n"))
             var bc = BuildConfig(contextPath: absContext, tag: tag)
             bc.dockerfile = buildSpec.dockerfile ?? "Dockerfile"
-            bc.buildArgs = buildSpec.args ?? [:]
+            bc.buildArgs = buildSpec.args?.dictionary ?? [:]
+            // `target:` was never carried through, so a compose file naming a
+            // multi-stage target silently built the final stage instead.
+            bc.target = buildSpec.target
             _ = try await containerEngine.images.build(config: bc, vmRuntime: containerEngine.vmRuntime) { event in
                 progressHandler(event)
             }
@@ -449,7 +657,7 @@ actor ComposeEngine {
     }
 
     func build(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
-        let compose = try loadComposeFile(at: request.composePath)
+        let compose = try loadComposeFile(at: request.composePath, overrides: request.overrideFiles ?? [])
         let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
         let services = request.services.isEmpty ? Array(compose.services.keys) : request.services
 
@@ -469,7 +677,8 @@ actor ComposeEngine {
             progressHandler(StreamEvent(stream: .status, data: "Building \(serviceName)...\n"))
             var config = BuildConfig(contextPath: context, tag: tag)
             config.dockerfile = dockerfile
-            config.buildArgs = buildSpec.args ?? [:]
+            config.buildArgs = buildSpec.args?.dictionary ?? [:]
+            config.target = buildSpec.target
             config.noCache = request.noCache
             _ = try await containerEngine.images.build(config: config, vmRuntime: containerEngine.vmRuntime) { event in
                 progressHandler(event)
@@ -479,7 +688,7 @@ actor ComposeEngine {
     }
 
     func pull(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
-        let compose = try loadComposeFile(at: request.composePath)
+        let compose = try loadComposeFile(at: request.composePath, overrides: request.overrideFiles ?? [])
         let services = request.services.isEmpty ? Array(compose.services.keys) : request.services
 
         for serviceName in services {
@@ -499,7 +708,7 @@ actor ComposeEngine {
 
     func run(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
         // One-off run: start the service's container with detach
-        let compose = try loadComposeFile(at: request.composePath)
+        let compose = try loadComposeFile(at: request.composePath, overrides: request.overrideFiles ?? [])
         let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
         let serviceName = request.services.first ?? ""
 
@@ -507,13 +716,25 @@ actor ComposeEngine {
             throw CockerError.invalidComposeFile("Service '\(serviceName)' not found")
         }
 
-        let runConfig = try buildRunConfig(service: service, serviceName: serviceName, projectName: projectName, compose: compose, composePath: request.composePath)
+        var runConfig = try buildRunConfig(service: service, serviceName: serviceName, projectName: projectName, compose: compose, composePath: request.composePath)
+        // `compose run <svc> <cmd...>` : the override was parsed by the CLI,
+        // never carried on the wire, and the service silently ran its
+        // compose-file command instead.
+        if let override = request.command, !override.isEmpty {
+            runConfig.command = override
+        }
+        // `--rm` was declared and never referenced, so one-off containers
+        // accumulated after every `compose run`.
+        runConfig.rm = request.removeAfterRun
+        // A one-off run gets its own container: reusing the service's name
+        // would collide with an `up` of the same project.
+        runConfig.name = nil
         let id = try await containerEngine.run(config: runConfig)
         progressHandler(StreamEvent(stream: .status, data: "Started container \(String(id.prefix(12)))\n"))
     }
 
     func down(request: ComposeRequest) async throws {
-        let compose = try loadComposeFile(at: request.composePath)
+        let compose = try loadComposeFile(at: request.composePath, overrides: request.overrideFiles ?? [])
         let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
 
         // Find every container belonging to this project via the label we
@@ -573,7 +794,73 @@ actor ComposeEngine {
 
     // MARK: - Helpers
 
-    private func loadComposeFile(at path: String) throws -> ComposeFile {
+    /// Load the project's compose file, merging any override files on top.
+    ///
+    /// `docker-compose.override.yml` is loaded automatically by Docker
+    /// Compose and is one of the most common things in a real project — a
+    /// dev-only port, a bind mount, an extra env var. Cocker read a single
+    /// file and never merged, so every one of those was **silently ignored**:
+    /// the project came up, looked healthy, and simply wasn't configured the
+    /// way the author wrote it.
+    private func loadComposeFile(at path: String, overrides: [String] = []) throws -> ComposeFile {
+        guard overrides.isEmpty else {
+            return try loadMergedComposeFile(base: path, overrides: overrides)
+        }
+        return try loadSingleComposeFile(at: path)
+    }
+
+    /// Deep-merge `base` with each override in order, then decode the result.
+    ///
+    /// Merging happens on the parsed YAML rather than on `ComposeFile`, so a
+    /// key cocker doesn't model yet still merges correctly instead of being
+    /// dropped by the first decode.
+    private func loadMergedComposeFile(base: String, overrides: [String]) throws -> ComposeFile {
+        var merged = try Self.parseYAMLObject(at: base)
+        for override in overrides {
+            merged = Self.deepMerge(base: merged, override: try Self.parseYAMLObject(at: override))
+        }
+        guard let text = try? Yams.dump(object: merged) else {
+            throw CockerError.invalidComposeFile("could not re-serialise the merged compose file")
+        }
+        do {
+            return try YAMLDecoder().decode(ComposeFile.self, from: text)
+        } catch {
+            throw CockerError.invalidComposeFile(
+                "YAML parse error after merging \(([base] + overrides).map { ($0 as NSString).lastPathComponent }.joined(separator: " + ")): \(error)")
+        }
+    }
+
+    /// Read a compose file and apply `${VAR}` substitution, without decoding.
+    static func parseYAMLObject(at path: String) throws -> [String: Any] {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            throw CockerError.invalidComposeFile("Cannot read file: \(path)")
+        }
+        let dir = URL(fileURLWithPath: path).deletingLastPathComponent().path
+        let expanded = expandVariables(in: content, env: composeSubstitutionEnv(composeDir: dir))
+        guard let object = try? Yams.load(yaml: expanded) as? [String: Any] else {
+            throw CockerError.invalidComposeFile("YAML parse error in \(path)")
+        }
+        return object
+    }
+
+    /// Compose's merge rule: mappings merge key-by-key, everything else is
+    /// replaced. A sequence in an override wins outright rather than being
+    /// appended — that is what Docker does, and it is what lets an override
+    /// shorten a `command:` or replace a `ports:` list.
+    static func deepMerge(base: [String: Any], override: [String: Any]) -> [String: Any] {
+        var out = base
+        for (key, value) in override {
+            if let nestedOverride = value as? [String: Any],
+               let nestedBase = out[key] as? [String: Any] {
+                out[key] = deepMerge(base: nestedBase, override: nestedOverride)
+            } else {
+                out[key] = value
+            }
+        }
+        return out
+    }
+
+    private func loadSingleComposeFile(at path: String) throws -> ComposeFile {
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
             throw CockerError.invalidComposeFile("Cannot read file: \(path)")
         }
@@ -728,14 +1015,31 @@ actor ComposeEngine {
         config.hostname = service.hostname ?? serviceName
 
         if let cmd = service.command {
-            config.command = cmd.array
+            // `command: "npm run dev"` (string form) is shell form in compose,
+            // exactly like Dockerfile CMD. Passing it through as a single
+            // argv element made the guest try to exec a file literally named
+            // "npm run dev" — ENOENT, every time. The array form is exec form
+            // and passes through verbatim.
+            switch cmd {
+            case .string(let line): config.command = ["/bin/sh", "-c", line]
+            case .array(let argv): config.command = argv
+            }
+        }
+
+        // `entrypoint:` was decoded and then never read, so overriding an
+        // image's ENTRYPOINT through compose was impossible.
+        if let entrypoint = service.entrypoint {
+            switch entrypoint {
+            case .string(let line): config.entrypoint = ["/bin/sh", "-c", line]
+            case .array(let argv): config.entrypoint = argv
+            }
         }
 
         // env_file is the lowest-priority layer ; `environment:` overrides it.
         // Paths are relative to the compose file's directory.
         if let envFile = service.env_file {
             let baseDir = URL(fileURLWithPath: composePath).deletingLastPathComponent()
-            for p in envFile.array {
+            for p in envFile.paths {
                 let fullPath = p.hasPrefix("/") ? p : baseDir.appendingPathComponent(p).path
                 for (k, v) in Self.parseEnvFile(at: fullPath) {
                     config.env[k] = v
@@ -748,11 +1052,21 @@ actor ComposeEngine {
         }
 
         // Ports
-        config.ports = (service.ports ?? []).compactMap { try? PortMapping.parse($0) }
+        // `compactMap { try? }` swallowed every entry the old parser couldn't
+        // handle — ranges, udp, a host bind address — so the port was never
+        // published and nothing said so. A port the user asked for and didn't
+        // get is worth failing the service over.
+        config.ports = try (service.ports?.specs ?? []).flatMap { spec -> [PortMapping] in
+            do { return try PortMapping.parseSpec(spec) }
+            catch {
+                throw CockerError.invalidComposeFile(
+                    "service '\(serviceName)': cannot parse port '\(spec)'")
+            }
+        }
 
         // Volumes
         let composeDir = (composePath as NSString).deletingLastPathComponent
-        config.volumes = (service.volumes ?? []).compactMap { s in
+        config.volumes = (service.volumes?.specs ?? []).compactMap { s in
             let parts = s.split(separator: ":", maxSplits: 2).map(String.init)
             // Single-part volume entry like `- /app/node_modules` is a
             // Docker Compose ANONYMOUS volume — a per-container managed

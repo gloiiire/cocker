@@ -19,6 +19,87 @@ public actor RegistryClient {
         credentials[registry] = (username, password)
     }
 
+    /// Check credentials against a registry's `/v2/` endpoint.
+    ///
+    /// `cocker login` used to write the credentials to disk and report
+    /// success without ever contacting the registry, so a typo'd password
+    /// "succeeded" and only surfaced later as an inexplicable pull failure —
+    /// by which time nobody suspects the login.
+    ///
+    /// Follows the same handshake the pull path already does: `GET /v2/`,
+    /// and if the registry answers 401 with a Bearer challenge, exchange the
+    /// Basic credentials for a token at the advertised realm. A 200 from
+    /// either step means the credentials are good.
+    ///
+    /// Throws `CockerError.permissionDenied` for a rejection and
+    /// `.connectionFailed` when the registry can't be reached at all —
+    /// those are different problems and deserve different messages.
+    public func verifyCredentials(registry: String, username: String, password: String) async throws {
+        let scheme = Self.isLocalRegistry(registry) ? "http" : "https"
+        // Docker Hub's API lives on a different host than its index name.
+        let host = (registry == "docker.io" || registry == "index.docker.io")
+            ? "registry-1.docker.io" : registry
+        guard let base = URL(string: "\(scheme)://\(host)/v2/") else {
+            throw CockerError.connectionFailed("bad registry host: \(registry)")
+        }
+        let basic = Data("\(username):\(password)".utf8).base64EncodedString()
+
+        var probe = URLRequest(url: base)
+        probe.setValue("Basic \(basic)", forHTTPHeaderField: "Authorization")
+        let (_, response): (Data, URLResponse)
+        do {
+            (_, response) = try await session.data(for: probe)
+        } catch {
+            throw CockerError.connectionFailed(
+                "cannot reach \(host): \(error.localizedDescription)")
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw CockerError.connectionFailed("no HTTP response from \(host)")
+        }
+        if (200...299).contains(http.statusCode) { return }
+        guard http.statusCode == 401 else {
+            throw CockerError.connectionFailed("\(host) answered HTTP \(http.statusCode)")
+        }
+
+        // Bearer challenge : trade the Basic credentials for a token. A
+        // registry that still refuses at this point is rejecting the
+        // credentials, not the request.
+        guard let challenge = http.value(forHTTPHeaderField: "WWW-Authenticate"),
+              challenge.lowercased().hasPrefix("bearer") else {
+            throw CockerError.permissionDenied("\(registry): invalid username or password")
+        }
+        var params: [String: String] = [:]
+        for field in challenge.dropFirst("Bearer".count).split(separator: ",") {
+            let kv = field.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2 else { continue }
+            params[kv[0].trimmingCharacters(in: .whitespaces)] =
+                kv[1].trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
+        }
+        guard let realm = params["realm"], var components = URLComponents(string: realm) else {
+            throw CockerError.permissionDenied("\(registry): invalid username or password")
+        }
+        var query = components.queryItems ?? []
+        if let service = params["service"] { query.append(URLQueryItem(name: "service", value: service)) }
+        components.queryItems = query.isEmpty ? nil : query
+        guard let tokenURL = components.url else {
+            throw CockerError.permissionDenied("\(registry): invalid username or password")
+        }
+
+        var tokenRequest = URLRequest(url: tokenURL)
+        tokenRequest.setValue("Basic \(basic)", forHTTPHeaderField: "Authorization")
+        let tokenResponse: URLResponse
+        do {
+            (_, tokenResponse) = try await session.data(for: tokenRequest)
+        } catch {
+            throw CockerError.connectionFailed(
+                "cannot reach the token endpoint: \(error.localizedDescription)")
+        }
+        let code = (tokenResponse as? HTTPURLResponse)?.statusCode ?? -1
+        guard (200...299).contains(code) else {
+            throw CockerError.permissionDenied("\(registry): invalid username or password")
+        }
+    }
+
     /// Whether `host` is a loopback or RFC1918 private-network address — i.e.
     /// a registry we may reach over plain http.
     ///
@@ -218,6 +299,29 @@ public actor RegistryClient {
         }
     }
 
+    /// Resolve the blob-upload `PUT` target from a registry's `Location`
+    /// header, which may be absolute or relative to the registry.
+    ///
+    /// `location` is remote input, so this returns nil rather than
+    /// force-unwrapping `URL(string:)` — a header carrying a space, a control
+    /// character or a non-ASCII byte used to crash the whole daemon mid-push.
+    static func uploadPutURL(location: String, base: URL, digest: String) -> URL? {
+        guard !location.isEmpty else { return nil }
+        let separator = location.contains("?") ? "&" : "?"
+        let candidate: String
+        if location.hasPrefix("http://") || location.hasPrefix("https://") {
+            candidate = "\(location)\(separator)digest=\(digest)"
+        } else {
+            guard let scheme = base.scheme, let host = base.host else { return nil }
+            let port = base.port.map { ":\($0)" } ?? ""
+            // A relative Location is defined against the registry root and
+            // always starts with '/'; tolerate a server that omits it.
+            let path = location.hasPrefix("/") ? location : "/\(location)"
+            candidate = "\(scheme)://\(host)\(port)\(path)\(separator)digest=\(digest)"
+        }
+        return URL(string: candidate)
+    }
+
     private func uploadBlob(ref: ImageReference, digest: String, data: Data, token: String?) async throws {
         // Step A : POST to /v2/<name>/blobs/uploads/ → 202 Accepted + Location.
         let startURL = try pushURL(ref: ref, path: "blobs/uploads/")
@@ -233,17 +337,26 @@ public actor RegistryClient {
 
         // Step B : PUT to <Location>?digest=<sha256:...>.
         // The Location may be absolute OR relative.
-        let putURL: URL
-        if location.hasPrefix("http://") || location.hasPrefix("https://") {
-            putURL = URL(string: "\(location)\(location.contains("?") ? "&" : "?")digest=\(digest)")!
-        } else {
-            putURL = URL(string: "\(startURL.scheme!)://\(startURL.host!)\(startURL.port.map { ":\($0)" } ?? "")\(location)\(location.contains("?") ? "&" : "?")digest=\(digest)")!
+        //
+        // `location` is a header from a remote server, so it cannot be
+        // force-unwrapped through `URL(string:)` — a value with a space, a
+        // control character or a non-ASCII byte makes that return nil, and
+        // this used to crash the whole daemon mid-push.
+        guard let putURL = Self.uploadPutURL(location: location, base: startURL, digest: digest) else {
+            throw CockerError.layerDownloadFailed(
+                digest, "registry returned an unusable upload Location: \(location)")
         }
         var put = URLRequest(url: putURL)
         put.httpMethod = "PUT"
         put.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         put.setValue("\(data.count)", forHTTPHeaderField: "Content-Length")
-        if let token { put.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        // Only send the bearer token to the registry that issued it. A
+        // Location pointing at another host is a normal blob-storage handoff
+        // and carries its own pre-signed credentials; forwarding ours there
+        // would hand a push token to a third party the registry named.
+        if let token, putURL.host == startURL.host {
+            put.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         let (_, putResp) = try await session.upload(for: put, from: data)
         guard let putHTTP = putResp as? HTTPURLResponse,
               putHTTP.statusCode == 201 || putHTTP.statusCode == 204 else {

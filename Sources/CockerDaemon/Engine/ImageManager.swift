@@ -1006,7 +1006,15 @@ actor DockerfileBuilder {
                     if flag.hasPrefix("--from=") {
                         fromStage = String(flag.dropFirst("--from=".count))
                     }
-                    // Discard the flag (chown / chmod are silently ignored for now).
+                    // chown / chmod aren't applied yet. Say so instead of
+                    // dropping them in silence — the files land with the
+                    // wrong ownership and the image looks fine until
+                    // something inside it fails at runtime.
+                    if flag.hasPrefix("--chown=") || flag.hasPrefix("--chmod=") {
+                        log(.stderr, "Warning: \(instruction.keyword) \(flag) is not applied yet — "
+                            + "files keep the build context's ownership and mode ; "
+                            + "add a `RUN chown`/`chmod` step if the image depends on it\n")
+                    }
                     if spaceIdx == effectiveArgs.endIndex { effectiveArgs = ""; break }
                     effectiveArgs = String(effectiveArgs[effectiveArgs.index(after: spaceIdx)...])
                         .trimmingCharacters(in: .whitespaces)
@@ -1389,7 +1397,11 @@ actor DockerfileBuilder {
                 log(.stdout, " ---> \(shortID())\n")
 
             case "ONBUILD", "SHELL":
-                break  // acknowledged but not implemented
+                // Parsed so the build doesn't abort, but neither is honoured.
+                // Silently skipping them produced an image that differs from
+                // what the Dockerfile describes, with nothing to explain why.
+                log(.stderr, "Warning: \(instruction.keyword) is parsed but not implemented — "
+                    + "this instruction has no effect on the resulting image\n")
 
             default:
                 log(.stderr, "Warning: Unknown instruction: \(instruction.keyword)\n")

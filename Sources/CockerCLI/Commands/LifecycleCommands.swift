@@ -36,7 +36,7 @@ struct StartCommand: AsyncParsableCommand {
         }
 
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -62,7 +62,7 @@ struct StartCommand: AsyncParsableCommand {
                     footer.restore()
                 }
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot start container \(id)",
                     reason: error.description,
@@ -70,7 +70,39 @@ struct StartCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
+    }
+}
+
+struct WaitCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "wait",
+        abstract: "Block until one or more containers stop, then print their exit codes"
+    )
+
+    @Argument(help: "Container ID(s) or name(s)")
+    var containers: [String]
+
+    mutating func run() async throws {
+        let client = IPCClient()
+        let failures = FailureCode()
+        for id in containers {
+            do {
+                let request = try IPCRequest(type: .wait, payload: ContainerIDRequest(id: id))
+                let response = try await client.send(request)
+                // Docker prints one code per line and exits 0 itself — the
+                // code is data here, not this command's own status.
+                print(try response.decode(WaitResponse.self).exitCode)
+            } catch let error as CockerError {
+                failures.record(error)
+                UX.Failure.emit(
+                    headline: "Cannot wait on container \(id)",
+                    reason: error.description,
+                    hint: "check `cocker ps -a` to confirm it exists"
+                )
+            }
+        }
+        try failures.throwIfFailed()
     }
 }
 
@@ -88,15 +120,19 @@ struct StopCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
-                let request = try IPCRequest(type: .stop, payload: ContainerIDRequest(id: id))
+                // `-t` was parsed and dropped; the grace period never left
+                // the CLI.
+                let request = try IPCRequest(type: .stop,
+                                             payload: ContainerIDRequest(id: id,
+                                                                         timeout: TimeInterval(timeout)))
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .stop, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot stop container \(id)",
                     reason: error.description,
@@ -104,7 +140,7 @@ struct StopCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -122,7 +158,7 @@ struct KillCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -130,14 +166,14 @@ struct KillCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .kill, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot kill container \(id)",
                     reason: error.description
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -155,22 +191,24 @@ struct RestartCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
-                let request = try IPCRequest(type: .restart, payload: ContainerIDRequest(id: id))
+                let request = try IPCRequest(type: .restart,
+                                             payload: ContainerIDRequest(id: id,
+                                                                         timeout: TimeInterval(timeout)))
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .restart, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot restart container \(id)",
                     reason: error.description
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -185,7 +223,7 @@ struct PauseCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -193,7 +231,7 @@ struct PauseCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .pause, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot pause container \(id)",
                     reason: error.description,
@@ -201,7 +239,7 @@ struct PauseCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -216,7 +254,7 @@ struct UnpauseCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -224,14 +262,14 @@ struct UnpauseCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .unpause, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot unpause container \(id)",
                     reason: error.description
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -252,15 +290,19 @@ struct RmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
-                let request = try IPCRequest(type: .rm, payload: ContainerIDRequest(id: id, force: force))
+                // `-v` was parsed and never sent, so anonymous volumes piled
+                // up on disk with no way to reclaim them by name.
+                let request = try IPCRequest(type: .rm,
+                                             payload: ContainerIDRequest(id: id, force: force,
+                                                                         removeVolumes: volumes))
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot remove container \(id)",
                     reason: error.description,
@@ -268,7 +310,7 @@ struct RmCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -386,12 +428,23 @@ struct ExecCommand: AsyncParsableCommand {
         //      real-time interactive yet (needs duplex IPC + PTY relay).
         //      Print a clear warning and leave stdin empty.
         //   3. `-i` not set : skip stdin handling entirely.
+        // Live interactive session : raw mode locally, stdin streamed to the
+        // daemon on a side channel, PTY allocated in the guest. This branch
+        // used to print "typed input will not reach the container" and drop
+        // the keystrokes on the floor.
+        let session: InteractiveSession? =
+            (interactive && InteractiveSession.stdinIsTerminal) ? InteractiveSession() : nil
+        if let session {
+            config.sessionID = session.sessionID
+            if tty, let size = InteractiveSession.windowSize() {
+                config.rows = size.rows
+                config.cols = size.cols
+            }
+        }
+
         if interactive {
             if isatty(fileno(stdin)) == 1 {
-                UX.Warning.emit(
-                    "live interactive stdin (TTY) isn't supported yet",
-                    note: "pipe input via `echo … | cocker exec -i …` or file redirection ; typed input will not reach the container"
-                )
+                // Handled by the live session above — nothing to slurp.
             } else {
                 let maxBytes = 64 * 1024 * 1024
                 var collected = Data()
@@ -417,13 +470,34 @@ struct ExecCommand: AsyncParsableCommand {
         let payload = ExecRequest(config: config)
         let request = try IPCRequest(type: .exec, payload: payload)
 
+        // Docker parity : `cocker exec` exits with the command's code. The
+        // `.status` event carrying `exit:<n>` used to be dropped here, so
+        // `cocker exec c false` reported success.
+        let status = ExitStatusBox()
+        // Raw mode goes on before the first byte of output and comes off no
+        // matter how we leave — a half-restored terminal is the worst
+        // possible failure mode for an interactive command.
+        // Read stdin from the start so nothing typed early is lost; the
+        // pump holds it until the daemon reports its vsock is up.
+        session?.enterRawMode()
+        session?.startPump()
+        defer {
+            session?.stop()
+            session?.restore()
+        }
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: UX.writeStreamChunk(event.data)
             case .stderr: UX.writeStderr(event.data)
-            default: break
+            case .status:
+                if event.data == "exec-ready" { session?.markReady() }
+                status.consume(statusPayload: event.data)
+            case .error: UX.writeStderr(event.data)
             }
         }
+        session?.stop()
+        session?.restore()
+        if status.code != 0 { throw ExitCode(status.code) }
     }
 }
 
@@ -472,6 +546,7 @@ struct CpCommand: AsyncParsableCommand {
                     reason: "neither source nor destination starts with `<container>:`",
                     hint: "format : `cocker cp <container>:/src /host/dst` or `cocker cp /host/src <container>:/dst`"
                 )
+                // Usage error, not a daemon failure — plain 1.
                 throw ExitCode.failure
             }
             UX.printResult(.container, containerLabel, verb: .copy, elapsed: Date().timeIntervalSince(start))
@@ -480,7 +555,7 @@ struct CpCommand: AsyncParsableCommand {
                 headline: "Cannot copy files",
                 reason: error.description
             )
-            throw ExitCode.failure
+            throw ExitCode(error.exitCode)
         }
     }
 }
@@ -520,7 +595,12 @@ struct AttachCommand: AsyncParsableCommand {
         abstract: "Attach local STDIN/STDOUT/STDERR to a running container"
     )
 
-    @Flag(name: .customLong("no-stdin"), help: "Do not attach STDIN")
+    /// `attach` used to be read-only — cocker had no way to reach a running
+    /// container's stdin, so this flag was documented as a no-op. It isn't
+    /// one any more: a container started with `-t` has a console the host
+    /// can write to, and `attach` now relays the local terminal into it.
+    @Flag(name: .customLong("no-stdin"),
+          help: "Do not forward STDIN (view the output only)")
     var noStdin = false
 
     @Argument(help: "Container ID or name")
@@ -528,16 +608,48 @@ struct AttachCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+
+        // Only a container started with `-t` has a console the host can
+        // write into. Attaching stdin to one that hasn't would silently
+        // swallow every keystroke, so check first and stay read-only
+        // otherwise.
+        var containerHasTTY = false
+        if !noStdin, InteractiveSession.stdinIsTerminal {
+            let inspectReq = try IPCRequest(type: .inspect, payload: ContainerIDRequest(id: container))
+            if let info = try? await client.send(inspectReq).decode(Container.self) {
+                containerHasTTY = info.tty == true
+            }
+        }
+        let interactive = containerHasTTY
+
         let payload = ContainerIDRequest(id: container)
         let request = try IPCRequest(type: .attach, payload: payload)
 
         // Attach holds the terminal until the container stops, so it gets
         // the same pinned footer as the other continuous viewers. Piped, the
         // footer is inert and this is a plain pass-through.
+        //
+        // Not in interactive mode though: the footer reads stdin for its
+        // d/q keys, and two readers on one fd means it steals bytes out of
+        // the middle of what the user typed. The container owns the terminal.
         let footer = InteractiveFooter()
-        footer.start(footer: { footerLines(detach: true) }, onDetach: { true },
-                     plainFallback: false)
-        let view = StreamingLogView(footer: footer)
+        if !interactive {
+            footer.start(footer: { footerLines(detach: true) }, onDetach: { true },
+                         plainFallback: false)
+        }
+        let session: InteractiveSession? =
+            interactive ? InteractiveSession(sessionID: container) : nil
+        if let session {
+            session.enterRawMode()
+            session.startPump(containerStdin: true)
+            // The console is already up — nothing to hand-shake with.
+            session.markReady()
+        }
+        defer {
+            session?.stop()
+            session?.restore()
+        }
+        let view = StreamingLogView(footer: interactive ? nil : footer)
 
         let fail = UX.FailFlag()
         try await client.sendStreaming(request) { event in
@@ -553,6 +665,8 @@ struct AttachCommand: AsyncParsableCommand {
             }
         }
         view.finish()
+        session?.stop()
+        session?.restore()
         footer.restore()
         try fail.throwIfTripped()
     }

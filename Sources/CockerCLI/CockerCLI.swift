@@ -17,6 +17,7 @@ struct CockerCLI: AsyncParsableCommand {
             RunCommand.self,
             StartCommand.self,
             StopCommand.self,
+            WaitCommand.self,
             KillCommand.self,
             RestartCommand.self,
             PauseCommand.self,

@@ -58,16 +58,29 @@ jobs:
           # registry HTTPS / filesystem rootfs layout. They have full
           # live-test coverage via Sprint 3 smoke tests, but cannot be
           # exercised by the in-process `swift test` runner.
+          # `run -it` additions : InteractiveSession is termios raw mode, a
+          # blocking read(2) loop on a real fd and a SIGWINCH DispatchSource ;
+          # Confirm.swift prompts on a tty. Neither can be driven by the
+          # in-process runner, same as SignalTrap / StickyView /
+          # InteractiveFooter above. The parts that *are* testable — session
+          # identity, the `.execInput` wire contract, degrading when stdin
+          # isn't a terminal, idempotent restore — are covered by
+          # InteractiveExecTests ; the rest is exercised by Tests/e2e.
           # 0.5.13.x additions : CLI-side helpers that shell out to rsync
           # / brctl, use FSEvents, or twiddle termios. None can be unit-
           # tested in-process without elaborate FS / subprocess mocks ;
           # real coverage comes from integration smoke runs (compose up
           # on a known iCloud project).
           # 0.6.0 audit additions :
-          #   - LeasePoolMonitor : reads /var/db/dhcpd_leases + touches a
-          #     /var/run trigger ; not exercisable inside swift test.
           #   - AuditLog : writes ~/.cocker/audit.log with rotation ; the
           #     real coverage comes from the smoke runs.
+          # LeasePoolMonitor used to be excluded here on the grounds that it
+          # "reads /var/db/dhcpd_leases + touches a /var/run trigger ; not
+          # exercisable inside swift test". That was a property of the code,
+          # not of the test runner: the paths were hardcoded. They're
+          # parameters now, so the whole module — including the saturated
+          # pool with an unreachable helper, which shipped broken precisely
+          # because nothing exercised it — is unit-tested and gated.
           # 0.7.0 UX foundation additions :
           #   - Spinner : drives a Task that writes ANSI cursor moves to
           #     stdout in a 80 ms loop ; deterministic testing would require
@@ -92,15 +105,28 @@ jobs:
           # EngineOperations was extracted from ContainerEngine without changing
           # behavior. It owns the same VM/filesystem integration paths, so keep
           # the coverage boundary stable instead of counting moved code as 0%.
-          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/EngineOperations|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/Ext4Image|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/LeasePoolMonitor|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift|CockerCLI/UX/InteractiveFooter\.swift|CockerCLI/UX/SignalTrap\.swift)'
+          IGNORE='(\.build/|Tests/|cocker-init/|OCI/Registry|OCI/ImageStore|IPC/Transport|CockerDaemon/Engine/VMRuntime|CockerDaemon/Engine/ContainerEngine|CockerDaemon/Engine/EngineOperations|CockerDaemon/Engine/ImageManager|CockerDaemon/Engine/Ext4Image|CockerDaemon/Engine/NetworkManager|CockerDaemon/Engine/PortForwarder|CockerDaemon/Engine/AuditLog|CockerDaemon/DNS/DNSServer|CockerDaemon/Network/|CockerDaemon/Server/DaemonServer|CockerDaemon/API/DockerAPIServer|CockerDaemon/API/DockerAPITLSListener|CockerDaemon/Compose/ComposeEngine|CockerDaemon/main\.swift|CockerCLI/Commands/|CockerCLI/Output/|CockerCLI/CockerCLI\.swift|CockerCLI/ICloudStaging\.swift|CockerCLI/ICloudInspector\.swift|CockerCLI/InteractiveDetach\.swift|CockerCLI/UX/Spinner\.swift|CockerCLI/UX/StickyView\.swift|CockerCLI/UX/InteractiveFooter\.swift|CockerCLI/UX/SignalTrap\.swift|CockerCLI/UX/Confirm\.swift|CockerCLI/InteractiveSession\.swift)'
 
           xcrun llvm-cov report "$BIN" -instr-profile="$PROF" \
             -ignore-filename-regex="$IGNORE" \
             | tee coverage.txt
 
+          # The same report WITHOUT the exclusion list. Every entry in
+          # $IGNORE is individually defensible — Virtualization.framework,
+          # raw sockets, termios, ArgumentParser glue: things a unit test
+          # cannot drive — but together they leave most of the product
+          # outside the gated number. Publishing only that figure invites
+          # "90% covered" to be read as a claim about the whole engine,
+          # which it is not. Report both; gate on one.
+          xcrun llvm-cov report "$BIN" -instr-profile="$PROF" \
+            -ignore-filename-regex='(\.build/|Tests/|cocker-init/)' \
+            > coverage-full.txt
+
           # Extract the TOTAL line coverage percentage (last column after lines column)
           COV=$(awk '/^TOTAL/ { gsub("%","",$10); print $10 }' coverage.txt)
-          echo "Line coverage: ${COV}%"
+          COV_FULL=$(awk '/^TOTAL/ { gsub("%","",$10); print $10 }' coverage-full.txt)
+          echo "Line coverage (gated scope): ${COV}%"
+          echo "Line coverage (all of Sources/): ${COV_FULL}%"
           # Use python for float comparison so we don't depend on bc
           MEET=$(python3 -c "print('yes' if float('${COV}') >= 90 else 'no')")
           if [ "$MEET" != "yes" ]; then
@@ -109,6 +135,17 @@ jobs:
           fi
           {
             echo '## Test coverage'
+            echo ''
+            echo "**Gated scope: ${COV}%** (threshold 90%)"
+            echo ''
+            echo "**All of Sources/: ${COV_FULL}%**"
+            echo ''
+            echo 'The gate excludes code a unit test cannot drive:'
+            echo 'Virtualization.framework, raw sockets, termios,'
+            echo 'ArgumentParser glue. Those live in Tests/e2e instead,'
+            echo 'which needs a vm-capable runner. The second number is'
+            echo 'the honest answer to "how much of cocker do unit tests'
+            echo 'actually touch".'
             echo ''
             echo '```'
             cat coverage.txt
@@ -445,6 +482,17 @@ jobs:
       - name: Start a daemon on an isolated root
         # A dedicated --root keeps CI containers, images and build cache
         # away from whatever the machine's owner is running.
+        #
+        # --root and --socket do NOT isolate the DNS listener, which binds
+        # a fixed port (default 5300). The self-hosted runner is somebody's
+        # actual Mac, so their own cockerd is usually up and already holds
+        # it: the CI daemon then logs `WARN [dns] TCP listener bind failed`,
+        # both daemons end up bound to the same UDP port on the same
+        # bridge, and container DHCP becomes a coin flip. Results go flaky
+        # rather than failing outright, which is worse — this cost a full
+        # e2e run reporting four failures that had nothing to do with the
+        # commit. `Tests/e2e/README.md` has said "COCKER_DNS_PORT is not
+        # optional" for a while; this is the workflow finally obeying it.
         run: |
           ROOT="$RUNNER_TEMP/cocker-ci-root"
           rm -rf "$ROOT" && mkdir -p "$ROOT/kernel"
@@ -453,7 +501,9 @@ jobs:
           cp cocker-init/initrd.img "$ROOT/kernel/initrd.img"
           echo "COCKER_CI_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "COCKER_HOST=unix://$ROOT/cocker.sock" >> "$GITHUB_ENV"
-          nohup ./.build/release/cockerd --root "$ROOT" --socket "$ROOT/cocker.sock" \
+          echo "COCKER_DNS_PORT=5399" >> "$GITHUB_ENV"
+          nohup env COCKER_DNS_PORT=5399 \
+            ./.build/release/cockerd --root "$ROOT" --socket "$ROOT/cocker.sock" \
             > "$RUNNER_TEMP/cockerd.log" 2>&1 &
           for _ in $(seq 1 30); do
             COCKER_HOST="unix://$ROOT/cocker.sock" ./.build/release/cocker info >/dev/null 2>&1 && break
@@ -474,3 +524,51 @@ jobs:
           ./.build/release/cocker system prune -f >/dev/null 2>&1 || true
           pkill -f "cockerd --root $COCKER_CI_ROOT" || true
           rm -rf "$COCKER_CI_ROOT"
+
+  e2e-status:
+    # Say out loud whether the e2e suite actually ran.
+    #
+    # The `e2e` job targets a `vm-capable` self-hosted runner. With no such
+    # runner online it is reported as *skipped*, and a skipped job doesn't
+    # fail anything — so a pull request went green while the only tests that
+    # boot a real VM never executed. Every path this project cares most about
+    # (mount failures, exit codes, the interactive terminal) lives behind that
+    # job, and its absence was invisible.
+    #
+    # This never fails the build either — a missing runner isn't the
+    # contributor's fault. It writes the state into the run summary so a green
+    # checkmark can't be mistaken for e2e coverage.
+    name: e2e coverage status
+    runs-on: ubuntu-latest
+    needs: [e2e]
+    if: always()
+    steps:
+      - name: Report whether the e2e suite ran
+        run: |
+          result='${{ needs.e2e.result }}'
+          {
+            echo '## End-to-end suite'
+            echo ''
+            case "$result" in
+              success)
+                echo '✅ **Ran, and passed.** Real VMs booted on a self-hosted Apple-silicon runner.'
+                ;;
+              failure)
+                echo '❌ **Ran, and failed.** See the `e2e` job.'
+                ;;
+              skipped|cancelled|"")
+                echo '⚠️ **Did not run.** No `vm-capable` self-hosted runner was available.'
+                echo ''
+                echo 'Everything that boots a VM is therefore unverified by this run:'
+                echo 'volume mounts, exit-code propagation through a real container,'
+                echo 'the interactive terminal, compose, and the build cache.'
+                echo ''
+                echo 'A green check on this pull request means the **unit** tests passed.'
+                echo 'Run `bash Tests/e2e/run-all.sh` against a local daemon before tagging.'
+                ;;
+              *)
+                echo "⚠️ **Unknown state:** $result"
+                ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "e2e result: $result"

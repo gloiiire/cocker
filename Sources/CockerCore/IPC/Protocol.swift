@@ -7,8 +7,14 @@ public enum IPCRequestType: String, Codable, Sendable {
     case run, start, stop, kill, restart, rm, pause, unpause
     // Container info
     case ps, inspect, logs, top
+    // Block until a container exits, then report its code
+    case wait
+    /// Tell a `-t` container its terminal changed size (SIGWINCH).
+    case resize
     // Exec
     case exec
+    /// Live stdin for an in-flight exec, on its own connection.
+    case execInput
     // Copy
     case cp
     // Rename
@@ -78,6 +84,16 @@ public struct IPCResponse: Codable, Sendable {
     public let success: Bool
     public let payload: Data
     public let error: String?
+    /// The failing `CockerError`'s exit code, so the CLI can keep the
+    /// taxonomy the charter documents.
+    ///
+    /// Only the message used to cross the socket, and the client re-wrapped
+    /// it as `CockerError.daemon(String)` — which has no kind, so every
+    /// daemon-side failure arrived as a plain 1. "No such container" and
+    /// "the daemon is wedged" were indistinguishable to a script, which is
+    /// precisely what the taxonomy exists to prevent. Optional: an older
+    /// daemon doesn't send it and the client falls back to 1.
+    public let errorCode: Int32?
     public let isStreaming: Bool
     public let isLast: Bool
 
@@ -91,15 +107,17 @@ public struct IPCResponse: Codable, Sendable {
         self.success = true
         self.payload = try JSONEncoder().encode(payload)
         self.error = nil
+        self.errorCode = nil
         self.isStreaming = isStreaming
         self.isLast = isLast
     }
 
-    public init(requestId: String, error: String) {
+    public init(requestId: String, error: String, errorCode: Int32? = nil) {
         self.requestId = requestId
         self.success = false
         self.payload = Data()
         self.error = error
+        self.errorCode = errorCode
         self.isStreaming = false
         self.isLast = true
     }
@@ -187,9 +205,48 @@ public struct ContainerIDRequest: Codable, Sendable {
     public let id: String
     public let signal: String?
     public let force: Bool?
-    public init(id: String, signal: String? = nil, force: Bool? = nil) {
+    /// Grace period for `stop` / `restart` (`-t`). nil keeps the daemon's
+    /// 10 s default. Optional so an older CLI's payload still decodes.
+    public let timeout: TimeInterval?
+    /// `rm -v` — also remove the anonymous volumes this container created.
+    public let removeVolumes: Bool?
+    public init(id: String, signal: String? = nil, force: Bool? = nil,
+                timeout: TimeInterval? = nil, removeVolumes: Bool? = nil) {
         self.id = id; self.signal = signal; self.force = force
+        self.timeout = timeout; self.removeVolumes = removeVolumes
     }
+}
+
+/// The daemon reports a finished `exec` as a `.status` stream event whose
+/// payload is `exit:<n>`. Both the CLI and the Docker-API server have to read
+/// it back, and both used to drop it — so `cocker exec c false` and
+/// `docker exec c false` each reported success. One parser, so the two can't
+/// drift apart.
+public enum ExitMarker {
+    /// `exit:<n>` → n. Tolerates the trailing newline the guest may leave on
+    /// the marker. Any other status payload (pull progress and the like)
+    /// returns nil and must be left for the caller to handle.
+    public static func parse(_ raw: String) -> Int32? {
+        guard raw.hasPrefix("exit:") else { return nil }
+        return Int32(raw.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
+/// `.resize` — new terminal geometry for a `-t` container.
+public struct ResizeRequest: Codable, Sendable {
+    public let id: String
+    public let rows: Int
+    public let cols: Int
+    public init(id: String, rows: Int, cols: Int) {
+        self.id = id; self.rows = rows; self.cols = cols
+    }
+}
+
+/// Reply to `.wait` — the container's real exit code, readable even after
+/// `--rm` has removed the container.
+public struct WaitResponse: Codable, Sendable {
+    public let exitCode: Int32
+    public init(exitCode: Int32) { self.exitCode = exitCode }
 }
 
 public struct PSRequest: Codable, Sendable {
@@ -257,14 +314,39 @@ public struct VolumeCreateRequest: Codable, Sendable {
     public let name: String
     public let driver: String
     public let labels: [String: String]
-    public init(name: String, driver: String = "local", labels: [String: String] = [:]) {
+    /// Set when cocker is inventing the volume for a mount the user didn't
+    /// name. Marks it eligible for `rm -v`. Optional for older CLIs.
+    public let anonymous: Bool?
+    public init(name: String, driver: String = "local", labels: [String: String] = [:],
+                anonymous: Bool = false) {
         self.name = name; self.driver = driver; self.labels = labels
+        self.anonymous = anonymous
     }
 }
 
 public struct VolumesResponse: Codable, Sendable {
     public let volumes: [VolumeInfo]
     public init(volumes: [VolumeInfo]) { self.volumes = volumes }
+}
+
+/// A chunk of live stdin for an in-flight exec, or the EOF that ends it.
+public struct ExecInputRequest: Codable, Sendable {
+    /// Exec session id, or — when `isContainerStdin` is set — the container
+    /// whose *main* process should receive the bytes. `run -it` needs the
+    /// same side channel for the same reason exec did: the connection
+    /// streaming output can't read a second frame.
+    public let sessionID: String
+    /// Route to the container's console rather than to an exec session.
+    public let isContainerStdin: Bool?
+    public let data: Data?
+    /// The caller closed its stdin. The daemon half-closes the vsock so the
+    /// in-VM child sees EOF instead of blocking forever.
+    public let eof: Bool
+    public init(sessionID: String, data: Data? = nil, eof: Bool = false,
+                isContainerStdin: Bool = false) {
+        self.sessionID = sessionID; self.data = data; self.eof = eof
+        self.isContainerStdin = isContainerStdin
+    }
 }
 
 public struct ExecRequest: Codable, Sendable {
@@ -322,10 +404,25 @@ public struct ComposeRequest: Codable, Sendable {
     /// `compose build --no-cache`: execute every RUN instruction instead of
     /// consulting the on-disk layer cache.
     public let noCache: Bool
+    /// `compose run <service> <cmd...>` : argv overriding the service's
+    /// command. Parsed by the CLI but dropped on the floor before — the
+    /// service always ran its compose-file command instead.
+    public let command: [String]?
+    /// `compose run --rm` : remove the one-off container when it exits.
+    public let removeAfterRun: Bool
+    /// `compose up/down --remove-orphans` : also remove containers labelled
+    /// for this project that the compose file no longer declares.
+    public let removeOrphans: Bool
+    /// Extra compose files to merge on top of `composePath`, in order —
+    /// repeated `-f`, plus the `docker-compose.override.yml` Docker loads
+    /// automatically. Optional so an older CLI's payload still decodes.
+    public let overrideFiles: [String]?
     public init(composePath: String, projectName: String? = nil, services: [String] = [],
                 detach: Bool = false, activeProfiles: [String]? = nil,
                 removeVolumes: Bool = false, follow: Bool = false, tail: Int = 50,
-                forceBuild: Bool = false, noCache: Bool = false) {
+                forceBuild: Bool = false, noCache: Bool = false,
+                command: [String]? = nil, removeAfterRun: Bool = false,
+                removeOrphans: Bool = false, overrideFiles: [String]? = nil) {
         self.composePath = composePath; self.projectName = projectName
         self.services = services; self.detach = detach
         self.activeProfiles = activeProfiles
@@ -334,10 +431,15 @@ public struct ComposeRequest: Codable, Sendable {
         self.tail = tail
         self.forceBuild = forceBuild
         self.noCache = noCache
+        self.command = command
+        self.removeAfterRun = removeAfterRun
+        self.removeOrphans = removeOrphans
+        self.overrideFiles = overrideFiles
     }
 
     enum CodingKeys: String, CodingKey {
         case composePath, projectName, services, detach, activeProfiles, removeVolumes, follow, tail, forceBuild, noCache
+        case command, removeAfterRun, removeOrphans, overrideFiles
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -356,6 +458,12 @@ public struct ComposeRequest: Codable, Sendable {
         // "skip rebuild when image already exists" behaviour.
         self.forceBuild     = try c.decodeIfPresent(Bool.self, forKey: .forceBuild) ?? false
         self.noCache        = try c.decodeIfPresent(Bool.self, forKey: .noCache) ?? false
+        // Absent from older CLIs : nil command means "use the compose file's",
+        // and both flags default off.
+        self.command        = try c.decodeIfPresent([String].self, forKey: .command)
+        self.removeAfterRun = try c.decodeIfPresent(Bool.self, forKey: .removeAfterRun) ?? false
+        self.removeOrphans  = try c.decodeIfPresent(Bool.self, forKey: .removeOrphans) ?? false
+        self.overrideFiles  = try c.decodeIfPresent([String].self, forKey: .overrideFiles)
     }
 }
 
@@ -575,11 +683,13 @@ public struct UpdateRequest: Codable, Sendable {
 // MARK: - Version
 
 public enum CockerVersion {
-    // Bumped manually with each tag. TODO : drive from a Version.generated.swift
-    // produced by the release workflow so this can't drift again.
-    public static let version = "0.7.13.26"
+    // Both are rewritten by scripts/bump-version.sh, which release.yml then
+    // re-validates against the tag. `buildTime` used to be hand-maintained
+    // alongside an automated `version` and had already drifted: 0.7.13.26
+    // shipped claiming a build date seven weeks older than the release.
+    public static let version = "1.0.0.0"
     public static let apiVersion = "1.0"
-    public static let buildTime = "2026-06-13"
+    public static let buildTime = "2026-08-02"
     public static let minAPIVersion = "1.0"
 
     /// **A10 — IPC protocol version**. v1 = post-audit shape (the

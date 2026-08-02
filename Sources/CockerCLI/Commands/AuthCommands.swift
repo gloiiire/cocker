@@ -64,6 +64,22 @@ struct LoginCommand: AsyncParsableCommand {
             pass = p
         }
 
+        // Check the credentials before writing them. `login` used to store
+        // whatever it was given and report success without contacting the
+        // registry at all, so a typo'd password "succeeded" and only surfaced
+        // later as an inexplicable pull failure — by which point nobody
+        // suspects the login.
+        do {
+            try await RegistryClient().verifyCredentials(
+                registry: server, username: user, password: pass)
+        } catch let error as CockerError {
+            UX.Failure.emit(
+                headline: "Login failed",
+                reason: error.description,
+                hint: "check the username and password, or the registry hostname")
+            throw ExitCode(error.exitCode)
+        }
+
         var store = CredentialStore.load()
         store.credentials[server] = CredentialStore.Credential(username: user, password: pass)
         try store.save()

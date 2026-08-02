@@ -408,13 +408,10 @@ final class DockerAPITLSListener {
                 }
             }
         }
-        // Strip /v1.NN prefix the way the canonical parser does.
-        if path.hasPrefix("/v") {
-            let afterV = path.dropFirst(2)
-            if let slash = afterV.firstIndex(of: "/") {
-                path = String(afterV[slash...])
-            }
-        }
+        // Strip /v1.NN prefix through the canonical helper — this used to be
+        // a copy of the old, broken version that also ate the "v" of
+        // `/volumes/...`.
+        path = stripAPIVersionPrefix(path)
         var headers: [String: String] = [:]
         for line in lines.dropFirst() {
             let parts = line.split(separator: ":", maxSplits: 1)

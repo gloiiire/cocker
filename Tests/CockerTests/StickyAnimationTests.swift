@@ -100,18 +100,30 @@ struct StickyAnimationTests {
 
     @Test func tickerStartIsIdempotent() async throws {
         let counter = TickCounter()
-        // A long interval keeps the assertion meaningful : a triple-started
-        // ticker would fire ~3x, which stays far above this ceiling even
-        // when the machine is slow.
-        let ticker = UX.Ticker(interval: 0.05) { counter.bump() }
+        let interval = 0.05
+        let ticker = UX.Ticker(interval: interval) { counter.bump() }
         ticker.start()
         ticker.start()
         ticker.start()
+        let start = Date()
         try await Task.sleep(nanoseconds: 250_000_000)
         ticker.stop()
-        // ~5 ticks expected from one ticker ; three would give ~15. The
-        // bound only has to separate those two cases.
-        #expect(counter.value <= 10)
+        let elapsed = Date().timeIntervalSince(start)
+
+        // The ceiling has to be derived from the time that actually elapsed,
+        // not from the time we asked to sleep. `Task.sleep` guarantees a
+        // minimum, not a maximum : under load it overruns badly (two
+        // concurrent `swift test` processes pushed 250 ms past 500 ms), and
+        // since the ticker fires ~elapsed/interval times, a SINGLE ticker
+        // then sails past any constant bound — failing a test about
+        // triple-starting for a reason that has nothing to do with it.
+        //
+        // One ticker gives ~elapsed/interval ; three give ~3x that. A 2x
+        // ceiling separates those two cases on any machine, however slow.
+        let expectedForOne = elapsed / interval
+        let seconds = String(format: "%.3f", elapsed)
+        #expect(Double(counter.value) <= expectedForOne * 2 + 1,
+                "\(counter.value) ticks in \(seconds)s — one ticker should give about \(Int(expectedForOne)), three about \(Int(expectedForOne * 3))")
     }
 
     // MARK: - Rendering

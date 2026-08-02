@@ -99,7 +99,8 @@ actor VolumeManager {
             name: request.name,
             mountpoint: imgURL.path,
             driver: request.driver,
-            labels: request.labels
+            labels: request.labels,
+            anonymous: request.anonymous ?? false
         )
 
         try await store.store(volume: volume)
@@ -117,16 +118,33 @@ actor VolumeManager {
         await store.allVolumes()
     }
 
+    /// Like `get`, but nil rather than throwing for a volume that isn't
+    /// there — for callers doing cleanup, where "already gone" is fine.
+    func info(_ name: String) async -> VolumeInfo? {
+        await store.volume(id: name)
+    }
+
     func remove(_ name: String, force: Bool = false) async throws {
         let vol = try await get(name)
 
         // Check if in use by a container
         let containers = await store.allContainers(includeAll: true)
-        let inUse = containers.contains { c in
+        let users = containers.filter { c in
             c.volumes.contains { $0.source == name }
         }
 
-        if inUse && !force {
+        // A *running* container's volume is never removable, force or not.
+        // `force` used to skip this check entirely, so `volume rm -f` unlinked
+        // the backing data.img out from under a live VM that still held the
+        // fd — the container kept writing into a deleted inode and the data
+        // was gone at stop. Docker refuses this case too; its `--force` only
+        // relaxes the stopped-container and missing-volume cases.
+        if let live = users.first(where: { $0.status == .running || $0.status == .paused }) {
+            throw CockerError.volumeInUse(
+                "\(name): still mounted by running container \(live.name) — stop it first")
+        }
+
+        if !users.isEmpty && !force {
             throw CockerError.volumeInUse(name)
         }
 
@@ -160,8 +178,11 @@ actor VolumeManager {
         }
         // Named volume
         if await store.volume(id: mount.source) == nil {
-            // Auto-create anonymous volume
-            _ = try await create(request: VolumeCreateRequest(name: mount.source))
+            // Auto-create anonymous volume. Flagged as such so `rm -v` can
+            // tell it apart from a volume the user named and expects to
+            // outlive the container.
+            _ = try await create(request: VolumeCreateRequest(name: mount.source,
+                                                             anonymous: true))
         }
         let vol = try await get(mount.source)
         return vol.mountpoint

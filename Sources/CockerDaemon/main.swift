@@ -88,7 +88,9 @@ func main() async {
             }
         }
     } catch {
-        fputs("Failed to create data directories: \(error)\n", stderr)
+        DaemonMessage.failure("Cannot create the data directories",
+                              reason: "\(error)",
+                              hint: "check permissions on the --root path")
         exit(1)
     }
 
@@ -222,13 +224,25 @@ func main() async {
                 lastCount = count
                 continue
             }
+            // Whether the helper ACCEPTED the request, not whether its
+            // plist happens to exist. The old shape asked "is it
+            // installed?", tried the write, discarded the failure, and
+            // routed the actionable warning into the `else` branch — so an
+            // installed-but-inert helper produced total silence while the
+            // pool ran to 317/256 and containers failed DHCP. Both
+            // failure modes are real: the plist can be present with
+            // `launchctl` never having loaded it, and `/var/run` is
+            // root-owned while cockerd runs as the user.
             let helperInstalled = FileManager.default.fileExists(atPath: helperPath)
+            var helperAccepted = false
             if helperInstalled {
                 let trigger = URL(fileURLWithPath: triggerPath)
-                if (try? Data().write(to: trigger)) != nil {
+                helperAccepted = (try? Data().write(to: trigger)) != nil
+                if helperAccepted {
                     log.info("vmnet", "lease pool at \(count)/256 — asked helper to clear")
                 }
-            } else if count > 240 {
+            }
+            if !helperAccepted, count > 240 {
                 // Rate limit : warn on first crossing of 240, then at
                 // most every 5 min, OR immediately if the count jumped
                 // ≥10 leases since the last warning (= rapid saturation).
@@ -237,9 +251,15 @@ func main() async {
                 let dueByTime = lastWarnedAbove240.map { now.timeIntervalSince($0) >= 300 } ?? false
                 let jumpedFast = count - lastCount >= 10
                 if crossedFresh || dueByTime || jumpedFast {
+                    let fix = helperInstalled
+                        ? "The helper is installed but did not accept the request — it is " +
+                          "probably not loaded (`sudo launchctl load \(helperPath)`). " +
+                          "Reinstall with `cocker daemon helper-install`, or clear once " +
+                          "with `cocker daemon clear-leases`."
+                        : "Install the helper with `cocker daemon helper-install` " +
+                          "OR run `cocker daemon clear-leases`."
                     log.warn("vmnet", "lease pool at \(count)/256 — new containers will " +
-                        "soon fail DHCP. Install the helper with `cocker daemon " +
-                        "helper-install` OR run `cocker daemon clear-leases`.")
+                        "soon fail DHCP. " + fix)
                     lastWarnedAbove240 = now
                 }
             }
@@ -672,7 +692,7 @@ private func linkKernel(_ k: DiscoveredKernel, into kernelDir: URL) -> Bool {
     // ~/.container ; printing the path makes the trust decision
     // visible at install time so the user can spot anything odd.
     if !kernelPathLooksTrusted(k.vmlinuz) {
-        print("Warning: kernel path \(k.vmlinuz) is outside the usual " +
+        DaemonMessage.warning("kernel path \(k.vmlinuz) is outside the usual " +
               "Homebrew / Apple container / ~/.container prefixes. " +
               "Verify it's the kernel you intended to install before " +
               "starting cockerd.")
@@ -698,12 +718,14 @@ private func linkKernel(_ k: DiscoveredKernel, into kernelDir: URL) -> Bool {
         // an opaque VZ "config validate" error. fileExists follows symlinks,
         // so a true return == the underlying file is reachable.
         guard FileManager.default.fileExists(atPath: dstKernel.path) else {
-            print("Error: kernel symlink at \(dstKernel.path) doesn't resolve to a file (broken link or missing source).")
+            DaemonMessage.failure("Kernel symlink is broken",
+                              reason: "\(dstKernel.path) doesn't resolve to a file",
+                              hint: "re-run `cockerd setup` to re-create it")
             return false
         }
         return true
     } catch {
-        print("Warning: could not symlink kernel files: \(error)")
+        DaemonMessage.warning("could not symlink kernel files", note: "\(error)")
         return false
     }
 }
@@ -741,11 +763,12 @@ func runSetup(rootURL: URL) async {
                         )
                         print("✓ Linked cocker's shipped initrd: \(shippedInitrd)")
                     } catch {
-                        print("Warning: found shipped initrd at \(shippedInitrd) but failed to symlink: \(error)")
+                        DaemonMessage.warning("found a shipped initrd but could not symlink it",
+                                              note: "\(shippedInitrd): \(error)")
                     }
                 } else {
                     print("")
-                    print("⚠ initrd.img is still missing at \(cockerInitrd)")
+                    DaemonMessage.warning("initrd.img is still missing at \(cockerInitrd)")
                     print("  Apple's `container` doesn't ship a Linux initrd next to its kernel")
                     print("  (it builds per-container init filesystems instead). Cocker needs")
                     print("  its own initrd. Either run `./install.sh` from the cocker checkout")
@@ -792,7 +815,7 @@ func runSetup(rootURL: URL) async {
         return
     }
     guard FileManager.default.fileExists(atPath: entered) else {
-        print("✗ \(entered) does not exist.")
+        DaemonMessage.failure("\(entered) does not exist")
         return
     }
     let initrdSibling = (entered as NSString).deletingLastPathComponent + "/initrd.img"

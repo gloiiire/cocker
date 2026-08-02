@@ -46,7 +46,10 @@ actor NetworkManager {
             name: request.name,
             driver: request.driver,
             subnet: subnet,
-            gateway: gateway
+            gateway: gateway,
+            // `--label` reached this far and was then dropped on the floor,
+            // so `network ls --filter label=…` could never match anything.
+            labels: request.labels
         )
 
         try await store.store(network: network)
@@ -120,13 +123,28 @@ actor NetworkManager {
     func allocateIP(for containerID: String, subnet: String = "172.17.0.0/16") -> String {
         if let existing = allocatedIPs[containerID] { return existing }
 
-        // Parse subnet to generate IP in range
+        // Take the lowest free host address rather than counting containers.
+        //
+        // `2 + allocatedIPs.count` hands out duplicates the moment anything
+        // is released: start three containers (.2 .3 .4), stop the middle
+        // one, start another — count is 2 again, so the newcomer gets .4,
+        // which is already taken. Past 253 it wrapped to .2 unconditionally.
+        // DHCP overwrites `container.ip` later, but this is what lands in
+        // state.json and what `inspect` shows until then.
         let base = parseSubnetBase(subnet)
-        var octet4 = 2 + allocatedIPs.count  // Start at .2 (.1 is gateway)
-        if octet4 > 254 { octet4 = 2 }       // Wrap around (simplified)
-        let ip = "\(base).\(octet4)"
-        allocatedIPs[containerID] = ip
-        return ip
+        let taken = Set(allocatedIPs.values)
+        for octet in 2...254 {
+            let candidate = "\(base).\(octet)"
+            if !taken.contains(candidate) {
+                allocatedIPs[containerID] = candidate
+                return candidate
+            }
+        }
+        // 253 containers on one subnet — the lease pool gives out long
+        // before this, so returning the last address is honest enough.
+        let exhausted = "\(base).254"
+        allocatedIPs[containerID] = exhausted
+        return exhausted
     }
 
     func releaseIP(for containerID: String) {
@@ -160,13 +178,40 @@ actor NetworkManager {
 
     func allocateIPv6(for containerID: String, networkName: String = "bridge") -> String {
         if let existing = allocatedIPv6s[containerID] { return existing }
-        // Générer une adresse IPv6 unique dans fd00:c0c4::/48
-        // abs() crash sur Int.min — on cast via bitPattern pour être safe
-        let hash = UInt(bitPattern: containerID.hashValue)
-        let suffix = UInt16(truncatingIfNeeded: hash) & 0xFFFF
-        let ipv6 = "\(Self.ipv6Prefix)\(String(format: "%x", suffix))"
-        allocatedIPv6s[containerID] = ipv6
-        return ipv6
+
+        // Derive the suffix from a *stable* hash of the container id.
+        //
+        // This used to use `containerID.hashValue`, which Swift seeds per
+        // process — so a container's IPv6 changed every time cockerd
+        // restarted, while `container.ipv6` in state.json kept the old value.
+        // Unlike `container.ip`, nothing later corrects it, so `inspect`
+        // reported an address the container did not have.
+        //
+        // FNV-1a: tiny, dependency-free, and identical across runs.
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in containerID.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x0000_0100_0000_01B3
+        }
+
+        // Probe for a free suffix instead of trusting a 16-bit hash to be
+        // unique — birthday collisions start around 300 containers, and a
+        // collision here means two containers share an address.
+        let taken = Set(allocatedIPv6s.values)
+        var suffix = UInt16(truncatingIfNeeded: hash)
+        for _ in 0..<UInt16.max {
+            if suffix == 0 { suffix = 1 }  // ::0 is the subnet itself
+            let candidate = "\(Self.ipv6Prefix)\(String(format: "%x", suffix))"
+            if !taken.contains(candidate) {
+                allocatedIPv6s[containerID] = candidate
+                return candidate
+            }
+            suffix = suffix &+ 1
+        }
+        // 65k containers on one host is not a case worth handling gracefully.
+        let fallback = "\(Self.ipv6Prefix)\(String(format: "%x", suffix))"
+        allocatedIPv6s[containerID] = fallback
+        return fallback
     }
 
     // MARK: - Port forwarding
