@@ -651,8 +651,10 @@ public struct UpdateRequest: Codable, Sendable {
 // MARK: - Version
 
 public enum CockerVersion {
-    // Bumped manually with each tag. TODO : drive from a Version.generated.swift
-    // produced by the release workflow so this can't drift again.
+    // Both are rewritten by scripts/bump-version.sh, which release.yml then
+    // re-validates against the tag. `buildTime` used to be hand-maintained
+    // alongside an automated `version` and had already drifted: 0.7.13.26
+    // shipped claiming a build date seven weeks older than the release.
     public static let version = "0.7.13.26"
     public static let apiVersion = "1.0"
     public static let buildTime = "2026-06-13"

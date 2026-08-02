@@ -1755,18 +1755,37 @@ private extension Container {
 /// Buffer thread-safe pour accumuler la sortie d'une VM ephémère.
 /// Le readabilityHandler de Pipe tourne sur une queue dédiée non-actor.
 final class OutputBuffer: @unchecked Sendable {
+    /// Keep at most this much, newest-last. A build VM's console is fed
+    /// straight into here for the whole build, and `append` had no cap at
+    /// all — one chatty `RUN` (npm, pip or apt with progress bars, or an
+    /// accidental `yes`) grew cockerd's resident memory without limit.
+    ///
+    /// 4 MiB is far more than any diagnostic needs and small enough that a
+    /// runaway command costs nothing. What matters on a failure is the tail,
+    /// so that is what survives.
+    static let capacity = 4 * 1024 * 1024
+
     private var data = Data()
+    private var dropped = 0
     private let lock = NSLock()
 
     func append(_ chunk: Data) {
         lock.lock()
         data.append(chunk)
+        if data.count > Self.capacity {
+            let excess = data.count - Self.capacity
+            data.removeFirst(excess)
+            dropped += excess
+        }
         lock.unlock()
     }
 
     func text() -> String {
         lock.lock()
         defer { lock.unlock() }
-        return String(data: data, encoding: .utf8) ?? ""
+        let body = String(data: data, encoding: .utf8) ?? ""
+        guard dropped > 0 else { return body }
+        // Say so rather than presenting a truncated head as the whole output.
+        return "[… \(dropped / 1024) KiB of earlier output dropped …]\n" + body
     }
 }

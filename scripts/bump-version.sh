@@ -60,6 +60,16 @@ tmp="$(mktemp)"
 sed -E "s|(public static let version = )\"[^\"]+\"|\1\"${new_version}\"|" "$protocol_file" > "$tmp"
 mv "$tmp" "$protocol_file"
 
+# 2b. CockerVersion.buildTime, same file. It was bumped by hand and had
+# already drifted — 0.7.13.26 shipped claiming a build time seven weeks
+# older than the release, so `cocker version` misreported it. Anything
+# maintained by hand alongside something automated drifts eventually;
+# this is the automation.
+build_date="$(date -u +%Y-%m-%d)"
+tmp="$(mktemp)"
+sed -E "s|(public static let buildTime = )\"[^\"]+\"|\1\"${build_date}\"|" "$protocol_file" > "$tmp"
+mv "$tmp" "$protocol_file"
+
 # 3. Formula/cocker.rb : three substitutions on a single file.
 #  a) version "X.Y.Z"
 #  b) root_url "...releases/download/vX.Y.Z"
@@ -123,7 +133,7 @@ fi
 echo ""
 echo "Bumped cocker → ${new_version}"
 echo "  /VERSION                                  →  ${new_version}"
-echo "  Sources/CockerCore/IPC/Protocol.swift     →  version = \"${new_version}\""
+echo "  Sources/CockerCore/IPC/Protocol.swift     →  version = \"${new_version}\", buildTime = \"${build_date}\""
 echo "  Formula/cocker.rb                         →  version + root_url + REPLACE_BOTTLE_SHA256_ALL placeholder"
 echo ""
 echo "Next steps :"
