@@ -140,6 +140,14 @@ extern int privileged_spec;
 /// container child instead so STOPSIGNAL Dockerfiles work.
 extern int stop_signal_spec;
 
+/* v6 spec : `cocker run -it`. When set, init gives the container's main
+ * process the console as a controlling terminal so isatty() is true and the
+ * terminal discipline (line editing, ^C → SIGINT) works. Geometry is 0 when
+ * the host didn't say. */
+extern int tty_spec;
+extern int tty_rows_spec;
+extern int tty_cols_spec;
+
 /* MARK: - etc_overlay.c */
 
 /* Bind-mount a tmpfs copy of /etc over the virtiofs /etc to work around
