@@ -269,7 +269,9 @@ struct ComposeAdvancedTests {
         let b = f.services["api"]?.build
         #expect(b?.context == "./api")
         #expect(b?.dockerfile == "Dockerfile.dev")
-        #expect(b?.args?["FOO"] == "bar")
+        // `args` is now a map-or-list spec (compose accepts both); read it
+        // through the normalising accessor.
+        #expect(b?.args?.dictionary["FOO"] == "bar")
     }
 
     @Test func healthcheckTestAsArray() throws {

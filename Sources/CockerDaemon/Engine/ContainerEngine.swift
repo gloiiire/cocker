@@ -211,9 +211,13 @@ final class ContainerEngine {
         //       ENTRYPOINT + args
         //   - if there's no ENTRYPOINT, the final argv is just args (which
         //     defaults to the image's CMD if the user passed none)
+        //   - an explicit `entrypoint:` / `Entrypoint` replaces the image's
+        //     (and, per Docker, an empty one clears it entirely)
         let imageInfo = try? await images.find(config.image)
         var resolvedCommand = config.command
-        if let entrypoint = imageInfo?.entrypoint, !entrypoint.isEmpty {
+        if let override = config.entrypoint {
+            resolvedCommand = override + resolvedCommand
+        } else if let entrypoint = imageInfo?.entrypoint, !entrypoint.isEmpty {
             // User args replace CMD ; entrypoint is always prepended.
             let cmdPart = resolvedCommand.isEmpty ? (imageInfo?.cmd ?? []) : resolvedCommand
             resolvedCommand = entrypoint + cmdPart

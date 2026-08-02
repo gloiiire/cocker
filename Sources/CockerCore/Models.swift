@@ -265,7 +265,7 @@ public enum ContainerStatus: String, Codable, Sendable {
     public var description: String { rawValue }
 }
 
-public struct PortMapping: Codable, Sendable, CustomStringConvertible {
+public struct PortMapping: Codable, Sendable, Equatable, CustomStringConvertible {
     public let hostPort: UInt16
     public let containerPort: UInt16
     public let proto: TransportProto
@@ -279,16 +279,63 @@ public struct PortMapping: Codable, Sendable, CustomStringConvertible {
     public var description: String { "0.0.0.0:\(hostPort)->\(containerPort)/\(proto.rawValue)" }
 
     public static func parse(_ s: String) throws -> PortMapping {
-        let parts = s.split(separator: ":", maxSplits: 1)
-        if parts.count == 2 {
-            guard let host = UInt16(parts[0]), let container = UInt16(parts[1]) else {
+        guard let first = try parseSpec(s).first else {
+            throw CockerError.invalidPortMapping(s)
+        }
+        return first
+    }
+
+    /// Parse one `ports:` entry into every mapping it describes.
+    ///
+    /// Only `HOST:CONTAINER` and a bare `PORT` used to parse. Everything else
+    /// — `8080:80/udp`, `127.0.0.1:8080:80`, `8000-8010:8000-8010` — threw,
+    /// and compose `compactMap`'d the throw away, so the port was simply
+    /// never published and nothing said so.
+    ///
+    /// A host IP is accepted and ignored: cocker's forwarder binds all
+    /// interfaces, and dropping the whole mapping over an unsupported bind
+    /// address is worse than binding it more widely than asked.
+    public static func parseSpec(_ s: String) throws -> [PortMapping] {
+        var body = s
+        var proto: TransportProto = .tcp
+        if let slash = body.lastIndex(of: "/") {
+            let suffix = String(body[body.index(after: slash)...]).lowercased()
+            guard let parsed = TransportProto(rawValue: suffix) else {
                 throw CockerError.invalidPortMapping(s)
             }
-            return PortMapping(hostPort: host, containerPort: container)
-        } else if let port = UInt16(s) {
-            return PortMapping(hostPort: port, containerPort: port)
+            proto = parsed
+            body = String(body[..<slash])
         }
-        throw CockerError.invalidPortMapping(s)
+
+        var fields = body.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        // `IP:HOST:CONTAINER` — drop the bind address (see above).
+        if fields.count == 3 { fields.removeFirst() }
+        guard fields.count == 1 || fields.count == 2 else {
+            throw CockerError.invalidPortMapping(s)
+        }
+
+        let hostRange = try portRange(fields[0], in: s)
+        let containerRange = try portRange(fields.count == 2 ? fields[1] : fields[0], in: s)
+        guard hostRange.count == containerRange.count else {
+            throw CockerError.invalidPortMapping(s)
+        }
+        return zip(hostRange, containerRange).map {
+            PortMapping(hostPort: $0, containerPort: $1, proto: proto)
+        }
+    }
+
+    /// `8080` → [8080] ; `8000-8010` → [8000…8010].
+    private static func portRange(_ field: String, in spec: String) throws -> [UInt16] {
+        if let dash = field.firstIndex(of: "-") {
+            guard let lo = UInt16(field[..<dash]),
+                  let hi = UInt16(field[field.index(after: dash)...]),
+                  lo <= hi else {
+                throw CockerError.invalidPortMapping(spec)
+            }
+            return Array(lo...hi)
+        }
+        guard let port = UInt16(field) else { throw CockerError.invalidPortMapping(spec) }
+        return [port]
     }
 }
 
@@ -482,6 +529,11 @@ public struct VolumeInfo: Codable, Sendable, Identifiable {
 public struct RunConfig: Codable, Sendable {
     public var image: String
     public var command: [String]
+    /// Overrides the image's ENTRYPOINT (compose `entrypoint:`, Docker API
+    /// `Entrypoint`). nil means "keep the image's". There was no field at
+    /// all before, so both paths decoded the value and discarded it and an
+    /// ENTRYPOINT override was simply impossible.
+    public var entrypoint: [String]?
     public var name: String?
     public var detach: Bool
     public var interactive: Bool
@@ -533,6 +585,7 @@ public struct RunConfig: Codable, Sendable {
     public init(image: String, command: [String] = []) {
         self.image = image
         self.command = command
+        self.entrypoint = nil
         self.name = nil
         self.detach = false
         self.interactive = false

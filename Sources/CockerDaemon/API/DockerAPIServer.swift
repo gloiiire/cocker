@@ -599,6 +599,9 @@ final class DockerAPIServer {
         var config = RunConfig(image: createReq.Image)
         config.name = name
         config.command = createReq.Cmd?.array ?? []
+        // Decoded and dropped before — `docker run --entrypoint` and compose
+        // `entrypoint:` over the API both had no effect.
+        config.entrypoint = createReq.Entrypoint?.array
         config.hostname = createReq.Hostname
         config.workdir = createReq.WorkingDir
         config.tty = createReq.Tty ?? false

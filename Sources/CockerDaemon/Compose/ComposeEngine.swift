@@ -111,10 +111,57 @@ struct ComposeFile: Decodable {
         var profiles: [String]?
     }
 
+    /// `build:` accepts either a bare context path (`build: ./frontend`) or a
+    /// mapping. Only the mapping was modelled, so the short form — which is
+    /// what most compose files use — made the YAML decode fail and took the
+    /// *entire file* down with `invalidComposeFile`.
     struct ComposeBuild: Decodable {
         var context: String?
         var dockerfile: String?
-        var args: [String: String]?
+        var args: ArgsSpec?
+        /// Multi-stage target. Silently absent before, so a compose file
+        /// naming a stage built the last one instead.
+        var target: String?
+
+        init(from decoder: Decoder) throws {
+            if let shorthand = try? decoder.singleValueContainer().decode(String.self) {
+                self.context = shorthand
+                return
+            }
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.context = try c.decodeIfPresent(String.self, forKey: .context)
+            self.dockerfile = try c.decodeIfPresent(String.self, forKey: .dockerfile)
+            self.args = try c.decodeIfPresent(ArgsSpec.self, forKey: .args)
+            self.target = try c.decodeIfPresent(String.self, forKey: .target)
+        }
+
+        enum CodingKeys: String, CodingKey { case context, dockerfile, args, target }
+
+        /// `args:` is a map or a `KEY=value` list, like `environment:`.
+        /// Only the map form decoded, so the list form rejected the file.
+        enum ArgsSpec: Decodable {
+            case map([String: String])
+            case list([String])
+
+            init(from decoder: Decoder) throws {
+                if let m = try? [String: String](from: decoder) { self = .map(m) }
+                else { self = .list(try [String](from: decoder)) }
+            }
+
+            var dictionary: [String: String] {
+                switch self {
+                case .map(let m): return m
+                case .list(let l):
+                    var out: [String: String] = [:]
+                    for entry in l {
+                        let parts = entry.split(separator: "=", maxSplits: 1)
+                        if parts.count == 2 { out[String(parts[0])] = String(parts[1]) }
+                        else { out[entry] = "" }
+                    }
+                    return out
+                }
+            }
+        }
     }
 
     struct ComposeNetwork: Decodable {
@@ -346,7 +393,10 @@ actor ComposeEngine {
             progressHandler(StreamEvent(stream: .status, data: "Building \(serviceName)...\n"))
             var bc = BuildConfig(contextPath: absContext, tag: tag)
             bc.dockerfile = buildSpec.dockerfile ?? "Dockerfile"
-            bc.buildArgs = buildSpec.args ?? [:]
+            bc.buildArgs = buildSpec.args?.dictionary ?? [:]
+            // `target:` was never carried through, so a compose file naming a
+            // multi-stage target silently built the final stage instead.
+            bc.target = buildSpec.target
             _ = try await containerEngine.images.build(config: bc, vmRuntime: containerEngine.vmRuntime) { event in
                 progressHandler(event)
             }
@@ -490,7 +540,8 @@ actor ComposeEngine {
             progressHandler(StreamEvent(stream: .status, data: "Building \(serviceName)...\n"))
             var config = BuildConfig(contextPath: context, tag: tag)
             config.dockerfile = dockerfile
-            config.buildArgs = buildSpec.args ?? [:]
+            config.buildArgs = buildSpec.args?.dictionary ?? [:]
+            config.target = buildSpec.target
             config.noCache = request.noCache
             _ = try await containerEngine.images.build(config: config, vmRuntime: containerEngine.vmRuntime) { event in
                 progressHandler(event)
@@ -761,7 +812,24 @@ actor ComposeEngine {
         config.hostname = service.hostname ?? serviceName
 
         if let cmd = service.command {
-            config.command = cmd.array
+            // `command: "npm run dev"` (string form) is shell form in compose,
+            // exactly like Dockerfile CMD. Passing it through as a single
+            // argv element made the guest try to exec a file literally named
+            // "npm run dev" — ENOENT, every time. The array form is exec form
+            // and passes through verbatim.
+            switch cmd {
+            case .string(let line): config.command = ["/bin/sh", "-c", line]
+            case .array(let argv): config.command = argv
+            }
+        }
+
+        // `entrypoint:` was decoded and then never read, so overriding an
+        // image's ENTRYPOINT through compose was impossible.
+        if let entrypoint = service.entrypoint {
+            switch entrypoint {
+            case .string(let line): config.entrypoint = ["/bin/sh", "-c", line]
+            case .array(let argv): config.entrypoint = argv
+            }
         }
 
         // env_file is the lowest-priority layer ; `environment:` overrides it.
@@ -781,7 +849,17 @@ actor ComposeEngine {
         }
 
         // Ports
-        config.ports = (service.ports ?? []).compactMap { try? PortMapping.parse($0) }
+        // `compactMap { try? }` swallowed every entry the old parser couldn't
+        // handle — ranges, udp, a host bind address — so the port was never
+        // published and nothing said so. A port the user asked for and didn't
+        // get is worth failing the service over.
+        config.ports = try (service.ports ?? []).flatMap { spec -> [PortMapping] in
+            do { return try PortMapping.parseSpec(spec) }
+            catch {
+                throw CockerError.invalidComposeFile(
+                    "service '\(serviceName)': cannot parse port '\(spec)'")
+            }
+        }
 
         // Volumes
         let composeDir = (composePath as NSString).deletingLastPathComponent
