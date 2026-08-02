@@ -325,8 +325,8 @@ struct ComposeAdvancedTests {
               - "data:/var/lib"
         """
         let f = try parse(yaml)
-        #expect(f.services["a"]?.ports == ["8080:80", "443:443"])
-        #expect(f.services["a"]?.volumes == ["/host:/guest", "data:/var/lib"])
+        #expect(f.services["a"]?.ports?.specs == ["8080:80", "443:443"])
+        #expect(f.services["a"]?.volumes?.specs == ["/host:/guest", "data:/var/lib"])
     }
 
     @Test func labelsAndLabelsLikeMaps() throws {
@@ -361,7 +361,7 @@ struct ComposeAdvancedTests {
         """
         let s = try parse(single)
         let m = try parse(multi)
-        #expect(s.services["a"]?.env_file?.array == [".env"])
-        #expect(m.services["a"]?.env_file?.array == [".env", ".env.local"])
+        #expect(s.services["a"]?.env_file?.paths == [".env"])
+        #expect(m.services["a"]?.env_file?.paths == [".env", ".env.local"])
     }
 }

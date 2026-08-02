@@ -90,8 +90,8 @@ struct ComposeFile: Decodable {
         var command: StringOrArray?
         var entrypoint: StringOrArray?
         var environment: EnvSpec?
-        var ports: [String]?
-        var volumes: [String]?
+        var ports: PortsSpec?
+        var volumes: VolumesSpec?
         var networks: NetworksSpec?
         var depends_on: DependsOnSpec?
         var restart: String?
@@ -106,9 +106,146 @@ struct ComposeFile: Decodable {
         var healthcheck: ComposeHealthcheck?
         var deploy: ComposeDeploy?
         var container_name: String?
-        var env_file: StringOrArray?
+        var env_file: EnvFileSpec?
         var extra_hosts: [String]?
         var profiles: [String]?
+    }
+
+    /// `ports:` entries are either the short string form (`"8080:80/udp"`)
+    /// or a mapping. Only `[String]` was modelled, so a file using the long
+    /// syntax — which is what `docker compose config` emits — was rejected
+    /// outright. Both normalise to the short form the rest of the code reads.
+    struct PortsSpec: Decodable {
+        var specs: [String]
+
+        struct LongForm: Decodable {
+            var target: Int?
+            var published: PublishedValue?
+            var protocolName: String?
+            var host_ip: String?
+
+            enum CodingKeys: String, CodingKey {
+                case target, published, host_ip
+                case protocolName = "protocol"
+            }
+
+            /// `published:` is a number in the spec but quoted by plenty of
+            /// generators, and may be a range.
+            enum PublishedValue: Decodable {
+                case int(Int), text(String)
+                init(from decoder: Decoder) throws {
+                    if let i = try? decoder.singleValueContainer().decode(Int.self) { self = .int(i) }
+                    else { self = .text(try decoder.singleValueContainer().decode(String.self)) }
+                }
+                var string: String {
+                    switch self {
+                    case .int(let i): return String(i)
+                    case .text(let t): return t
+                    }
+                }
+            }
+
+            var shortForm: String? {
+                guard let target else { return nil }
+                var out = ""
+                if let host_ip, !host_ip.isEmpty { out += "\(host_ip):" }
+                if let published { out += "\(published.string):" }
+                out += String(target)
+                if let proto = protocolName?.lowercased(), proto != "tcp" { out += "/\(proto)" }
+                return out
+            }
+        }
+
+        init(from decoder: Decoder) throws {
+            var container = try decoder.unkeyedContainer()
+            var collected: [String] = []
+            while !container.isAtEnd {
+                if let short = try? container.decode(String.self) {
+                    collected.append(short)
+                } else if let long = try? container.decode(LongForm.self), let short = long.shortForm {
+                    collected.append(short)
+                } else if let number = try? container.decode(Int.self) {
+                    // `- 8080` unquoted.
+                    collected.append(String(number))
+                } else {
+                    _ = try? container.decode(AnyIgnored.self)
+                }
+            }
+            self.specs = collected
+        }
+    }
+
+    /// Same story for `volumes:` — long syntax rejected the whole file, so
+    /// `type: tmpfs` and `read_only: true` were unreachable.
+    struct VolumesSpec: Decodable {
+        var specs: [String]
+
+        struct LongForm: Decodable {
+            var type: String?
+            var source: String?
+            var target: String?
+            var read_only: Bool?
+
+            var shortForm: String? {
+                guard let target else { return nil }
+                // A tmpfs mount has no source; the short form can't express
+                // it, so it's dropped here rather than mounted as a bind of
+                // an empty path. Callers see it missing, not wrong.
+                guard let source, !source.isEmpty else { return nil }
+                return read_only == true ? "\(source):\(target):ro" : "\(source):\(target)"
+            }
+        }
+
+        init(from decoder: Decoder) throws {
+            var container = try decoder.unkeyedContainer()
+            var collected: [String] = []
+            while !container.isAtEnd {
+                if let short = try? container.decode(String.self) {
+                    collected.append(short)
+                } else if let long = try? container.decode(LongForm.self), let short = long.shortForm {
+                    collected.append(short)
+                } else {
+                    _ = try? container.decode(AnyIgnored.self)
+                }
+            }
+            self.specs = collected
+        }
+    }
+
+    /// `env_file:` accepts a string, a list of strings, or a list of
+    /// `{path:, required:}` mappings. Only the first two decoded.
+    struct EnvFileSpec: Decodable {
+        var paths: [String]
+
+        struct LongForm: Decodable {
+            var path: String
+            var required: Bool?
+        }
+
+        init(from decoder: Decoder) throws {
+            if let single = try? decoder.singleValueContainer().decode(String.self) {
+                self.paths = [single]
+                return
+            }
+            var container = try decoder.unkeyedContainer()
+            var collected: [String] = []
+            while !container.isAtEnd {
+                if let short = try? container.decode(String.self) {
+                    collected.append(short)
+                } else if let long = try? container.decode(LongForm.self) {
+                    collected.append(long.path)
+                } else {
+                    _ = try? container.decode(AnyIgnored.self)
+                }
+            }
+            self.paths = collected
+        }
+    }
+
+    /// Placeholder that consumes one unkeyed element we can't interpret, so
+    /// the decoder advances instead of spinning.
+    struct AnyIgnored: Decodable {
+        init(from decoder: Decoder) throws { _ = try? decoder.singleValueContainer() }
     }
 
     /// `build:` accepts either a bare context path (`build: ./frontend`) or a
@@ -836,7 +973,7 @@ actor ComposeEngine {
         // Paths are relative to the compose file's directory.
         if let envFile = service.env_file {
             let baseDir = URL(fileURLWithPath: composePath).deletingLastPathComponent()
-            for p in envFile.array {
+            for p in envFile.paths {
                 let fullPath = p.hasPrefix("/") ? p : baseDir.appendingPathComponent(p).path
                 for (k, v) in Self.parseEnvFile(at: fullPath) {
                     config.env[k] = v
@@ -853,7 +990,7 @@ actor ComposeEngine {
         // handle — ranges, udp, a host bind address — so the port was never
         // published and nothing said so. A port the user asked for and didn't
         // get is worth failing the service over.
-        config.ports = try (service.ports ?? []).flatMap { spec -> [PortMapping] in
+        config.ports = try (service.ports?.specs ?? []).flatMap { spec -> [PortMapping] in
             do { return try PortMapping.parseSpec(spec) }
             catch {
                 throw CockerError.invalidComposeFile(
@@ -863,7 +1000,7 @@ actor ComposeEngine {
 
         // Volumes
         let composeDir = (composePath as NSString).deletingLastPathComponent
-        config.volumes = (service.volumes ?? []).compactMap { s in
+        config.volumes = (service.volumes?.specs ?? []).compactMap { s in
             let parts = s.split(separator: ":", maxSplits: 2).map(String.init)
             // Single-part volume entry like `- /app/node_modules` is a
             // Docker Compose ANONYMOUS volume — a per-container managed

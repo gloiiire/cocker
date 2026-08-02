@@ -190,3 +190,125 @@ struct ComposeCompatibilityTests {
         #expect(file.services["b"]?.entrypoint?.array == ["/bin/sh", "-c", "echo hi"])
     }
 }
+
+/// The long syntax `docker compose config` emits, and that plenty of
+/// hand-written files use. None of it was modelled, so each shape rejected
+/// the entire compose file.
+@Suite("Compose long syntax")
+struct ComposeLongSyntaxTests {
+
+    private func decode(_ yaml: String) throws -> ComposeFile {
+        try YAMLDecoder().decode(ComposeFile.self, from: yaml)
+    }
+
+    @Test func acceptsLongFormPorts() throws {
+        let file = try decode("""
+        services:
+          web:
+            image: nginx
+            ports:
+              - target: 80
+                published: 8080
+                protocol: tcp
+              - target: 53
+                published: 5353
+                protocol: udp
+        """)
+        #expect(file.services["web"]?.ports?.specs == ["8080:80", "5353:53/udp"])
+    }
+
+    @Test func longFormPortsCarryAHostIP() throws {
+        let file = try decode("""
+        services:
+          web:
+            image: nginx
+            ports:
+              - target: 80
+                published: 8080
+                host_ip: 127.0.0.1
+        """)
+        #expect(file.services["web"]?.ports?.specs == ["127.0.0.1:8080:80"])
+    }
+
+    /// Generators quote `published:` about as often as they don't.
+    @Test func acceptsAQuotedPublishedPort() throws {
+        let file = try decode("""
+        services:
+          web:
+            image: nginx
+            ports:
+              - target: 80
+                published: "8080"
+        """)
+        #expect(file.services["web"]?.ports?.specs == ["8080:80"])
+    }
+
+    @Test func shortAndLongPortFormsMix() throws {
+        let file = try decode("""
+        services:
+          web:
+            image: nginx
+            ports:
+              - "3000:3000"
+              - target: 80
+                published: 8080
+        """)
+        #expect(file.services["web"]?.ports?.specs == ["3000:3000", "8080:80"])
+    }
+
+    @Test func acceptsLongFormVolumes() throws {
+        let file = try decode("""
+        services:
+          db:
+            image: postgres
+            volumes:
+              - type: volume
+                source: pgdata
+                target: /var/lib/postgresql/data
+              - type: bind
+                source: ./conf
+                target: /etc/conf
+                read_only: true
+        """)
+        #expect(file.services["db"]?.volumes?.specs
+                == ["pgdata:/var/lib/postgresql/data", "./conf:/etc/conf:ro"])
+    }
+
+    /// A tmpfs mount has no source and the short form can't express one, so
+    /// it's dropped rather than mounted as a bind of an empty path — missing
+    /// beats wrong.
+    @Test func dropsSourcelessMountsRatherThanMisMountingThem() throws {
+        let file = try decode("""
+        services:
+          app:
+            image: x
+            volumes:
+              - type: tmpfs
+                target: /tmp/scratch
+        """)
+        #expect(file.services["app"]?.volumes?.specs.isEmpty == true)
+    }
+
+    @Test func acceptsLongFormEnvFile() throws {
+        let file = try decode("""
+        services:
+          web:
+            image: x
+            env_file:
+              - path: .env
+                required: false
+              - .env.local
+        """)
+        #expect(file.services["web"]?.env_file?.paths == [".env", ".env.local"])
+    }
+
+    @Test func envFileStillAcceptsABareString() throws {
+        let file = try decode("""
+        services:
+          web:
+            image: x
+            env_file: .env
+        """)
+        #expect(file.services["web"]?.env_file?.paths == [".env"])
+    }
+}
