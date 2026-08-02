@@ -88,7 +88,7 @@ failed, or losing data. Shipped in #357.
 | | |
 |---|---|
 | ⬜ | **Decide the punt.** `ROADMAP.md` said to cut `swarm`/`stack`/`service`/`node` in v0.5 and it never happened — 23 commands still ship, still lead the help screen, and some invent data (`node ls` returns a fresh UUID per call). This is a breaking change for anyone scripting them, so it needs a decision, not a patch |
-| ⬜ | README: the tagline still never adopted the iCloud positioning, and iCloud — the actual differentiator — first appears at line 427 of 677. (The broken `cocker completion` lines, the hardcoded test count and the contradictory API version are fixed.) |
+| ✅ | README leads with the iCloud positioning, documents Dev Containers / JetBrains, and states the `apple/container` split |
 | ✅ | `docs/man/` regenerated (145 → 159 pages) and `bump-version.sh` keeps it current |
 | ⬜ | **Decide the `*.md` policy.** `.gitignore` deliberately keeps every markdown file out of the repo except `README.md` and named spec docs, so there is no `CHANGELOG.md`, `CONTRIBUTING.md` or `SECURITY.md` by choice rather than by oversight. A 1.0 arguably needs at least a changelog — a user currently cannot tell what changed between `0.7.13.19` and `0.7.13.26` — and a security file, since cocker installs a root LaunchDaemon and stores registry passwords in plaintext at `~/.cocker/credentials.json`. Either add exceptions for those three or write down why they live outside the repo |
 | ✅ | `cockerd` and the `daemon` command group now use the charter §6 block, shared with the CLI rather than copied. The 125/126/127 taxonomy reaches scripts — it was flattened both by the IPC layer dropping the error kind and by commands throwing a blanket 1. (`exit(64)` stays: it's a documented EX_USAGE for schema-too-new, deliberately preserved.) |
@@ -101,7 +101,7 @@ failed, or losing data. Shipped in #357.
 | ✅ | **Releases gated on tests.** `build-and-sign` now `needs: test` — `swift test` plus a cocker-init cross-compile and its C test, which `swift test` never covered |
 | 🚧 | e2e coverage. Added `11-exit-codes` and `12-exec-after-start`; suite is 12/12 green on real hardware. Still uncovered: registry push/pull, block volumes, `compose down`, `logs -f`, volume/network lifecycle |
 | ✅ | Coverage reports two numbers — the gated scope and all of `Sources/` — and says which is which |
-| ⬜ | This document's commitments written into the README, and a deprecation policy |
+| ✅ | The four commitments, the 1.x compatibility promise and the deprecation rule are in the README |
 
 ---
 

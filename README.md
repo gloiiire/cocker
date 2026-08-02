@@ -1,8 +1,46 @@
 # Cocker
 
-A Docker-compatible container engine for Apple Silicon, powered by Apple Virtualization.framework.
+**Docker-compatible container engine for Apple Silicon, optimized for projects in iCloud Drive.**
 
-Cocker runs Linux containers natively on macOS using lightweight Apple VMs — no x86 emulation, no Rosetta, no Docker Desktop required.
+Cocker runs Linux containers natively on macOS using lightweight Apple VMs — no x86
+emulation, no Rosetta, no Docker Desktop required.
+
+## Why this one
+
+`apple/container` has more resources than this project ever will, and matching it
+feature-for-feature would waste both. Cocker owns three things it doesn't:
+
+- **Your project lives in iCloud Drive.** Builds stage and materialize dataless
+  files, and `compose watch` hot-reloads through FSEvents. Apple ignores this case;
+  lima and colima don't address it either. See [iCloud Drive projects](#icloud-drive-projects).
+- **Docker Engine API on a Unix socket.** `DOCKER_HOST=unix://~/.cocker/docker.sock`
+  makes `docker compose`, IDE plugins and CI runners work unmodified.
+- **Block-storage volumes.** postgres, mysql and redis crash on virtiofs — chown
+  EPERM, lost+found, FUSE inode inconsistency. Cocker mounts real block devices
+  (`VZVirtioBlockDevice`), so they just work.
+
+## What 1.0 promises
+
+Four commitments, stated in full in [`docs/ROADMAP-1.0.md`](docs/ROADMAP-1.0.md):
+
+1. **Cocker never reports success for something that failed.** Exit codes are real,
+   destructive operations refuse rather than guess, and a flag that can't be
+   honoured says so instead of being ignored.
+2. **A Docker client that works against Docker works against cocker, or fails
+   loudly.** An honest 501 is fine; a wrong-shaped answer to a well-formed request
+   is not.
+3. **Your data survives.** Named volumes are not silently unmounted, corrupted by
+   concurrent attach, deleted out from under a running container, or left dirty.
+4. **The documented surface is the real surface**, and the release that ships was
+   tested.
+
+For the whole 1.x line: **Docker Engine API floor v1.41**, CLI flag meanings stay
+stable (a flag may be added, or deprecated with a warning for a full minor cycle,
+never silently repurposed), and `~/.cocker/state.json` migrates forward — a 1.x
+daemon reads anything a 1.x daemon wrote. Downgrades are not supported.
+
+Versions are `MAJOR.MINOR.PATCH.BUILD`. The fourth segment is a re-release of the
+same intended content — a bottle refresh, a packaging fix — with no behaviour change.
 
 ## Features
 
@@ -533,6 +571,41 @@ export DOCKER_HOST=unix://$HOME/.cocker/docker.sock
 docker ps
 docker run --rm alpine echo hello
 ```
+
+### IDEs
+
+The same variable is all any Docker-aware editor needs — cocker's socket speaks the
+Engine API, so nothing is configured cocker-side.
+
+**VS Code Dev Containers.** Export the variable in the shell you launch the editor
+from, so the extension inherits it:
+
+```bash
+export DOCKER_HOST=unix://$HOME/.cocker/docker.sock
+code .
+```
+
+Then *Reopen in Container* as usual. `docker cp` (used to inject the VS Code server)
+and `docker attach` both work over the socket.
+
+**JetBrains.** *Settings → Build, Execution, Deployment → Docker → `+` → Unix socket*,
+and set the path to `~/.cocker/docker.sock`. The Services window, `Dockerfile` run
+configurations and Compose support all drive the same endpoint.
+
+Anything cocker doesn't implement answers **501** rather than guessing, so a feature
+gap surfaces as a clear error in the IDE instead of a wrong result.
+
+### Relationship with `apple/container`
+
+They solve different problems and compose well:
+
+| | |
+|---|---|
+| **`container machine`** | a persistent dev VM you ssh into and keep |
+| **cocker** | Docker-compatible container workflows — `run`, `compose`, an Engine API socket |
+
+Cocker depends on `apple/container` for its Linux kernel. There is no overlap in what
+they're for, and no reason to pick only one.
 
 ## MCP (Claude Desktop / agents)
 
