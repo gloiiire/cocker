@@ -295,9 +295,10 @@ struct NodeLsCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "ls", abstract: "List nodes in the swarm")
 
     mutating func run() async throws {
-        let host = ProcessInfo.processInfo.hostName
-        print("ID                                         HOSTNAME    STATUS    AVAILABILITY    MANAGER STATUS    ENGINE VERSION")
-        print("\(String(UUID().uuidString.prefix(20)))*   \(host)    Ready     Active          Leader            \(CockerVersion.version)")
+        // This printed a plausible node row with a *fresh UUID on every
+        // call*. A caller scripting against it got a different node id each
+        // time and no way to notice the table was invented.
+        throw CockerError.notImplemented("node ls")
     }
 }
 
@@ -308,11 +309,8 @@ struct NodeInspectCommand: AsyncParsableCommand {
     var nodes: [String]
 
     mutating func run() async throws {
-        let host = ProcessInfo.processInfo.hostName
-        print("ID: \(UUID().uuidString)")
-        print("Hostname: \(host)")
-        print("Status: Ready")
-        print("Role: Manager")
+        // Ignored its `nodes` argument entirely and printed a new random id.
+        throw CockerError.notImplemented("node inspect")
     }
 }
 
