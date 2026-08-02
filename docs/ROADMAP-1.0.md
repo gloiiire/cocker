@@ -79,7 +79,7 @@ failed, or losing data. Shipped in #357.
 | ✅ | `/volumes/*` no longer eaten by the API-version strip; `/networks/{id}` and `/volumes/{name}` no longer dead code; registry-qualified image names no longer 501 (#358) |
 | ✅ | Compose long syntax, `build:` shorthand, `entrypoint:`, shell-form `command:`, udp/range/host-IP ports (#358) |
 | ✅ | `/containers/{id}/archive` — Dev Containers can't inject the VS Code server without it |
-| 🚧 | **Interactive TTY** — attempted in #361 and **it does not work yet**. Verified on an M3 Max: `exec -t` alone works, plain `exec` and piped `exec -i` work, but as soon as the CLI's stdin side-channel is running the vsock connect either resets or never completes. The guest PTY, the initial window size and the `compose exec -i/-t` flags are all good; the host-side pump is the unsolved part |
+| ✅ | **Interactive TTY** — `exec -it` and `compose exec -it` work. Verified on an M3 Max: 5/5 interactive shell sessions, exit codes propagate through the shell (`exit 7` → 7), Ctrl-D reaches the container. Still missing: SIGWINCH mid-session, `run -it`, `attach` |
 | ⬜ | Hijacked raw streams on the API side, plus `/attach` and `/resize`. Today exec output is chunk-framed, so chunk headers land inside the stdcopy stream and corrupt it |
 | ⬜ | Multiple `-f` / `override.yml` merging, and `--profile` (compose parses profiles but nothing ever populates the active set) |
 
@@ -121,8 +121,6 @@ failed, or losing data. Shipped in #357.
 
 These are real and documented rather than fixed:
 
-- **No interactive TTY.** `exec -it` still cannot carry keystrokes. See #361
-  for what was tried and exactly where it fails.
 
 - **Healthchecks go through virtiofs files, not vsock.** Apple's
   `VZVirtioSocketDevice.connect()` doesn't reliably fire its callback when

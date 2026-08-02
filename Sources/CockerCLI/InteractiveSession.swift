@@ -117,6 +117,20 @@ final class InteractiveSession: @unchecked Sendable {
             var buffer = [UInt8](repeating: 0, count: 4096)
             while true {
                 if self?.isStopped ?? true { break }
+                // poll(2) before read(2), so the loop can notice `stop()`.
+                //
+                // A bare blocking read parks here forever when stdin is a pty
+                // the peer never closes — which is the normal case: a terminal
+                // stays open for as long as the session does. The exec would
+                // finish and the CLI would still hang, because this thread
+                // never came back to see that it should quit.
+                var pfd = pollfd(fd: fileno(stdin), events: Int16(POLLIN), revents: 0)
+                let ready = poll(&pfd, 1, 200)  // ms
+                if ready == 0 { continue }      // idle tick — re-check stopped
+                if ready < 0 {
+                    if errno == EINTR { continue }
+                    break
+                }
                 let n = read(fileno(stdin), &buffer, buffer.count)
                 if n < 0 && errno == EINTR { continue }
                 guard n > 0 else { break }  // EOF or error
