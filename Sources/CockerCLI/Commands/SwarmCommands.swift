@@ -21,30 +21,11 @@ struct SwarmInitCommand: AsyncParsableCommand {
     var advertiseAddr: String?
 
     mutating func run() async throws {
-        let addr = advertiseAddr ?? localHostIP()
-        let nodeID = UUID().uuidString
-        let swarmState: [String: String] = [
-            "mode": "active",
-            "nodeID": nodeID,
-            "advertiseAddr": addr,
-        ]
-        let url = URL(fileURLWithPath: "\(NSHomeDirectory())/.cocker/swarm.json")
-        try FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try JSONEncoder().encode(swarmState).write(to: url, options: .atomic)
-        let token = "SWMTKN-1-\(UUID().uuidString.prefix(20))"
-        if UX.TTY.current.isInteractive {
-            let trailing = "node " + UX.TTY.paint(String(nodeID.prefix(12)), .accent) + " (manager)"
-            print(UX.ActionLine(
-                icon: .success, name: "swarm",
-                status: "Initialized", trailing: trailing
-            ).render())
-            print("   " + UX.TTY.paint("worker  :", .dim) + " cocker swarm join --token \(token) \(addr):2377")
-        } else {
-            print(nodeID)
-        }
+        // This wrote a swarm.json and printed a join token — a plausible
+        // `SWMTKN-1-…` string that joins nothing, because there is no
+        // cluster and no second node to join it. Someone could paste that
+        // token into a real command and spend a while wondering why.
+        throw CockerError.notImplemented("swarm init")
     }
 }
 
@@ -55,14 +36,8 @@ struct SwarmLeaveCommand: AsyncParsableCommand {
     var force = false
 
     mutating func run() async throws {
-        try? FileManager.default.removeItem(atPath: "\(NSHomeDirectory())/.cocker/swarm.json")
-        if UX.TTY.current.isInteractive {
-            print(UX.ActionLine(
-                icon: .success, name: "swarm", status: "Left"
-            ).render())
-        } else {
-            print("swarm")
-        }
+        // Deleted swarm.json and always reported success, `--force` unread.
+        throw CockerError.notImplemented("swarm leave")
     }
 }
 
@@ -76,22 +51,8 @@ struct SwarmJoinCommand: AsyncParsableCommand {
     var addr: String
 
     mutating func run() async throws {
-        // Cocker is single-node. Joining a swarm as a worker is conceptually
-        // a no-op : the local node becomes its own one-element worker pool.
-        // The previous stub just printed plain text ; now we surface the
-        // single-node caveat as a Warning so it shows in scripts too.
-        if UX.TTY.current.isInteractive {
-            print(UX.ActionLine(
-                icon: .success, name: addr,
-                status: "Joined", trailing: "single-node mode"
-            ).render())
-        } else {
-            print(addr)
-        }
-        UX.Warning.emit(
-            "Cocker is single-node",
-            note: "this node joined as its own worker pool ; multi-node swarming is not supported"
-        )
+        // Reported "joined" and never used the address or the token.
+        throw CockerError.notImplemented("swarm join")
     }
 }
 
@@ -490,13 +451,9 @@ struct ServiceUpdateCommand: AsyncParsableCommand {
     var service: String
 
     mutating func run() async throws {
-        UX.printResult(.service, service, verb: .update)
-        if let r = replicas, r > 1 {
-            UX.Warning.emit(
-                "ignoring --replicas \(r)",
-                note: "Cocker is single-node ; only 1 replica is supported"
-            )
-        }
+        // Printed "updated" while `--image` was never read — the service
+        // kept running exactly what it was running before.
+        throw CockerError.notImplemented("service update")
     }
 }
 
@@ -510,15 +467,8 @@ struct ServiceScaleCommand: AsyncParsableCommand {
     var serviceScale: [String]  // "service=replicas"
 
     mutating func run() async throws {
-        for spec in serviceScale {
-            let parts = spec.split(separator: "=")
-            if parts.count == 2 {
-                UX.printResult(.service, String(parts[0]), verb: .scale)
-            }
-        }
-        UX.Warning.emit(
-            "scaling beyond 1 replica is a no-op",
-            note: "Cocker is single-node ; the swarm-mode contract requires a multi-node cluster"
-        )
+        // Printed a per-service line and then warned that anything past one
+        // replica is a no-op. Scaling is the entire point of the command.
+        throw CockerError.notImplemented("service scale")
     }
 }

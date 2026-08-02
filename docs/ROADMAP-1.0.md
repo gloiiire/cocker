@@ -87,7 +87,7 @@ failed, or losing data. Shipped in #357.
 
 | | |
 |---|---|
-| ⬜ | **Decide the punt.** `ROADMAP.md` said to cut `swarm`/`stack`/`service`/`node` in v0.5 and it never happened — 23 commands still ship, still lead the help screen, and some invent data (`node ls` returns a fresh UUID per call). This is a breaking change for anyone scripting them, so it needs a decision, not a patch |
+| ✅ | **The punt, decided.** Not a deletion. The family splits in two once you look: `stack deploy`/`ls`/`rm` and `service create`/`rm`/`ls` genuinely delegate to compose and to `run`, and deleting them would break working behaviour for no correctness gain. `swarm init`/`join`/`leave` and `service update`/`scale` were pure theatre — `swarm init` printed a plausible `SWMTKN-1-…` join token that joins nothing — and now fail with `notImplemented` (exit 126). All of them stay out of `-h`. The surface is truthful; a further deletion is a product choice, not a 1.0 blocker |
 | ✅ | README leads with the iCloud positioning, documents Dev Containers / JetBrains, and states the `apple/container` split |
 | ✅ | `docs/man/` regenerated (145 → 159 pages) and `bump-version.sh` keeps it current |
 | ✅ | **`*.md` policy decided.** `CHANGELOG.md` and `SECURITY.md` are exceptions in `.gitignore`, alongside the spec docs. A user needs to know what changed before upgrading, and cocker installs a root LaunchDaemon and stores registry passwords in cleartext — neither is discoverable from the README. `CONTRIBUTING.md` stays out: the promotion chain and branch rules live in the repo's own tooling |
