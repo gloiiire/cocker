@@ -1306,6 +1306,11 @@ final class VMRuntime: NSObject {
 
     // MARK: - Exec via vsock
 
+    /// How long to wait for the in-VM exec listener to accept a vsock
+    /// connection. Generous — a healthy guest answers immediately; this only
+    /// bounds the Virtualization.framework callback bug (see `exec`).
+    nonisolated static let execConnectTimeout: TimeInterval = 15
+
     func exec(containerID: String, command: [String], env: [String: String], tty: Bool = false,
               stdin: Data? = nil, workdir: String? = nil, user: String? = nil) async throws -> AsyncStream<StreamEvent> {
         guard let running = runningVMs[containerID] else {
@@ -1321,12 +1326,43 @@ final class VMRuntime: NSObject {
         return AsyncStream { continuation in
             let lifetime = ExecStreamLifetime()
             continuation.onTermination = { @Sendable _ in lifetime.cancel() }
+
+            // `connect(toPort:)`'s completion handler is not guaranteed to
+            // fire. Called repeatedly from a background async context,
+            // VZVirtioSocketDevice.connect() can simply never invoke its
+            // callback — the Virtualization.framework bug that also pushed
+            // healthchecks onto the virtiofs `health_poll` file protocol.
+            // Report + reproducer: docs/APPLE-FEEDBACK-VSOCK-CALLBACK.md.
+            //
+            // With nothing arming a deadline, the stream then never yielded
+            // and never finished, so `cocker exec` hung forever with no way
+            // out short of killing the client.
+            let settled = ResumeOnceBox()
+            DispatchQueue.global(qos: .userInitiated)
+                .asyncAfter(deadline: .now() + Self.execConnectTimeout) {
+                    guard settled.tryClaim() else { return }
+                    CockerLog.shared.error("exec", "vsock connect timed out for container=\(containerID)")
+                    continuation.yield(StreamEvent(stream: .error,
+                        data: "exec failed: the in-VM listener did not answer within "
+                            + "\(Int(Self.execConnectTimeout))s (try `cocker restart \(containerID)`)"))
+                    continuation.yield(StreamEvent(stream: .status, data: "exit:125"))
+                    continuation.finish()
+                }
+
             socketDevice.connect(toPort: 9000) { result in
+                guard settled.tryClaim() else {
+                    // The deadline already gave up and closed the stream.
+                    if case .success(let late) = result {
+                        _ = Darwin.shutdown(late.fileDescriptor, SHUT_RDWR)
+                    }
+                    return
+                }
                 switch result {
                 case .failure(let error):
                     CockerLog.shared.error("exec", "vsock connect failed: \(error)")
                     continuation.yield(StreamEvent(stream: .error,
                         data: "exec failed: \(error) — the in-VM listener may be unavailable (try `cocker restart \(containerID)`)"))
+                    continuation.yield(StreamEvent(stream: .status, data: "exit:125"))
                     continuation.finish()
                 case .success(let connection):
                     CockerLog.shared.debug("exec", "vsock connected fd=\(connection.fileDescriptor)")
@@ -1426,9 +1462,26 @@ final class VMRuntime: NSObject {
                             continuation.yield(StreamEvent(stream: .stdout, data: text))
                         }
 
+                        // Wake the blocking read periodically so this worker
+                        // can notice the consumer went away. An exec may
+                        // legitimately sit idle for hours (`tail -f`, a
+                        // shell), so this is a poll interval, not a deadline —
+                        // without it a guest that connects and never writes
+                        // parks a GCD worker for the process's lifetime, and
+                        // enough of those exhaust the global pool.
+                        var poll = timeval(tv_sec: 1, tv_usec: 0)
+                        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &poll,
+                                       socklen_t(MemoryLayout<timeval>.size))
+
                         while true {
                             let n = Darwin.read(fd, &chunk, chunk.count)
                             if n < 0, errno == EINTR { continue }
+                            if n < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+                                // Idle tick, not an error. Keep waiting unless
+                                // the consumer has gone.
+                                if lifetime.isCancelled { continuation.finish(); break }
+                                continue
+                            }
                             if n <= 0 { continuation.finish(); break }
                             buffer.append(contentsOf: chunk.prefix(n))
 
@@ -1504,6 +1557,11 @@ final class ExecStreamLifetime: @unchecked Sendable {
     func complete() {
         lock.lock(); fd = -1; lock.unlock()
     }
+
+    var isCancelled: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancelled
+    }
 }
 
 /// Single-shot resume guard. NSLock-backed so the timeout / connect
@@ -1517,109 +1575,6 @@ final class ResumeOnceBox: @unchecked Sendable {
         if claimed { return false }
         claimed = true
         return true
-    }
-}
-
-extension VMRuntime {
-    /// Synchronous one-shot exec for healthchecks. Connects to vsock 9000,
-    /// sends the request, reads until the exit marker or `timeout` seconds
-    /// elapse, and tears down the connection unconditionally. Returns the
-    /// child's exit code, or 1 on any transport/timeout failure.
-    ///
-    /// **Known limitation** (Apple Virtualization.framework bug) :
-    /// VZVirtioSocketDevice.connect() callback fails to fire when called
-    /// repeatedly from a background async context. The probe will reliably
-    /// hit its `timeout` and the container's healthStatus flips to
-    /// `.unhealthy`. Healthchecks therefore go through the virtiofs file
-    /// protocol in ContainerEngine.runHealthcheckOnce (slower but reliable).
-    ///
-    /// Full bug report + repro + tracking : `docs/APPLE-FEEDBACK-VSOCK-CALLBACK.md`.
-    /// Once Apple ships a fix, drop the virtiofs `health_poll` worker and
-    /// wire ContainerEngine to call this function instead.
-    func execProbe(containerID: String,
-                   argv: [String],
-                   timeout: TimeInterval) async -> Int32 {
-        guard let socketDevice = runningVMs[containerID]?.vm.socketDevices.first as? VZVirtioSocketDevice else {
-            CockerLog.shared.debug("probe", "no VM/socket for \(containerID)")
-            return 1
-        }
-        CockerLog.shared.debug("probe", "connecting vsock 9000 for \(containerID)")
-
-        return await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
-            let resumeBox = ResumeOnceBox()
-            func resumeOnce(_ code: Int32) {
-                if resumeBox.tryClaim() { continuation.resume(returning: code) }
-            }
-
-            // Hard deadline : if no callback fires within `timeout` we
-            // count it as failed and drop the probe on the floor.
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
-                resumeOnce(1)
-            }
-
-            socketDevice.connect(toPort: 9000) { result in
-                switch result {
-                case .failure(let err):
-                    CockerLog.shared.error("probe", "connect failed: \(err)")
-                    resumeOnce(1)
-                case .success(let connection):
-                    let fd = connection.fileDescriptor
-                    CockerLog.shared.debug("probe", "connected fd=\(fd)")
-                    struct Req: Codable { let cmd: [String]; let env: [String: String] }
-                    guard let data = try? JSONEncoder().encode(Req(cmd: argv, env: [:])) else {
-                        resumeOnce(1); return
-                    }
-                    // Box the connection in an @unchecked Sendable holder
-                    // so DispatchQueue.global().async (a @Sendable closure)
-                    // can keep it alive without tripping Swift 6's
-                    // strict-concurrency check. VZVirtioSocketConnection
-                    // isn't Sendable but we never touch it across threads —
-                    // the box just extends its retain count past the
-                    // socketDevice.connect callback's lifetime.
-                    let retained = ConnectionHolder(connection)
-
-                    DispatchQueue.global().async {
-                        _ = retained
-                        defer {
-                            // Best-effort fd cleanup. The connection retains
-                            // its end ; closing the dup'd fd via shutdown is
-                            // safe because we own the read side.
-                            shutdown(fd, SHUT_RDWR)
-                        }
-                        // Write request + NL.
-                        let wrote = data.withUnsafeBytes {
-                            Darwin.write(fd, $0.baseAddress!, $0.count)
-                        }
-                        var nl: UInt8 = 0x0A
-                        _ = Darwin.write(fd, &nl, 1)
-                        if wrote <= 0 { resumeOnce(1); return }
-
-                        var buffer = Data()
-                        var chunk = [UInt8](repeating: 0, count: 4096)
-                        let marker = Data("__COCKER_EXIT__".utf8)
-                        let readDeadline = Date().addingTimeInterval(timeout)
-                        while Date() < readDeadline {
-                            let n = Darwin.read(fd, &chunk, chunk.count)
-                            if n <= 0 { break }
-                            buffer.append(contentsOf: chunk.prefix(n))
-                            if let r = buffer.range(of: marker) {
-                                let tail = buffer[r.upperBound...]
-                                let codeBytes: Data
-                                if let nlIdx = tail.firstIndex(of: 0x0A) {
-                                    codeBytes = Data(tail[..<nlIdx])
-                                } else {
-                                    codeBytes = Data(tail)
-                                }
-                                let codeStr = String(data: codeBytes, encoding: .utf8) ?? ""
-                                resumeOnce(Int32(codeStr) ?? 1)
-                                return
-                            }
-                        }
-                        resumeOnce(1)
-                    }
-                }
-            }
-        }
     }
 }
 
