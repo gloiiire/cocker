@@ -19,7 +19,21 @@ import Testing
 /// `Tests/e2e/09-ctrl-c-during-build.sh`. What is worth pinning here is the
 /// one property that made the old code fail: the handler must keep running
 /// while the main queue is blocked.
-@Suite("Signal trap")
+/// `.serialized` because a signal disposition is **process-global**, not
+/// per-test. Four tests here install a trap — which sets SIGINT to
+/// `SIG_IGN` — and `uninstallRestoresDefaultDisposition` reads that same
+/// global back to prove uninstall restored it. Run in parallel, one
+/// sibling's `install()` lands between this test's `uninstall()` and its
+/// read, and it fails with `previousAddr → 1 != ignoreAddr → 1`: it is
+/// looking at the sibling's `SIG_IGN`, not its own leftovers.
+///
+/// Seen on CI on a commit whose pull-request run was green — the same
+/// code, the same runner image, a different interleaving. The comment at
+/// the bottom of this file already knew the suite ran in parallel and
+/// that a stray disposition change could kill the runner; nothing acted
+/// on it. Serializing costs a few hundred milliseconds and removes the
+/// whole class.
+@Suite("Signal trap", .serialized)
 struct SignalTrapTests {
 
     /// The regression, reproduced without any signal: block the main queue,
