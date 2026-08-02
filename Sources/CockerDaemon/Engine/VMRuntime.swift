@@ -1382,6 +1382,57 @@ final class VMRuntime: NSObject {
     /// bounds the Virtualization.framework callback bug (see `exec`).
     nonisolated static let execConnectTimeout: TimeInterval = 15
 
+    /// Delay between vsock connect attempts, and how many to make. The
+    /// overall `execConnectTimeout` still bounds the whole thing.
+    nonisolated static let execConnectRetryDelay: TimeInterval = 0.25
+    nonisolated static let execConnectRetries = 40
+
+    /// Connect to the in-VM exec listener, retrying a refused connection.
+    ///
+    /// Measured on an M3 Max: for a window after a container starts — even
+    /// though the guest has already logged "exec-listener ready on vsock port
+    /// 9000" — every connect is refused with ECONNRESET. **20 consecutive
+    /// plain `cocker exec` calls failed**, then the next one seconds later
+    /// succeeded and everything passed from then on. The guest's listener and
+    /// the host's view of the vsock device do not become usable at the same
+    /// instant, and a single attempt loses that race.
+    ///
+    /// Docker clients exec in loops — CI steps, healthchecks, dev scripts, and
+    /// cocker's own `top` — so one shot was never enough.
+    ///
+    /// **Must stay MainActor-isolated.** `VZVirtioSocketDevice.connectToPort:`
+    /// asserts it is called on the VM's own dispatch queue — the main queue
+    /// here — and traps with `dispatch_assert_queue_fail` otherwise. Retrying
+    /// from `DispatchQueue.global()` crashed cockerd outright.
+    ///
+    /// Worth noting for whoever revisits `docs/APPLE-FEEDBACK-VSOCK-CALLBACK.md`:
+    /// the symptom recorded there — the callback misbehaving "when called
+    /// repeatedly from a background async context" — is the same shape as this
+    /// queue requirement, so that report may describe our own violation rather
+    /// than a framework bug.
+    @MainActor
+    static func connectWithRetry(
+        _ device: VZVirtioSocketDevice,
+        settled: ResumeOnceBox,
+        attemptsRemaining: Int? = nil,
+        completion: @escaping @Sendable (Result<VZVirtioSocketConnection, Error>) -> Void
+    ) {
+        let remaining = attemptsRemaining ?? execConnectRetries
+        device.connect(toPort: 9000) { result in
+            if case .failure = result, remaining > 0, !settled.isClaimed {
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: UInt64(execConnectRetryDelay * 1_000_000_000))
+                    guard !settled.isClaimed else { return }
+                    connectWithRetry(device, settled: settled,
+                                     attemptsRemaining: remaining - 1,
+                                     completion: completion)
+                }
+                return
+            }
+            completion(result)
+        }
+    }
+
     func exec(containerID: String, command: [String], env: [String: String], tty: Bool = false,
               stdin: Data? = nil, workdir: String? = nil, user: String? = nil,
               sessionID: String? = nil, rows: Int? = nil, cols: Int? = nil) async throws -> AsyncStream<StreamEvent> {
@@ -1421,7 +1472,7 @@ final class VMRuntime: NSObject {
                     continuation.finish()
                 }
 
-            socketDevice.connect(toPort: 9000) { result in
+            Self.connectWithRetry(socketDevice, settled: settled) { result in
                 guard settled.tryClaim() else {
                     // The deadline already gave up and closed the stream.
                     if case .success(let late) = result {
@@ -1685,6 +1736,13 @@ final class ResumeOnceBox: @unchecked Sendable {
         if claimed { return false }
         claimed = true
         return true
+    }
+
+    /// Lets the retry loop stop once the deadline has already closed the
+    /// stream, instead of retrying behind a dead consumer.
+    var isClaimed: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return claimed
     }
 }
 
