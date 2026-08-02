@@ -244,6 +244,14 @@ final class DaemonServer {
                 let stream = try await engine.logs(id: req.id, request: req)
                 try await streamResponse(requestId: request.id, stream: stream, to: fd)
 
+            case .execInput:
+                // Arrives on its own connection : the loop handling the exec
+                // itself is busy streaming output and can't read another
+                // frame until it finishes.
+                let req = try JSONDecoder().decode(ExecInputRequest.self, from: request.payload)
+                await engine.execInput(req)
+                try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
+
             case .exec:
                 let req = try JSONDecoder().decode(ExecRequest.self, from: request.payload)
                 let stream = try await engine.exec(config: req.config)

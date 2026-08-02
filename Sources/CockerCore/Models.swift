@@ -675,11 +675,28 @@ public struct ExecConfig: Codable, Sendable {
     /// Empty / nil means "no stdin forwarded" (the legacy behaviour).
     public var stdin: Data?
 
+    /// Identifies this exec on the daemon so a *second* connection can stream
+    /// stdin into it while the first one streams output back.
+    ///
+    /// The daemon's per-connection loop can't read another frame while it is
+    /// streaming a response, so live stdin can't share the request's
+    /// connection without deadlocking. The CLI mints the id, opens a side
+    /// channel, and the daemon routes those bytes onto the same vsock fd the
+    /// guest is already relaying to the PTY master.
+    public var sessionID: String?
+    /// Terminal geometry for `-t`, so the PTY starts at the caller's real
+    /// size instead of openpty's 80x24 default.
+    public var rows: Int?
+    public var cols: Int?
+
     public init(containerID: String, command: [String]) {
         self.containerID = containerID
         self.command = command
         self.interactive = false
         self.tty = false
+        self.sessionID = nil
+        self.rows = nil
+        self.cols = nil
         self.user = nil
         self.workdir = nil
         self.env = [:]

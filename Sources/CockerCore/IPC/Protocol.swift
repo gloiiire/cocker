@@ -11,6 +11,8 @@ public enum IPCRequestType: String, Codable, Sendable {
     case wait
     // Exec
     case exec
+    /// Live stdin for an in-flight exec, on its own connection.
+    case execInput
     // Copy
     case cp
     // Rename
@@ -301,6 +303,18 @@ public struct VolumeCreateRequest: Codable, Sendable {
 public struct VolumesResponse: Codable, Sendable {
     public let volumes: [VolumeInfo]
     public init(volumes: [VolumeInfo]) { self.volumes = volumes }
+}
+
+/// A chunk of live stdin for an in-flight exec, or the EOF that ends it.
+public struct ExecInputRequest: Codable, Sendable {
+    public let sessionID: String
+    public let data: Data?
+    /// The caller closed its stdin. The daemon half-closes the vsock so the
+    /// in-VM child sees EOF instead of blocking forever.
+    public let eof: Bool
+    public init(sessionID: String, data: Data? = nil, eof: Bool = false) {
+        self.sessionID = sessionID; self.data = data; self.eof = eof
+    }
 }
 
 public struct ExecRequest: Codable, Sendable {

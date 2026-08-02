@@ -1148,7 +1148,16 @@ final class ContainerEngine {
         return try await vmRuntime.exec(
             containerID: container.id, command: config.command, env: config.env,
             tty: config.tty, stdin: config.stdin,
-            workdir: config.workdir, user: config.user)
+            workdir: config.workdir, user: config.user,
+            sessionID: config.sessionID, rows: config.rows, cols: config.cols)
+    }
+
+    /// Route a chunk of live stdin (or its EOF) into an in-flight exec.
+    func execInput(_ req: ExecInputRequest) {
+        if let data = req.data, !data.isEmpty {
+            vmRuntime.writeExecInput(session: req.sessionID, data: data)
+        }
+        if req.eof { vmRuntime.closeExecInput(session: req.sessionID) }
     }
 
     // MARK: - System info

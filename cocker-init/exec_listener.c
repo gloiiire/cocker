@@ -148,12 +148,16 @@ static int top_level_string_copy(char *buf, const char *key,
 static int parse_exec_request(char *buf, size_t buf_len,
                               char **argv, int argv_max,
                               char **env_out, int env_max,
-                              int *tty_out) {
+                              int *tty_out, int *rows_out, int *cols_out) {
     /* NUL-terminate */
     if (buf_len >= EXEC_BUF_SIZE) buf_len = EXEC_BUF_SIZE - 1;
     buf[buf_len] = '\0';
 
     *tty_out = 0;
+    /* 0 means "the host didn't say" — openpty then uses its default and the
+     * child sees the usual 80x24. */
+    *rows_out = 0;
+    *cols_out = 0;
     argv[0] = NULL;
     env_out[0] = NULL;
 
@@ -169,6 +173,14 @@ static int parse_exec_request(char *buf, size_t buf_len,
 
     char *t = top_level_value(buf, "tty");
     if (t && *t == 't') *tty_out = 1;  /* value is the literal `true` */
+
+    /* Terminal geometry, so a `-t` exec starts at the caller's real size
+     * instead of the 80x24 openpty default. Anything that redraws — vim,
+     * top, a shell prompt — is wrong until the first resize otherwise. */
+    char *r = top_level_value(buf, "rows");
+    if (r) *rows_out = atoi(r);
+    char *c = top_level_value(buf, "cols");
+    if (c) *cols_out = atoi(c);
 
     char *env_field = top_level_value(buf, "env");
 
@@ -367,9 +379,11 @@ static void handle_one(int client_fd) {
     char workdir[4096] = "";
     char user[256] = "";
     int tty = 0;
+    int rows = 0, cols = 0;
     (void)top_level_string_copy(buf, "workdir", workdir, sizeof(workdir));
     (void)top_level_string_copy(buf, "user", user, sizeof(user));
-    int argc = parse_exec_request(buf, (size_t)r, argv, MAX_ARGV, env_out, MAX_ENV, &tty);
+    int argc = parse_exec_request(buf, (size_t)r, argv, MAX_ARGV, env_out, MAX_ENV,
+                                  &tty, &rows, &cols);
     if (argc == 0) {
         const char *err = "parse error\n__COCKER_EXIT__2\n";
         write(client_fd, err, strlen(err));
@@ -384,7 +398,15 @@ static void handle_one(int client_fd) {
          * listener side and gets relayed to the client socket ; the slave
          * is dup'd into the child's stdin/stdout/stderr after setsid +
          * TIOCSCTTY so the child sees a real controlling terminal. */
-        if (openpty(&master_fd, &slave_fd, NULL, NULL, NULL) != 0) {
+        struct winsize ws;
+        struct winsize *wsp = NULL;
+        if (rows > 0 && cols > 0) {
+            memset(&ws, 0, sizeof(ws));
+            ws.ws_row = (unsigned short)rows;
+            ws.ws_col = (unsigned short)cols;
+            wsp = &ws;
+        }
+        if (openpty(&master_fd, &slave_fd, NULL, NULL, wsp) != 0) {
             const char *err = "openpty failed\n__COCKER_EXIT__3\n";
             write(client_fd, err, strlen(err));
             close(client_fd);
