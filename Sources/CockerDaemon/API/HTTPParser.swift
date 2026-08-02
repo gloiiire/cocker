@@ -118,15 +118,61 @@ extension Data {
 struct HTTPStreamWriter {
     let fd: Int32
 
+    /// Raw (hijacked) mode: bytes go out untouched, with no chunk framing.
+    ///
+    /// Docker's `/attach` and `/exec/{id}/start` are hijacked connections —
+    /// the Go client stops speaking HTTP after the response line and reads
+    /// the socket directly. Emitting `Transfer-Encoding: chunked` on those
+    /// put chunk-size lines *inside* the stdcopy stream, so every client
+    /// choked on "unrecognized input header" or silently mangled the output.
+    var isRaw: Bool = false
+
     func writeHeaders(status: Int = 200, contentType: String = "application/json") {
-        let headers = "HTTP/1.1 \(status) OK\r\nContent-Type: \(contentType)\r\nTransfer-Encoding: chunked\r\nServer: cocker/\(CockerVersion.version)\r\n\r\n"
+        let reason = Self.reasonPhrase(for: status)
+        let headers = "HTTP/1.1 \(status) \(reason)\r\nContent-Type: \(contentType)\r\nTransfer-Encoding: chunked\r\nServer: cocker/\(CockerVersion.version)\r\n\r\n"
         if let data = headers.data(using: .utf8) {
             writeRaw(data)
         }
     }
 
+    /// Response head for a hijacked stream.
+    ///
+    /// `upgrade` reflects whether the client asked for one: Docker sends
+    /// `Connection: Upgrade` / `Upgrade: tcp` and expects `101 UPGRADED`
+    /// back, but tolerates a plain 200 when it didn't. Either way the body
+    /// that follows is raw.
+    func writeHijackHeaders(upgrade: Bool) {
+        let head: String
+        if upgrade {
+            head = "HTTP/1.1 101 UPGRADED\r\n"
+                + "Content-Type: application/vnd.docker.raw-stream\r\n"
+                + "Connection: Upgrade\r\nUpgrade: tcp\r\n\r\n"
+        } else {
+            head = "HTTP/1.1 200 OK\r\n"
+                + "Content-Type: application/vnd.docker.raw-stream\r\n\r\n"
+        }
+        writeRaw(Data(head.utf8))
+    }
+
+    /// The reason phrase used to be hardcoded to "OK" for every status, so a
+    /// streaming 404 went out as `HTTP/1.1 404 OK`.
+    static func reasonPhrase(for status: Int) -> String {
+        switch status {
+        case 200: return "OK"
+        case 101: return "UPGRADED"
+        case 204: return "No Content"
+        case 400: return "Bad Request"
+        case 404: return "Not Found"
+        case 409: return "Conflict"
+        case 500: return "Internal Server Error"
+        case 501: return "Not Implemented"
+        default:  return "Status"
+        }
+    }
+
     func writeChunk(_ data: Data) {
         guard !data.isEmpty else { return }
+        if isRaw { writeRaw(data); return }
         let header = String(format: "%X\r\n", data.count)
         if let h = header.data(using: .utf8) { writeRaw(h) }
         writeRaw(data)
@@ -138,7 +184,10 @@ struct HTTPStreamWriter {
     }
 
     func finish() {
-        // Final zero-length chunk
+        // A hijacked stream ends by closing the socket, not with a
+        // zero-length chunk — writing one would land as literal bytes in
+        // the application's output.
+        guard !isRaw else { return }
         writeRaw(Data("0\r\n\r\n".utf8))
     }
 
