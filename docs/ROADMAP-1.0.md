@@ -97,9 +97,9 @@ failed, or losing data. Shipped in #357.
 
 | | |
 |---|---|
-| ⬜ | **Run the e2e suite in CI.** Still needs one M-series Mac as a self-hosted runner — hosted runners are M1/M2 VMs and nested virtualisation is M3+, so this is hardware, not configuration. Mitigated meanwhile: a status job now states in the run summary whether e2e actually ran, so a green check can't be mistaken for e2e coverage, and `Tests/e2e/README.md` documents running it by hand |
+| ✅ | **The e2e suite runs in CI.** A `vm-capable` self-hosted M3 Max runner is registered, and the suite runs on every pull request — 13/13 on the 1.0.0.0 bump. Hosted runners still can't do this (they're M1/M2 VMs and nested virtualisation needs M3+), so the job stays **non-required**: one physical machine being asleep must not block a contributor. The `e2e coverage status` job writes into every run summary whether it actually ran, so a green tick can't be mistaken for e2e coverage |
 | ✅ | **Releases gated on tests.** `build-and-sign` now `needs: test` — `swift test` plus a cocker-init cross-compile and its C test, which `swift test` never covered |
-| 🚧 | e2e coverage. Added `11-exit-codes` and `12-exec-after-start`; suite is 12/12 green on real hardware. Still uncovered: registry push/pull, block volumes, `compose down`, `logs -f`, volume/network lifecycle |
+| 🚧 | e2e coverage. Added `11-exit-codes`, `12-exec-after-start` and `13-compose-override-and-exec-env`; suite is 13/13 green on real hardware and in CI. Still uncovered: registry push/pull, block volumes, `compose down`, `logs -f`, volume/network lifecycle |
 | ✅ | Coverage reports two numbers — the gated scope and all of `Sources/` — and says which is which |
 | ✅ | The four commitments, the 1.x compatibility promise and the deprecation rule are in the README |
 
