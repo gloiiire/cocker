@@ -152,6 +152,40 @@ final class VMRuntime: NSObject {
     /// out. Cleared on container stop / remove.
     fileprivate var pendingNATMACs: [String: String] = [:]
 
+    /// Exclusive `flock`s held on each container's block-volume images for as
+    /// long as its VM runs, keyed by container id.
+    ///
+    /// `VZDiskImageStorageDeviceAttachment` takes no lock of its own, so two
+    /// containers naming the same volume — or a new VM racing one that hasn't
+    /// finished dying — attached the same ext4 image read-write and mounted
+    /// it twice. That is unconditional corruption, and nothing detected it.
+    private var volumeLockFDs: [String: [Int32]] = [:]
+
+    /// Take an exclusive, non-blocking lock on a volume image. Throws when
+    /// another VM already holds it, which turns silent corruption into a
+    /// refused start.
+    private func lockVolumeImage(at url: URL, containerID: String, volumeName: String) throws {
+        let fd = open(url.path, O_RDWR)
+        guard fd >= 0 else {
+            throw CockerError.volumeInUse(
+                "\(volumeName): cannot open \(url.lastPathComponent): \(String(cString: strerror(errno)))")
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            throw CockerError.volumeInUse(
+                "\(volumeName): already attached read-write by another running container")
+        }
+        volumeLockFDs[containerID, default: []].append(fd)
+    }
+
+    /// Release every volume lock held for a container. Safe to call twice.
+    private func releaseVolumeLocks(containerID: String) {
+        for fd in volumeLockFDs.removeValue(forKey: containerID) ?? [] {
+            flock(fd, LOCK_UN)
+            close(fd)
+        }
+    }
+
     /// Pop and return the auto-assigned eth0 MAC for `containerID` after a
     /// successful start. Returns nil if createVM never recorded one (e.g.
     /// network mode .none).
@@ -215,6 +249,11 @@ final class VMRuntime: NSObject {
 
     func createVM(for container: Container, rootfsPath: URL, stdoutPipe: Pipe) async throws -> VZVirtualMachine {
         CockerLog.shared.debug("vm", "createVM enter")
+        // Drop any volume locks a previous, failed start left behind for this
+        // container before claiming them again — otherwise a crash midway
+        // through configuration would lock the user out of their own volume
+        // until cockerd restarted.
+        releaseVolumeLocks(containerID: container.id)
         let config = VZVirtualMachineConfiguration()
 
         // Boot loader — cmdline gets assigned AFTER volume processing
@@ -348,6 +387,14 @@ final class VMRuntime: NSObject {
             if exists && !isDir.boolValue {
                 // Block storage path. Attach as virtio block device, build
                 // a cmdline spec that points cocker-init at /dev/vd<X>.
+                //
+                // Claim the image first: two VMs mounting the same ext4
+                // read-write corrupts it, and nothing else prevents that.
+                // Read-only attachments don't need to exclude each other.
+                if !mount.readOnly {
+                    try lockVolumeImage(at: hostURL, containerID: container.id,
+                                        volumeName: mount.source)
+                }
                 let attachment = try VZDiskImageStorageDeviceAttachment(url: hostURL, readOnly: mount.readOnly)
                 let blockDevice = VZVirtioBlockDeviceConfiguration(attachment: attachment)
                 storageDevices.append(blockDevice)
@@ -933,6 +980,10 @@ final class VMRuntime: NSObject {
     /// lived `cocker run --rm` cycle leaked ~8 FDs into cockerd (mainly
     /// console + stderr pipes + /dev/null + vsock IPC channels).
     func cleanup(containerID: String) async {
+        // Before the early return : a start that failed after claiming its
+        // volumes never registers a RunningVM, and leaving the flock held
+        // would lock the user out of their own volume until cockerd restarts.
+        releaseVolumeLocks(containerID: containerID)
         guard let running = runningVMs[containerID] else { return }
         // Finish live log streams before dropping the RunningVM. Consumers
         // receive a clean end-of-stream immediately instead of polling

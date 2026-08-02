@@ -122,11 +122,22 @@ actor VolumeManager {
 
         // Check if in use by a container
         let containers = await store.allContainers(includeAll: true)
-        let inUse = containers.contains { c in
+        let users = containers.filter { c in
             c.volumes.contains { $0.source == name }
         }
 
-        if inUse && !force {
+        // A *running* container's volume is never removable, force or not.
+        // `force` used to skip this check entirely, so `volume rm -f` unlinked
+        // the backing data.img out from under a live VM that still held the
+        // fd — the container kept writing into a deleted inode and the data
+        // was gone at stop. Docker refuses this case too; its `--force` only
+        // relaxes the stopped-container and missing-volume cases.
+        if let live = users.first(where: { $0.status == .running || $0.status == .paused }) {
+            throw CockerError.volumeInUse(
+                "\(name): still mounted by running container \(live.name) — stop it first")
+        }
+
+        if !users.isEmpty && !force {
             throw CockerError.volumeInUse(name)
         }
 

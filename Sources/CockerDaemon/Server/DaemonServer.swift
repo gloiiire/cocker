@@ -328,7 +328,9 @@ final class DaemonServer {
 
             case .volumeRm:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
-                try await engine.volumes.remove(req.id)
+                // `force` was decoded and dropped here, so `volume rm -f`
+                // behaved exactly like `volume rm`.
+                try await engine.volumes.remove(req.id, force: req.force ?? false)
                 try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
 
             case .volumeLs:

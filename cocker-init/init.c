@@ -146,6 +146,9 @@ static void switch_to_block(const char *dev) {
  * build-overlay setup above can reuse the same ext4 probe + fork/exec. */
 static int has_ext_fs(const char *device);
 static int run_cmd(char *const argv[]);
+static void fsck_block_volume(const char *device);
+static void remember_block_mount(const char *target);
+static void unmount_block_volumes(void);
 
 /* Build-overlay rootfs (PRO-73). lowerdir = the virtiofs "root" share
  * (base image, read-only) ; upperdir = an ext4 block device (rw, native
@@ -280,6 +283,83 @@ static int run_cmd(char *const argv[]) {
     return WEXITSTATUS(status);
 }
 
+/* Block volumes mounted this boot, in mount order. Recorded so the
+ * shutdown path can unmount them cleanly instead of leaving every ext4
+ * filesystem marked dirty for the next boot to inherit. 32 matches the
+ * per-container volume ceiling in mount_volumes(). */
+static char *block_mount_targets[32];
+static int block_mount_count = 0;
+
+static void remember_block_mount(const char *target) {
+    if (block_mount_count >= (int)(sizeof(block_mount_targets) / sizeof(block_mount_targets[0])))
+        return;
+    char *copy = strdup(target);
+    if (copy) block_mount_targets[block_mount_count++] = copy;
+}
+
+/* Unmount block volumes, most recent first, before the VM powers off.
+ *
+ * Shutdown used to be sync() + reboot() with no umount, so every ext4
+ * volume was left with a dirty journal — mounted dirty again on the next
+ * boot, over and over, with nothing ever checking it. umount(2) flushes
+ * the journal and clears the mount state, which is what makes the fsck
+ * on the next attach cheap instead of a recovery. */
+static void unmount_block_volumes(void) {
+    for (int i = block_mount_count - 1; i >= 0; i--) {
+        const char *target = block_mount_targets[i];
+        if (!target) continue;
+        if (umount(target) < 0) {
+            /* A process may still hold the mount ; detach it lazily so the
+             * filesystem is at least released rather than torn away by the
+             * power-off. */
+            if (umount2(target, MNT_DETACH) < 0)
+                info("umount %s failed: %s (volume will need a recovery fsck)",
+                     target, strerror(errno));
+            else
+                info("lazily detached %s", target);
+        } else {
+            info("unmounted %s", target);
+        }
+    }
+}
+
+/* Check a block volume before mounting it.
+ *
+ * Nothing ever ran a filesystem check: combined with the missing umount
+ * above, volumes accumulated journal damage boot after boot. `-p` fixes
+ * only what is safe to fix without asking.
+ *
+ * Deliberately tolerant — the point is to catch damage, not to make
+ * containers unbootable. A missing e2fsck (rc 127, the image simply
+ * doesn't ship e2fsprogs) or an odd status just warns. Only rc 4,
+ * "uncorrected errors remain", is fatal: mounting a filesystem e2fsck
+ * has declared broken is how a recoverable problem becomes data loss. */
+static void fsck_block_volume(const char *device) {
+    char *argv[] = { (char *)"e2fsck", (char *)"-p", (char *)device, NULL };
+    int rc = run_cmd(argv);
+    switch (rc) {
+    case 0:
+        break;
+    case 1:
+    case 2:
+        info("e2fsck repaired %s (rc=%d)", device, rc);
+        break;
+    case 127:
+        info("e2fsck not found — skipping the check on %s ; add e2fsprogs to "
+             "the image so cocker can repair this volume after an unclean stop",
+             device);
+        break;
+    case 4:
+        die("e2fsck found uncorrected errors on %s — refusing to mount it. "
+            "Run `e2fsck -f` against the volume image on the host before "
+            "starting this container again.", device);
+        break;
+    default:
+        info("e2fsck on %s returned %d — mounting anyway", device, rc);
+        break;
+    }
+}
+
 /* Per-container volume mounts driven by the kernel cmdline.
  *
  * Spec format : `cocker.vol<N>=<type>:<source>:<target>`
@@ -328,10 +408,14 @@ static void mount_volumes(const char *cmdline) {
         mkdirp(target);
 
         if (strcmp(type, "virtiofs") == 0) {
+            /* Fatal, not a warning. A container that starts without the
+             * volume the user asked for writes into the ephemeral rootfs
+             * and loses everything on removal — silently. Docker fails the
+             * start here too. */
             if (mount(source, target, "virtiofs", 0, NULL) < 0)
-                info("mount virtiofs %s -> %s failed: %s", source, target, strerror(errno));
-            else
-                info("mounted volume %s at %s (virtiofs)", source, target);
+                die("mount virtiofs %s -> %s failed: %s — refusing to start "
+                    "without the requested volume", source, target, strerror(errno));
+            info("mounted volume %s at %s (virtiofs)", source, target);
         } else if (strcmp(type, "blk") == 0) {
             if (!has_ext_fs(source)) {
                 info("volume %s has no filesystem, formatting ext4 …", source);
@@ -341,18 +425,20 @@ static void mount_volumes(const char *cmdline) {
                 };
                 int rc = run_cmd(mkfs_argv);
                 if (rc != 0) {
-                    info("mkfs.ext4 %s failed (rc=%d) — image likely lacks e2fsprogs ; "
-                         "install it in your Dockerfile (apt-get install e2fsprogs / "
-                         "apk add e2fsprogs) so cocker-init can format named volumes on "
-                         "first attach", source, rc);
-                    free(spec);
-                    continue;
+                    die("mkfs.ext4 %s failed (rc=%d) — image likely lacks e2fsprogs ; "
+                        "install it in your Dockerfile (apt-get install e2fsprogs / "
+                        "apk add e2fsprogs) so cocker-init can format named volumes on "
+                        "first attach", source, rc);
                 }
+            } else {
+                fsck_block_volume(source);
             }
             if (mount(source, target, "ext4", 0, NULL) < 0) {
-                info("mount ext4 %s -> %s failed: %s", source, target, strerror(errno));
+                die("mount ext4 %s -> %s failed: %s — refusing to start without "
+                    "the requested volume", source, target, strerror(errno));
             } else {
                 info("mounted volume %s at %s (ext4 block)", source, target);
+                remember_block_mount(target);
                 /* Remove the lost+found directory that mke2fs creates.
                  * Postgres' initdb refuses to use a non-empty data dir
                  * ("It contains a lost+found directory, perhaps due to
@@ -672,6 +758,11 @@ int main(int argc, char **argv) {
      * virtiofs rootfs before the VM powers off. resolv.conf et al. are
      * preserved at their image-time content. Must precede sync(). */
     etc_overlay_sync_back();
+
+    /* Flush and release the block volumes before the power cut. Without
+     * this every named volume was left with a dirty ext4 journal on every
+     * single stop. Must precede sync() so the journal commits land. */
+    unmount_block_volumes();
 
     sync();
 
