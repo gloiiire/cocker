@@ -224,13 +224,25 @@ func main() async {
                 lastCount = count
                 continue
             }
+            // Whether the helper ACCEPTED the request, not whether its
+            // plist happens to exist. The old shape asked "is it
+            // installed?", tried the write, discarded the failure, and
+            // routed the actionable warning into the `else` branch — so an
+            // installed-but-inert helper produced total silence while the
+            // pool ran to 317/256 and containers failed DHCP. Both
+            // failure modes are real: the plist can be present with
+            // `launchctl` never having loaded it, and `/var/run` is
+            // root-owned while cockerd runs as the user.
             let helperInstalled = FileManager.default.fileExists(atPath: helperPath)
+            var helperAccepted = false
             if helperInstalled {
                 let trigger = URL(fileURLWithPath: triggerPath)
-                if (try? Data().write(to: trigger)) != nil {
+                helperAccepted = (try? Data().write(to: trigger)) != nil
+                if helperAccepted {
                     log.info("vmnet", "lease pool at \(count)/256 — asked helper to clear")
                 }
-            } else if count > 240 {
+            }
+            if !helperAccepted, count > 240 {
                 // Rate limit : warn on first crossing of 240, then at
                 // most every 5 min, OR immediately if the count jumped
                 // ≥10 leases since the last warning (= rapid saturation).
@@ -239,9 +251,15 @@ func main() async {
                 let dueByTime = lastWarnedAbove240.map { now.timeIntervalSince($0) >= 300 } ?? false
                 let jumpedFast = count - lastCount >= 10
                 if crossedFresh || dueByTime || jumpedFast {
+                    let fix = helperInstalled
+                        ? "The helper is installed but did not accept the request — it is " +
+                          "probably not loaded (`sudo launchctl load \(helperPath)`). " +
+                          "Reinstall with `cocker daemon helper-install`, or clear once " +
+                          "with `cocker daemon clear-leases`."
+                        : "Install the helper with `cocker daemon helper-install` " +
+                          "OR run `cocker daemon clear-leases`."
                     log.warn("vmnet", "lease pool at \(count)/256 — new containers will " +
-                        "soon fail DHCP. Install the helper with `cocker daemon " +
-                        "helper-install` OR run `cocker daemon clear-leases`.")
+                        "soon fail DHCP. " + fix)
                     lastWarnedAbove240 = now
                 }
             }
