@@ -95,23 +95,82 @@ extension ContainerEngine {
         guard let container = await state.container(id: containerID) else {
             throw CockerError.containerNotFound(containerID)
         }
-        let rootfsDir = try await effectiveRootfs(for: container)
+        let containerRoot = try await effectiveRootfs(for: container)
+        // Every container writes into an APFS-clonefile copy of its image
+        // rootfs, so a real diff is just a comparison of the two trees.
+        // This used to enumerate the container rootfs and mark *everything*
+        // A or C, capped at 200 entries — the output looked like a diff and
+        // was nothing of the sort, which is worse than not offering it,
+        // because tooling trusts it.
+        let image = try await images.find(container.image)
+        let imageRoot = await images.store.rootfsDirectory(for: image)
+        guard FileManager.default.fileExists(atPath: imageRoot.path),
+              imageRoot.path != containerRoot.path else {
+            // No baseline to compare against (the image rootfs is gone, or
+            // the container never got its own clone). Report nothing rather
+            // than inventing changes.
+            return DiffResponse(entries: [])
+        }
+        return DiffResponse(entries: Self.compareTrees(base: imageRoot, overlay: containerRoot))
+    }
 
-        // Approximation : list files in the rootfs (capped) and mark them
-        // A/C. A real diff would compare against a snapshot of the image.
-        let fm = FileManager.default
+    /// Docker-shaped diff between an image rootfs and a container's copy of
+    /// it: `A` added, `C` changed, `D` deleted, paths absolute and sorted.
+    static func compareTrees(base: URL, overlay: URL) -> [DiffEntry] {
+        let baseEntries = fileIndex(of: base)
+        let overlayEntries = fileIndex(of: overlay)
+
         var entries: [DiffEntry] = []
-        if let enumerator = fm.enumerator(at: rootfsDir, includingPropertiesForKeys: [.isDirectoryKey]) {
-            while let any = enumerator.nextObject() {
-                guard let url = any as? URL else { continue }
-                let rel = url.path.replacingOccurrences(of: rootfsDir.path, with: "")
-                if rel.isEmpty { continue }
-                let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                entries.append(DiffEntry(kind: isDir ? "C" : "A", path: rel))
-                if entries.count >= 200 { break }  // cap output
+        for (path, overlayStat) in overlayEntries {
+            guard let baseStat = baseEntries[path] else {
+                entries.append(DiffEntry(kind: "A", path: path))
+                continue
+            }
+            if overlayStat != baseStat {
+                entries.append(DiffEntry(kind: "C", path: path))
             }
         }
-        return DiffResponse(entries: entries)
+        for path in baseEntries.keys where overlayEntries[path] == nil {
+            entries.append(DiffEntry(kind: "D", path: path))
+        }
+        return entries.sorted { $0.path < $1.path }
+    }
+
+    /// Relative path → a cheap identity (size + mtime, or a marker for
+    /// directories and symlinks). Content hashing every file would be
+    /// correct but unusably slow on a real image.
+    private static func fileIndex(of root: URL) -> [String: String] {
+        var index: [String: String] = [:]
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey,
+                                      .fileSizeKey, .contentModificationDateKey]
+        guard let walker = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: keys,
+            options: [.producesRelativePathURLs]) else { return index }
+
+        let rootPath = root.standardizedFileURL.path
+        while let any = walker.nextObject() {
+            guard let url = any as? URL else { continue }
+            var relative = url.standardizedFileURL.path
+            if relative.hasPrefix(rootPath) { relative = String(relative.dropFirst(rootPath.count)) }
+            guard !relative.isEmpty else { continue }
+            if !relative.hasPrefix("/") { relative = "/" + relative }
+
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            if values?.isSymbolicLink == true {
+                index[relative] = "l:" + ((try? FileManager.default
+                    .destinationOfSymbolicLink(atPath: url.path)) ?? "")
+            } else if values?.isDirectory == true {
+                // Directories carry no identity of their own — a directory is
+                // only "changed" because of what's inside it, and those
+                // children are reported individually.
+                index[relative] = "d"
+            } else {
+                let size = values?.fileSize ?? 0
+                let mtime = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+                index[relative] = "f:\(size):\(mtime)"
+            }
+        }
+        return index
     }
 
     // MARK: - save (image → tar)

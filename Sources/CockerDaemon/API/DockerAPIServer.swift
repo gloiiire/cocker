@@ -409,7 +409,7 @@ final class DockerAPIServer {
         // we return an empty list rather than a 501 so tooling like
         // Portainer doesn't error out at inspect time.
         case ("GET", "containers") where segments.count == 3 && segments[2] == "changes":
-            response = .json([DockerEmpty]())
+            response = await handleContainerChanges(id: segments[1])
 
         // ── Ping / version handshake ─────────────────────────────
         // `docker version` issues GET /_ping (and tolerates the HEAD
@@ -810,14 +810,57 @@ final class DockerAPIServer {
         } catch { return .notFound(id) }
     }
 
+    /// `GET /containers/{id}/changes` used to answer a hardcoded `[]`, which
+    /// tooling reads as "nothing changed" — a confident lie. It now runs the
+    /// same real diff the CLI does.
+    private func handleContainerChanges(id: String) async -> HTTPResponse {
+        struct Change: Encodable { let Path: String; let Kind: Int }
+        do {
+            let diff = try await engine.diff(containerID: id)
+            // Docker's Kind: 0 modified, 1 added, 2 deleted.
+            return .json(diff.entries.map { entry in
+                Change(Path: entry.path,
+                       Kind: entry.kind == "A" ? 1 : (entry.kind == "D" ? 2 : 0))
+            })
+        } catch {
+            return .notFound(id)
+        }
+    }
+
     private func handleContainerTop(id: String) async -> HTTPResponse {
         struct TopResponse: Encodable {
             let Titles: [String]; let Processes: [[String]]
         }
-        return .json(TopResponse(
-            Titles: ["PID", "USER", "TIME", "COMMAND"],
-            Processes: [["1", "root", "0:00", "/sbin/init"]]
-        ))
+        // This used to return a hardcoded `1 root 0:00 /sbin/init` for every
+        // container, whatever was actually running. The CLI never hit it —
+        // `cocker top` execs `ps` itself — so only API clients (JetBrains'
+        // process tab, `docker top`) saw the fabrication. Same exec, one
+        // implementation.
+        do {
+            var config = ExecConfig(containerID: id, command: ["ps", "-eo", "pid,user,time,args"])
+            config.tty = false
+            var lines: [String] = []
+            for await event in try await engine.exec(config: config)
+            where event.stream == .stdout {
+                lines.append(contentsOf: event.data
+                    .split(separator: "\n", omittingEmptySubsequences: true)
+                    .map(String.init))
+            }
+            // First line is `ps`'s own header; the rest are processes.
+            let rows = lines.dropFirst().compactMap { line -> [String]? in
+                let fields = line.split(separator: " ", maxSplits: 3,
+                                        omittingEmptySubsequences: true).map(String.init)
+                return fields.count == 4 ? fields : nil
+            }
+            guard !rows.isEmpty else {
+                return .error("could not read the process list in container \(id)", status: 409)
+            }
+            return .json(TopResponse(Titles: ["PID", "USER", "TIME", "COMMAND"], Processes: rows))
+        } catch let error as CockerError {
+            return .error(error.description, status: 409)
+        } catch {
+            return .error("\(error)", status: 500)
+        }
     }
 
     private func handleContainerRename(id: String, req: HTTPRequest) async -> HTTPResponse {
