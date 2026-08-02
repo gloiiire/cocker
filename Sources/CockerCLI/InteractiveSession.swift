@@ -24,6 +24,8 @@ final class InteractiveSession: @unchecked Sendable {
     private var rawActive = false
     private var stopped = false
     private var sendTask: Task<Void, Never>?
+    private var ready = false
+    private var readyWaiters: [CheckedContinuation<Void, Never>] = []
 
     // MARK: - Terminal
 
@@ -76,21 +78,31 @@ final class InteractiveSession: @unchecked Sendable {
 
     /// Stream stdin to the daemon until EOF or `stop()`.
     ///
-    /// Two halves on purpose. A GCD queue owns the blocking `read(2)` — a
-    /// keystroke may not come for hours and that must never park a Swift
-    /// cooperative-executor thread. A single long-lived Task owns the
-    /// sending, draining an AsyncStream so chunks reach the daemon strictly
-    /// in order on one connection.
+    /// Reading starts immediately, but nothing is *sent* until `markReady()`.
+    /// Both halves of that matter, and each was learned the hard way on
+    /// hardware:
     ///
-    /// An earlier version blocked the reader on a semaphore waiting for a
-    /// per-chunk Task. Under load that Task wasn't always scheduled before
-    /// the timeout, so input was silently dropped — caught on hardware, not
-    /// by any unit test.
+    ///  - Sending early breaks the exec outright. A burst of `.execInput`
+    ///    frames reaching the daemon before the exec exists made the vsock
+    ///    connect fail with ECONNRESET; toggling the pump off made the
+    ///    identical command succeed.
+    ///  - Reading late loses input. Piped stdin can hit EOF before the
+    ///    daemon reports readiness, and anything not already read is gone.
+    ///
+    /// So the reader runs from the start and the AsyncStream holds the bytes
+    /// until the daemon says its side is up.
+    ///
+    /// The blocking `read(2)` lives on a GCD queue — a keystroke may not come
+    /// for hours and must never park a Swift cooperative-executor thread —
+    /// while one long-lived Task drains the stream, keeping chunks ordered on
+    /// a single connection.
     func startPump(socketPath: String = IPCClient.defaultSocketPath) {
         let session = sessionID
         let (chunks, feed) = AsyncStream.makeStream(of: ExecInputRequest.self)
 
-        sendTask = Task.detached(priority: .userInitiated) {
+        sendTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.waitUntilReady()
+            if Task.isCancelled { return }
             let client = IPCClient(socketPath: socketPath)
             for await request in chunks {
                 guard let frame = try? IPCRequest(type: .execInput, payload: request) else { continue }
@@ -117,13 +129,41 @@ final class InteractiveSession: @unchecked Sendable {
         }
     }
 
+    /// The daemon's vsock is up; release the buffered stdin.
+    func markReady() {
+        lock.lock()
+        guard !ready else { lock.unlock(); return }
+        ready = true
+        let waiters = readyWaiters
+        readyWaiters.removeAll()
+        lock.unlock()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func waitUntilReady() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if ready || stopped {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            readyWaiters.append(continuation)
+            lock.unlock()
+        }
+    }
+
     func stop() {
         lock.lock()
         let alreadyStopped = stopped
         stopped = true
         let task = sendTask
         sendTask = nil
+        let waiters = readyWaiters
+        readyWaiters.removeAll()
         lock.unlock()
+        // Unpark the sender before cancelling, or it stays blocked forever.
+        for waiter in waiters { waiter.resume() }
         guard !alreadyStopped else { return }
         task?.cancel()
     }

@@ -580,15 +580,15 @@ struct ComposeExecCommand: AsyncParsableCommand {
         // Same live session as `cocker exec -it`. Before this, `-i`/`-t`
         // weren't even declared on this command, so `compose exec -it svc sh`
         // failed at parse time.
-        var session: InteractiveSession?
-        if !noTTY && (interactive || tty) && InteractiveSession.stdinIsTerminal {
-            let live = InteractiveSession()
-            config.sessionID = live.sessionID
+        let session: InteractiveSession? =
+            (!noTTY && (interactive || tty) && InteractiveSession.stdinIsTerminal)
+            ? InteractiveSession() : nil
+        if let session {
+            config.sessionID = session.sessionID
             if let size = InteractiveSession.windowSize() {
                 config.rows = size.rows
                 config.cols = size.cols
             }
-            session = live
         }
 
         let payload = ExecRequest(config: config)
@@ -597,6 +597,8 @@ struct ComposeExecCommand: AsyncParsableCommand {
         // Same contract as `cocker exec` : propagate the command's exit code
         // instead of swallowing the `exit:<n>` status event.
         let status = ExitStatusBox()
+        // Read stdin from the start so nothing typed early is lost; the
+        // pump holds it until the daemon reports its vsock is up.
         session?.enterRawMode()
         session?.startPump()
         defer {
@@ -607,7 +609,9 @@ struct ComposeExecCommand: AsyncParsableCommand {
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: UX.writeStderr(event.data)
-            case .status: status.consume(statusPayload: event.data)
+            case .status:
+                if event.data == "exec-ready" { session?.markReady() }
+                status.consume(statusPayload: event.data)
             case .error: UX.writeStderr(event.data)
             }
         }

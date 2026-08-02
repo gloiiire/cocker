@@ -432,15 +432,14 @@ struct ExecCommand: AsyncParsableCommand {
         // daemon on a side channel, PTY allocated in the guest. This branch
         // used to print "typed input will not reach the container" and drop
         // the keystrokes on the floor.
-        var session: InteractiveSession?
-        if interactive && InteractiveSession.stdinIsTerminal {
-            let live = InteractiveSession()
-            config.sessionID = live.sessionID
+        let session: InteractiveSession? =
+            (interactive && InteractiveSession.stdinIsTerminal) ? InteractiveSession() : nil
+        if let session {
+            config.sessionID = session.sessionID
             if tty, let size = InteractiveSession.windowSize() {
                 config.rows = size.rows
                 config.cols = size.cols
             }
-            session = live
         }
 
         if interactive {
@@ -478,6 +477,8 @@ struct ExecCommand: AsyncParsableCommand {
         // Raw mode goes on before the first byte of output and comes off no
         // matter how we leave — a half-restored terminal is the worst
         // possible failure mode for an interactive command.
+        // Read stdin from the start so nothing typed early is lost; the
+        // pump holds it until the daemon reports its vsock is up.
         session?.enterRawMode()
         session?.startPump()
         defer {
@@ -488,7 +489,9 @@ struct ExecCommand: AsyncParsableCommand {
             switch event.stream {
             case .stdout: UX.writeStreamChunk(event.data)
             case .stderr: UX.writeStderr(event.data)
-            case .status: status.consume(statusPayload: event.data)
+            case .status:
+                if event.data == "exec-ready" { session?.markReady() }
+                status.consume(statusPayload: event.data)
             case .error: UX.writeStderr(event.data)
             }
         }

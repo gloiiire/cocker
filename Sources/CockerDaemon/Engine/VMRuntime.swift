@@ -1468,13 +1468,6 @@ final class VMRuntime: NSObject {
                         continuation.finish()
                         return
                     }
-                    // Publish the fd so the side-channel connection carrying
-                    // live stdin can write onto it. The guest is already
-                    // relaying this socket to the PTY master, so anything
-                    // written here reaches the child's stdin.
-                    if let sessionID {
-                        Task { @MainActor in self.registerExecInput(session: sessionID, fd: fd) }
-                    }
                     // Request : single JSON line, NL-terminated. write() may
                     // accept only part of the buffer when the socket send
                     // buffer is nearly full, so loop until every byte is out
@@ -1521,6 +1514,34 @@ final class VMRuntime: NSObject {
                         // so we still receive the child's stdout +
                         // exit marker on the same fd.
                         _ = Darwin.shutdown(fd, SHUT_WR)
+                    }
+
+                    // Only now publish the fd to the side channel carrying
+                    // live stdin.
+                    //
+                    // This used to be dispatched right after `connect`
+                    // returned, i.e. *before* the JSON request above was
+                    // written. Registering flushes buffered stdin and may
+                    // apply a deferred `shutdown(SHUT_WR)`, so the hop
+                    // routinely won the race on real hardware: the guest read
+                    // stdin bytes — or an immediate EOF — where it expected
+                    // its request line, failed to parse, and closed. The host
+                    // saw ECONNRESET at connect and `exec -it` never worked.
+                    //
+                    // The request is fully on the wire by this point, so the
+                    // ordering is now safe whenever the hop lands.
+                    if let sessionID {
+                        Task { @MainActor in
+                            self.registerExecInput(session: sessionID, fd: fd)
+                            // Only now is it safe for the caller to stream
+                            // stdin. Starting the pump optimistically instead
+                            // meant a burst of `.execInput` frames hit the
+                            // daemon *before* this exec existed, and the vsock
+                            // connect then failed with ECONNRESET — proven on
+                            // hardware by toggling the pump off, which made
+                            // the identical command succeed.
+                            continuation.yield(StreamEvent(stream: .status, data: "exec-ready"))
+                        }
                     }
 
                     // Capture `connection` strongly so ARC doesn't release it
