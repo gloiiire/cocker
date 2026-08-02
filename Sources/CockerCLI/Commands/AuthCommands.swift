@@ -77,7 +77,7 @@ struct LoginCommand: AsyncParsableCommand {
                 headline: "Login failed",
                 reason: error.description,
                 hint: "check the username and password, or the registry hostname")
-            throw ExitCode.failure
+            throw ExitCode(error.exitCode)
         }
 
         var store = CredentialStore.load()

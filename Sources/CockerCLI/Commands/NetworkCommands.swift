@@ -124,7 +124,7 @@ struct NetworkCreateCommand: AsyncParsableCommand {
                 reason: error.description,
                 hint: "another network may already be named `\(name)` — `cocker network ls`"
             )
-            throw ExitCode.failure
+            throw ExitCode(error.exitCode)
         }
     }
 }
@@ -137,7 +137,7 @@ struct NetworkRmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for name in networks {
             let start = Date()
             do {
@@ -145,7 +145,7 @@ struct NetworkRmCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.network, name, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot remove network \(name)",
                     reason: error.description,
@@ -153,7 +153,7 @@ struct NetworkRmCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -207,7 +207,7 @@ struct NetworkConnectCommand: AsyncParsableCommand {
                 headline: "Cannot connect \(container) to \(network)",
                 reason: error.description
             )
-            throw ExitCode.failure
+            throw ExitCode(error.exitCode)
         }
     }
 }
@@ -244,7 +244,7 @@ struct NetworkDisconnectCommand: AsyncParsableCommand {
                 reason: error.description,
                 hint: force ? nil : "use `--force` (-f) if the container is unresponsive"
             )
-            throw ExitCode.failure
+            throw ExitCode(error.exitCode)
         }
     }
 }
