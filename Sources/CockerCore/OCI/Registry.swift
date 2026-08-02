@@ -19,6 +19,87 @@ public actor RegistryClient {
         credentials[registry] = (username, password)
     }
 
+    /// Check credentials against a registry's `/v2/` endpoint.
+    ///
+    /// `cocker login` used to write the credentials to disk and report
+    /// success without ever contacting the registry, so a typo'd password
+    /// "succeeded" and only surfaced later as an inexplicable pull failure —
+    /// by which time nobody suspects the login.
+    ///
+    /// Follows the same handshake the pull path already does: `GET /v2/`,
+    /// and if the registry answers 401 with a Bearer challenge, exchange the
+    /// Basic credentials for a token at the advertised realm. A 200 from
+    /// either step means the credentials are good.
+    ///
+    /// Throws `CockerError.permissionDenied` for a rejection and
+    /// `.connectionFailed` when the registry can't be reached at all —
+    /// those are different problems and deserve different messages.
+    public func verifyCredentials(registry: String, username: String, password: String) async throws {
+        let scheme = Self.isLocalRegistry(registry) ? "http" : "https"
+        // Docker Hub's API lives on a different host than its index name.
+        let host = (registry == "docker.io" || registry == "index.docker.io")
+            ? "registry-1.docker.io" : registry
+        guard let base = URL(string: "\(scheme)://\(host)/v2/") else {
+            throw CockerError.connectionFailed("bad registry host: \(registry)")
+        }
+        let basic = Data("\(username):\(password)".utf8).base64EncodedString()
+
+        var probe = URLRequest(url: base)
+        probe.setValue("Basic \(basic)", forHTTPHeaderField: "Authorization")
+        let (_, response): (Data, URLResponse)
+        do {
+            (_, response) = try await session.data(for: probe)
+        } catch {
+            throw CockerError.connectionFailed(
+                "cannot reach \(host): \(error.localizedDescription)")
+        }
+        guard let http = response as? HTTPURLResponse else {
+            throw CockerError.connectionFailed("no HTTP response from \(host)")
+        }
+        if (200...299).contains(http.statusCode) { return }
+        guard http.statusCode == 401 else {
+            throw CockerError.connectionFailed("\(host) answered HTTP \(http.statusCode)")
+        }
+
+        // Bearer challenge : trade the Basic credentials for a token. A
+        // registry that still refuses at this point is rejecting the
+        // credentials, not the request.
+        guard let challenge = http.value(forHTTPHeaderField: "WWW-Authenticate"),
+              challenge.lowercased().hasPrefix("bearer") else {
+            throw CockerError.permissionDenied("\(registry): invalid username or password")
+        }
+        var params: [String: String] = [:]
+        for field in challenge.dropFirst("Bearer".count).split(separator: ",") {
+            let kv = field.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2 else { continue }
+            params[kv[0].trimmingCharacters(in: .whitespaces)] =
+                kv[1].trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
+        }
+        guard let realm = params["realm"], var components = URLComponents(string: realm) else {
+            throw CockerError.permissionDenied("\(registry): invalid username or password")
+        }
+        var query = components.queryItems ?? []
+        if let service = params["service"] { query.append(URLQueryItem(name: "service", value: service)) }
+        components.queryItems = query.isEmpty ? nil : query
+        guard let tokenURL = components.url else {
+            throw CockerError.permissionDenied("\(registry): invalid username or password")
+        }
+
+        var tokenRequest = URLRequest(url: tokenURL)
+        tokenRequest.setValue("Basic \(basic)", forHTTPHeaderField: "Authorization")
+        let tokenResponse: URLResponse
+        do {
+            (_, tokenResponse) = try await session.data(for: tokenRequest)
+        } catch {
+            throw CockerError.connectionFailed(
+                "cannot reach the token endpoint: \(error.localizedDescription)")
+        }
+        let code = (tokenResponse as? HTTPURLResponse)?.statusCode ?? -1
+        guard (200...299).contains(code) else {
+            throw CockerError.permissionDenied("\(registry): invalid username or password")
+        }
+    }
+
     /// Whether `host` is a loopback or RFC1918 private-network address — i.e.
     /// a registry we may reach over plain http.
     ///
