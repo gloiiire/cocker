@@ -321,6 +321,43 @@ static void handle_one(int client_fd) {
      * its main child's PID there right after fork). Replies with one
      * line — "__COCKER_SIGNAL_OK__\n" on success or
      * "__COCKER_SIGNAL_ERR__<reason>\n" otherwise — and closes. */
+    /* Terminal resize : {"resize":true,"rows":N,"cols":N}.
+     *
+     * `cocker run -it` sets the console's winsize once at start, from the
+     * spec. Resizing the host window afterwards left the container at the
+     * old size, so anything that redraws — vim, top, a shell's line editor —
+     * wrapped at the wrong column for the rest of the session. There is no
+     * room for a control message in the console byte stream (it belongs to
+     * the application), so it comes over the same vsock the exec listener
+     * already serves.
+     *
+     * Applies to /dev/console, which init made the main process's
+     * controlling terminal; the kernel then sends SIGWINCH to its
+     * foreground process group for us. */
+    if (strstr(buf, "\"resize\"") && !strstr(buf, "\"cmd\"")) {
+        int rows = 0, cols = 0;
+        char *rp = strstr(buf, "\"rows\"");
+        if (rp && (rp = strchr(rp, ':'))) rows = atoi(rp + 1);
+        char *cp = strstr(buf, "\"cols\"");
+        if (cp && (cp = strchr(cp, ':'))) cols = atoi(cp + 1);
+
+        const char *reply = "__COCKER_RESIZE_ERR__\n";
+        if (rows > 0 && cols > 0) {
+            int fd = open("/dev/console", O_RDWR | O_NOCTTY);
+            if (fd >= 0) {
+                struct winsize ws;
+                memset(&ws, 0, sizeof(ws));
+                ws.ws_row = (unsigned short)rows;
+                ws.ws_col = (unsigned short)cols;
+                if (ioctl(fd, TIOCSWINSZ, &ws) == 0) reply = "__COCKER_RESIZE_OK__\n";
+                close(fd);
+            }
+        }
+        write(client_fd, reply, strlen(reply));
+        close(client_fd);
+        return;
+    }
+
     if (strstr(buf, "\"signal\"") && !strstr(buf, "\"cmd\"")) {
         char *sp = strstr(buf, "\"signal\"");
         sp = strchr(sp, ':');

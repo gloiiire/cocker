@@ -27,6 +27,7 @@ final class InteractiveSession: @unchecked Sendable {
     private var rawActive = false
     private var stopped = false
     private var sendTask: Task<Void, Never>?
+    private var resizeSource: DispatchSourceSignal?
     private var ready = false
     private var readyWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -149,6 +150,41 @@ final class InteractiveSession: @unchecked Sendable {
         }
     }
 
+    /// Report the terminal's size to the daemon whenever it changes.
+    ///
+    /// The container's console size is set once at start, from the spec.
+    /// Resizing the host window afterwards left the container at the old
+    /// size for the rest of the session, so anything that redraws — vim,
+    /// top, a shell's line editor — wrapped at the wrong column.
+    ///
+    /// A `DispatchSource` rather than `signal(2)`: the handler runs on a
+    /// queue, so it can do real work instead of being restricted to
+    /// async-signal-safe calls.
+    func startResizeWatcher(socketPath: String = IPCClient.defaultSocketPath) {
+        guard Self.stdinIsTerminal else { return }
+        // The default disposition for SIGWINCH is "ignore", but a
+        // DispatchSource only sees it once the signal is not being delivered
+        // to a handler; ignoring it explicitly is what makes that reliable.
+        signal(SIGWINCH, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGWINCH,
+                                                     queue: .global(qos: .utility))
+        let target = sessionID
+        source.setEventHandler {
+            guard let size = Self.windowSize() else { return }
+            Task {
+                let client = IPCClient(socketPath: socketPath)
+                if let frame = try? IPCRequest(
+                    type: .resize,
+                    payload: ResizeRequest(id: target, rows: size.rows, cols: size.cols)) {
+                    _ = try? await client.send(frame)
+                }
+                await client.disconnect()
+            }
+        }
+        source.resume()
+        lock.lock(); resizeSource = source; lock.unlock()
+    }
+
     /// The daemon's vsock is up; release the buffered stdin.
     func markReady() {
         lock.lock()
@@ -181,7 +217,10 @@ final class InteractiveSession: @unchecked Sendable {
         sendTask = nil
         let waiters = readyWaiters
         readyWaiters.removeAll()
+        let source = resizeSource
+        resizeSource = nil
         lock.unlock()
+        source?.cancel()
         // Unpark the sender before cancelling, or it stays blocked forever.
         for waiter in waiters { waiter.resume() }
         guard !alreadyStopped else { return }

@@ -170,6 +170,15 @@ public struct Container: Codable, Sendable, Identifiable {
         self.capAdd = try c.decodeIfPresent([String].self, forKey: .capAdd) ?? []
         self.capDrop = try c.decodeIfPresent([String].self, forKey: .capDrop) ?? []
         self.stopSignal = try c.decodeIfPresent(String.self, forKey: .stopSignal)
+        // Container has an explicit decoder, so a new property is invisible
+        // until it is listed here. `shmSizeMB` and the tty trio were added as
+        // stored properties and silently dropped on every round-trip —
+        // `cocker attach` couldn't tell a `-t` container from a plain one
+        // because `tty` came back nil no matter what was stored.
+        self.shmSizeMB = try c.decodeIfPresent(UInt64.self, forKey: .shmSizeMB)
+        self.tty = try c.decodeIfPresent(Bool.self, forKey: .tty)
+        self.ttyRows = try c.decodeIfPresent(Int.self, forKey: .ttyRows)
+        self.ttyCols = try c.decodeIfPresent(Int.self, forKey: .ttyCols)
     }
 }
 

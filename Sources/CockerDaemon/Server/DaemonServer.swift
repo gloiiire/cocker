@@ -233,6 +233,15 @@ final class DaemonServer {
                 let container = try await engine.inspect(id: req.id)
                 try sendResponse(requestId: request.id, payload: container, to: fd)
 
+            case .resize:
+                let req = try JSONDecoder().decode(ResizeRequest.self, from: request.payload)
+                guard let c = await engine.state.container(id: req.id) else {
+                    throw CockerError.containerNotFound(req.id)
+                }
+                await engine.vmRuntime.resizeTerminal(containerID: c.id,
+                                                      rows: req.rows, cols: req.cols)
+                try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
+
             case .wait:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
                 let code = try await engine.wait(id: req.id)

@@ -251,6 +251,7 @@ struct RunCommand: AsyncParsableCommand {
             if let session {
                 session.enterRawMode()
                 session.startPump(containerStdin: true)
+                session.startResizeWatcher()
                 // The console is up as soon as the container is running;
                 // there is no connect handshake to wait for here.
                 session.markReady()

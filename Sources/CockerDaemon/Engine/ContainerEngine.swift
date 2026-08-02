@@ -1170,14 +1170,21 @@ final class ContainerEngine {
     }
 
     /// Route a chunk of live stdin (or its EOF) into an in-flight exec.
-    func execInput(_ req: ExecInputRequest) {
+    func execInput(_ req: ExecInputRequest) async {
         if req.isContainerStdin == true {
             // `run -it` / `attach` : straight to the container's console,
             // which init has made the main process's controlling terminal.
+            //
+            // Resolve first. `run -it` sends the id it just got back, but
+            // `attach` sends whatever the user typed — a name or a short id —
+            // and the console pipes are keyed by canonical id. Skipping this
+            // made `cocker attach <name>` hang with every keystroke going
+            // nowhere.
+            let canonical = await state.container(id: req.sessionID)?.id ?? req.sessionID
             if let data = req.data, !data.isEmpty {
-                vmRuntime.writeContainerInput(containerID: req.sessionID, data: data)
+                vmRuntime.writeContainerInput(containerID: canonical, data: data)
             }
-            if req.eof { vmRuntime.closeContainerInput(containerID: req.sessionID) }
+            if req.eof { vmRuntime.closeContainerInput(containerID: canonical) }
             return
         }
         if let data = req.data, !data.isEmpty {

@@ -126,3 +126,50 @@ struct IPAllocationTests {
         #expect(await net.allocateIPv6(for: "abc") == (await net.allocateIPv6(for: "abc")))
     }
 }
+
+/// `Container` has an explicit `init(from:)`, so a new stored property is
+/// invisible to decoding until it's listed there. Two were missed:
+/// `shmSizeMB` (so `--shm-size` was lost on every state reload) and the tty
+/// trio (so `attach` couldn't tell a `-t` container from a plain one).
+@Suite("Container survives a round-trip")
+struct ContainerRoundTripTests {
+
+    private func roundTrip(_ c: Container) throws -> Container {
+        try JSONDecoder().decode(Container.self, from: try JSONEncoder().encode(c))
+    }
+
+    @Test func ttyRequestSurvives() throws {
+        var c = Container(name: "web", image: "alpine", command: ["sh"])
+        c.tty = true
+        c.ttyRows = 40
+        c.ttyCols = 120
+        let back = try roundTrip(c)
+        #expect(back.tty == true)
+        #expect(back.ttyRows == 40)
+        #expect(back.ttyCols == 120)
+    }
+
+    /// Pre-existing: `--shm-size` was dropped on every reload, so a postgres
+    /// container that needed 1 GiB of /dev/shm silently got the default back
+    /// after a daemon restart.
+    @Test func shmSizeSurvives() throws {
+        var c = Container(name: "db", image: "postgres", command: ["postgres"])
+        c.shmSizeMB = 1024
+        #expect(try roundTrip(c).shmSizeMB == 1024)
+    }
+
+    @Test func absentValuesStayNil() throws {
+        let back = try roundTrip(Container(name: "x", image: "alpine", command: ["true"]))
+        #expect(back.tty == nil)
+        #expect(back.shmSizeMB == nil)
+    }
+
+    /// A container written before these fields existed must still decode.
+    @Test func legacyContainerDecodes() throws {
+        let legacy = #"{"id":"abc","name":"old","image":"alpine","status":"running"}"#
+        let c = try JSONDecoder().decode(Container.self, from: Data(legacy.utf8))
+        #expect(c.name == "old")
+        #expect(c.tty == nil)
+        #expect(c.shmSizeMB == nil)
+    }
+}
