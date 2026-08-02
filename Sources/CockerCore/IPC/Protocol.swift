@@ -381,12 +381,16 @@ public struct ComposeRequest: Codable, Sendable {
     /// `compose up/down --remove-orphans` : also remove containers labelled
     /// for this project that the compose file no longer declares.
     public let removeOrphans: Bool
+    /// Extra compose files to merge on top of `composePath`, in order —
+    /// repeated `-f`, plus the `docker-compose.override.yml` Docker loads
+    /// automatically. Optional so an older CLI's payload still decodes.
+    public let overrideFiles: [String]?
     public init(composePath: String, projectName: String? = nil, services: [String] = [],
                 detach: Bool = false, activeProfiles: [String]? = nil,
                 removeVolumes: Bool = false, follow: Bool = false, tail: Int = 50,
                 forceBuild: Bool = false, noCache: Bool = false,
                 command: [String]? = nil, removeAfterRun: Bool = false,
-                removeOrphans: Bool = false) {
+                removeOrphans: Bool = false, overrideFiles: [String]? = nil) {
         self.composePath = composePath; self.projectName = projectName
         self.services = services; self.detach = detach
         self.activeProfiles = activeProfiles
@@ -398,11 +402,12 @@ public struct ComposeRequest: Codable, Sendable {
         self.command = command
         self.removeAfterRun = removeAfterRun
         self.removeOrphans = removeOrphans
+        self.overrideFiles = overrideFiles
     }
 
     enum CodingKeys: String, CodingKey {
         case composePath, projectName, services, detach, activeProfiles, removeVolumes, follow, tail, forceBuild, noCache
-        case command, removeAfterRun, removeOrphans
+        case command, removeAfterRun, removeOrphans, overrideFiles
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -426,6 +431,7 @@ public struct ComposeRequest: Codable, Sendable {
         self.command        = try c.decodeIfPresent([String].self, forKey: .command)
         self.removeAfterRun = try c.decodeIfPresent(Bool.self, forKey: .removeAfterRun) ?? false
         self.removeOrphans  = try c.decodeIfPresent(Bool.self, forKey: .removeOrphans) ?? false
+        self.overrideFiles  = try c.decodeIfPresent([String].self, forKey: .overrideFiles)
     }
 }
 

@@ -430,7 +430,7 @@ actor ComposeEngine {
     }
 
     func up(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
-        let compose = try loadComposeFile(at: request.composePath)
+        let compose = try loadComposeFile(at: request.composePath, overrides: request.overrideFiles ?? [])
         let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
 
         progressHandler(StreamEvent(stream: .status, data: "Starting project: \(projectName)\n"))
@@ -657,7 +657,7 @@ actor ComposeEngine {
     }
 
     func build(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
-        let compose = try loadComposeFile(at: request.composePath)
+        let compose = try loadComposeFile(at: request.composePath, overrides: request.overrideFiles ?? [])
         let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
         let services = request.services.isEmpty ? Array(compose.services.keys) : request.services
 
@@ -688,7 +688,7 @@ actor ComposeEngine {
     }
 
     func pull(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
-        let compose = try loadComposeFile(at: request.composePath)
+        let compose = try loadComposeFile(at: request.composePath, overrides: request.overrideFiles ?? [])
         let services = request.services.isEmpty ? Array(compose.services.keys) : request.services
 
         for serviceName in services {
@@ -708,7 +708,7 @@ actor ComposeEngine {
 
     func run(request: ComposeRequest, progressHandler: @escaping (StreamEvent) -> Void) async throws {
         // One-off run: start the service's container with detach
-        let compose = try loadComposeFile(at: request.composePath)
+        let compose = try loadComposeFile(at: request.composePath, overrides: request.overrideFiles ?? [])
         let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
         let serviceName = request.services.first ?? ""
 
@@ -734,7 +734,7 @@ actor ComposeEngine {
     }
 
     func down(request: ComposeRequest) async throws {
-        let compose = try loadComposeFile(at: request.composePath)
+        let compose = try loadComposeFile(at: request.composePath, overrides: request.overrideFiles ?? [])
         let projectName = ProjectName.normalize(request.projectName ?? inferProjectName(from: request.composePath))
 
         // Find every container belonging to this project via the label we
@@ -794,7 +794,73 @@ actor ComposeEngine {
 
     // MARK: - Helpers
 
-    private func loadComposeFile(at path: String) throws -> ComposeFile {
+    /// Load the project's compose file, merging any override files on top.
+    ///
+    /// `docker-compose.override.yml` is loaded automatically by Docker
+    /// Compose and is one of the most common things in a real project — a
+    /// dev-only port, a bind mount, an extra env var. Cocker read a single
+    /// file and never merged, so every one of those was **silently ignored**:
+    /// the project came up, looked healthy, and simply wasn't configured the
+    /// way the author wrote it.
+    private func loadComposeFile(at path: String, overrides: [String] = []) throws -> ComposeFile {
+        guard overrides.isEmpty else {
+            return try loadMergedComposeFile(base: path, overrides: overrides)
+        }
+        return try loadSingleComposeFile(at: path)
+    }
+
+    /// Deep-merge `base` with each override in order, then decode the result.
+    ///
+    /// Merging happens on the parsed YAML rather than on `ComposeFile`, so a
+    /// key cocker doesn't model yet still merges correctly instead of being
+    /// dropped by the first decode.
+    private func loadMergedComposeFile(base: String, overrides: [String]) throws -> ComposeFile {
+        var merged = try Self.parseYAMLObject(at: base)
+        for override in overrides {
+            merged = Self.deepMerge(base: merged, override: try Self.parseYAMLObject(at: override))
+        }
+        guard let text = try? Yams.dump(object: merged) else {
+            throw CockerError.invalidComposeFile("could not re-serialise the merged compose file")
+        }
+        do {
+            return try YAMLDecoder().decode(ComposeFile.self, from: text)
+        } catch {
+            throw CockerError.invalidComposeFile(
+                "YAML parse error after merging \(([base] + overrides).map { ($0 as NSString).lastPathComponent }.joined(separator: " + ")): \(error)")
+        }
+    }
+
+    /// Read a compose file and apply `${VAR}` substitution, without decoding.
+    static func parseYAMLObject(at path: String) throws -> [String: Any] {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+            throw CockerError.invalidComposeFile("Cannot read file: \(path)")
+        }
+        let dir = URL(fileURLWithPath: path).deletingLastPathComponent().path
+        let expanded = expandVariables(in: content, env: composeSubstitutionEnv(composeDir: dir))
+        guard let object = try? Yams.load(yaml: expanded) as? [String: Any] else {
+            throw CockerError.invalidComposeFile("YAML parse error in \(path)")
+        }
+        return object
+    }
+
+    /// Compose's merge rule: mappings merge key-by-key, everything else is
+    /// replaced. A sequence in an override wins outright rather than being
+    /// appended — that is what Docker does, and it is what lets an override
+    /// shorten a `command:` or replace a `ports:` list.
+    static func deepMerge(base: [String: Any], override: [String: Any]) -> [String: Any] {
+        var out = base
+        for (key, value) in override {
+            if let nestedOverride = value as? [String: Any],
+               let nestedBase = out[key] as? [String: Any] {
+                out[key] = deepMerge(base: nestedBase, override: nestedOverride)
+            } else {
+                out[key] = value
+            }
+        }
+        return out
+    }
+
+    private func loadSingleComposeFile(at path: String) throws -> ComposeFile {
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
             throw CockerError.invalidComposeFile("Cannot read file: \(path)")
         }
