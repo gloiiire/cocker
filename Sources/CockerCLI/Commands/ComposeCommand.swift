@@ -48,6 +48,16 @@ struct ComposeUpCommand: AsyncParsableCommand {
     @Flag(name: .customLong("remove-orphans"), help: "Remove containers for services not in compose file")
     var removeOrphans = false
 
+    /// Compose already filters services by profile, but nothing ever
+    /// populated the active set — so a service declaring `profiles:` could
+    /// never be started at all except by naming it on the command line. The
+    /// filter was there; the switch to turn it on wasn't.
+    ///
+    /// `COMPOSE_PROFILES` is honoured too, as Docker does.
+    @Option(name: .customLong("profile"),
+            help: "Enable a profile (repeatable; also reads COMPOSE_PROFILES)")
+    var profiles: [String] = []
+
     /// Docker semantics : an attached `up` aggregates every service's
     /// output, and `--attach` RESTRICTS that set rather than enabling it.
     /// Repeatable, like docker's.
@@ -63,6 +73,17 @@ struct ComposeUpCommand: AsyncParsableCommand {
 
     @Argument(help: "Services to start (default: all)", completion: .none)
     var services: [String] = []
+
+    /// `--profile web --profile debug`, plus `COMPOSE_PROFILES=web,debug`.
+    /// The flag wins where both are present, matching Docker.
+    static func resolvedProfiles(flag: [String],
+                                 environment: [String: String] = ProcessInfo.processInfo.environment) -> [String] {
+        if !flag.isEmpty { return flag }
+        guard let raw = environment["COMPOSE_PROFILES"], !raw.isEmpty else { return [] }
+        return raw.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
 
     mutating func run() async throws {
         let originalPath = resolvePath(file)
@@ -112,6 +133,9 @@ struct ComposeUpCommand: AsyncParsableCommand {
             projectName: effectiveProjectName,
             services: services,
             detach: detach,
+            // Compose could filter by profile but nothing ever populated the
+            // active set, so a service declaring `profiles:` was unstartable.
+            activeProfiles: Self.resolvedProfiles(flag: profiles),
             forceBuild: build,
             // Declared and referenced nowhere before, so a renamed or deleted
             // service left its container running with no way to reach it

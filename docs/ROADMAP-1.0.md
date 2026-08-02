@@ -80,7 +80,7 @@ failed, or losing data. Shipped in #357.
 | ✅ | Compose long syntax, `build:` shorthand, `entrypoint:`, shell-form `command:`, udp/range/host-IP ports (#358) |
 | ✅ | `/containers/{id}/archive` — Dev Containers can't inject the VS Code server without it |
 | ✅ | **Interactive TTY** — `exec -it` and `compose exec -it` work. Verified on an M3 Max: 5/5 interactive shell sessions, exit codes propagate through the shell (`exit 7` → 7), Ctrl-D reaches the container. Still missing: SIGWINCH mid-session, `run -it`, `attach` |
-| ⬜ | Hijacked raw streams on the API side, plus `/attach` and `/resize`. Today exec output is chunk-framed, so chunk headers land inside the stdcopy stream and corrupt it |
+| ⬜ | Hijacked raw streams on the API side, plus `/attach` and `/resize`. Today exec output is chunk-framed, so chunk headers land inside the stdcopy stream and corrupt it. (The *native* CLI path works — this is the Docker-socket surface) |
 | ⬜ | Multiple `-f` / `override.yml` merging, and `--profile` (compose parses profiles but nothing ever populates the active set) |
 
 ### v0.10 — "Focus"
@@ -97,9 +97,9 @@ failed, or losing data. Shipped in #357.
 
 | | |
 |---|---|
-| ⬜ | **Run the e2e suite.** The job targets a self-hosted `vm-capable` runner that doesn't exist, and is explicitly designed never to block a PR. Needs one M-series Mac — hosted runners are M1/M2 VMs and nested virtualisation is M3+, so this is hardware, not configuration |
-| ⬜ | **Gate releases on tests.** `release.yml` runs no tests at all: a tag can be built, signed, attested, bottled and published to the tap without `swift test` on that commit |
-| ⬜ | e2e coverage for registry push/pull, block volumes, `exec -it`, `compose down`, `logs -f`, and volume/network lifecycle — none have any test today |
+| ⬜ | **Run the e2e suite in CI.** The job targets a self-hosted `vm-capable` runner that doesn't exist, and is explicitly designed never to block a PR. Needs one M-series Mac — hosted runners are M1/M2 VMs and nested virtualisation is M3+, so this is hardware, not configuration |
+| ✅ | **Releases gated on tests.** `build-and-sign` now `needs: test` — `swift test` plus a cocker-init cross-compile and its C test, which `swift test` never covered |
+| 🚧 | e2e coverage. Added `11-exit-codes` and `12-exec-after-start`; suite is 12/12 green on real hardware. Still uncovered: registry push/pull, block volumes, `compose down`, `logs -f`, volume/network lifecycle |
 | ⬜ | Honest coverage reporting. The "90%" gate excludes 69.5% of `Sources/`, including `ImageManager`, `VMRuntime`, `ContainerEngine`, `DockerAPIServer` and all of `CockerCLI/Commands/` |
 | ⬜ | This document's commitments written into the README, and a deprecation policy |
 

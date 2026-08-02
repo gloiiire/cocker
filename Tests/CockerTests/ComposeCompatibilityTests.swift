@@ -3,6 +3,7 @@ import Testing
 import CockerCore
 import Yams
 @testable import CockerDaemon
+@testable import CockerCLI
 
 /// Compose files that mainstream tooling produces, and that cocker either
 /// rejected outright or silently mangled.
@@ -310,5 +311,50 @@ struct ComposeLongSyntaxTests {
             env_file: .env
         """)
         #expect(file.services["web"]?.env_file?.paths == [".env"])
+    }
+}
+
+/// `profiles:` was parsed, and `ComposeEngine` filtered on it correctly — but
+/// nothing ever populated the active set, so `activeProfiles` was always nil.
+/// A service declaring a profile could therefore never be started at all,
+/// except by naming it explicitly on the command line. The filter existed;
+/// the switch to turn it on didn't.
+@Suite("Compose --profile resolution")
+struct ComposeProfileFlagTests {
+
+    @Test func flagWins() {
+        #expect(ComposeUpCommand.resolvedProfiles(flag: ["web", "debug"],
+                                                  environment: [:]) == ["web", "debug"])
+    }
+
+    /// Docker reads `COMPOSE_PROFILES` when no flag is given.
+    @Test func fallsBackToTheEnvironment() {
+        #expect(ComposeUpCommand.resolvedProfiles(
+            flag: [], environment: ["COMPOSE_PROFILES": "web,debug"]) == ["web", "debug"])
+    }
+
+    @Test func flagOverridesTheEnvironment() {
+        #expect(ComposeUpCommand.resolvedProfiles(
+            flag: ["only"], environment: ["COMPOSE_PROFILES": "web,debug"]) == ["only"])
+    }
+
+    @Test func tolerateSpacingAndEmptyEntries() {
+        #expect(ComposeUpCommand.resolvedProfiles(
+            flag: [], environment: ["COMPOSE_PROFILES": " web , , debug "]) == ["web", "debug"])
+    }
+
+    @Test func absentMeansNoProfiles() {
+        #expect(ComposeUpCommand.resolvedProfiles(flag: [], environment: [:]).isEmpty)
+        #expect(ComposeUpCommand.resolvedProfiles(
+            flag: [], environment: ["COMPOSE_PROFILES": ""]).isEmpty)
+    }
+
+    /// The request has to carry them, or the daemon filters against nothing.
+    @Test func requestCarriesTheProfiles() throws {
+        let request = try IPCRequest(
+            type: .composeUp,
+            payload: ComposeRequest(composePath: "/x/compose.yml", activeProfiles: ["debug"]))
+        let decoded = try JSONDecoder().decode(ComposeRequest.self, from: request.payload)
+        #expect(decoded.activeProfiles == ["debug"])
     }
 }

@@ -91,6 +91,33 @@ awk '
 ' "$formula_file" > "$tmp"
 mv "$tmp" "$formula_file"
 
+# Regenerate the committed man pages.
+#
+# `Formula/cocker.rb` *prefers* `docs/man/*.1` from the tarball over
+# generating them during the brew build — its comment claims they are
+# "regenerated at every release on a developer machine and committed to
+# git". Nothing did that, so they sat frozen at v0.5.0 and every Homebrew
+# user read two-minor-versions-old documentation: `wait`, `icloud`,
+# `compose watch`, `shell-completion`, `autocomplete`, `prune` and the
+# `daemon` subcommands had no page at all.
+#
+# The plugin needs --allow-writing-to-package-directory and takes a while
+# (it builds the CLI first), so this is best-effort: a failure warns
+# rather than aborting the bump, and the stale pages are left in place.
+man_out=".build/plugins/GenerateManual/outputs/CockerCLI"
+echo ""
+echo "Regenerating man pages…"
+if swift package --allow-writing-to-package-directory generate-manual --multi-page >/dev/null 2>&1 \
+   && compgen -G "${man_out}/*.1" >/dev/null; then
+    rm -f docs/man/*.1
+    cp "${man_out}"/*.1 docs/man/
+    echo "  docs/man/                                 →  $(ls docs/man/*.1 | wc -l | tr -d ' ') pages"
+else
+    echo "  WARNING: man page generation failed — docs/man/ left unchanged." >&2
+    echo "           Run 'swift package --allow-writing-to-package-directory \\" >&2
+    echo "           generate-manual --multi-page' by hand before tagging." >&2
+fi
+
 # Pretty diff summary so a human can sanity-check what changed without
 # running `git diff` themselves.
 echo ""
