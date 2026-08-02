@@ -9,6 +9,8 @@ public enum IPCRequestType: String, Codable, Sendable {
     case ps, inspect, logs, top
     // Block until a container exits, then report its code
     case wait
+    /// Tell a `-t` container its terminal changed size (SIGWINCH).
+    case resize
     // Exec
     case exec
     /// Live stdin for an in-flight exec, on its own connection.
@@ -227,6 +229,16 @@ public enum ExitMarker {
     public static func parse(_ raw: String) -> Int32? {
         guard raw.hasPrefix("exit:") else { return nil }
         return Int32(raw.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
+/// `.resize` — new terminal geometry for a `-t` container.
+public struct ResizeRequest: Codable, Sendable {
+    public let id: String
+    public let rows: Int
+    public let cols: Int
+    public init(id: String, rows: Int, cols: Int) {
+        self.id = id; self.rows = rows; self.cols = cols
     }
 }
 

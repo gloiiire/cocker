@@ -1367,6 +1367,48 @@ final class VMRuntime: NSObject {
     /// Best-effort : a missing listener or closed connection is logged
     /// and ignored ; the outer stop() loop falls back to VZ's ACPI
     /// shutdown if the signal didn't trigger an exit within the timeout.
+    /// Tell a `-t` container its terminal changed size.
+    ///
+    /// The console's winsize is set once from the spec at start. Resizing the
+    /// host window afterwards left the container at the old size, so anything
+    /// that redraws wrapped at the wrong column for the rest of the session.
+    /// The console byte stream belongs to the application, so this rides the
+    /// same vsock the exec listener already serves.
+    func resizeTerminal(containerID: String, rows: Int, cols: Int) async {
+        guard rows > 0, cols > 0,
+              let running = runningVMs[containerID],
+              let socketDevice = running.vm.socketDevices.first as? VZVirtioSocketDevice
+        else { return }
+
+        let settled = ResumeOnceBox()
+        let connection: VZVirtioSocketConnection? = await withCheckedContinuation { cont in
+            Self.connectWithRetry(socketDevice, settled: settled) { result in
+                switch result {
+                case .success(let conn): cont.resume(returning: conn)
+                case .failure: cont.resume(returning: nil)
+                }
+            }
+        }
+        guard let connection else { return }
+        let holder = ConnectionHolder(connection)
+        defer { _ = holder.connection }
+
+        struct ResizeReq: Codable { let resize: Bool; let rows: Int; let cols: Int }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        guard let data = try? encoder.encode(ResizeReq(resize: true, rows: rows, cols: cols))
+        else { return }
+        let fd = connection.fileDescriptor
+        _ = data.withUnsafeBytes { buf -> Bool in
+            guard let base = buf.baseAddress else { return false }
+            return writeAllFD(fd, base, buf.count)
+        }
+        var nl: UInt8 = 0x0A
+        _ = writeAllFD(fd, &nl, 1)
+        // Best-effort : the guest replies with a one-line ack we don't need.
+        _ = Darwin.shutdown(fd, SHUT_WR)
+    }
+
     private func sendStopSignal(vm: VZVirtualMachine, containerID: String, signal: String) async {
         guard let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else {
             CockerLog.shared.debug("stopsig", "no vsock device for \(containerID)")

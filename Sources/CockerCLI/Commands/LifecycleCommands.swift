@@ -595,11 +595,12 @@ struct AttachCommand: AsyncParsableCommand {
         abstract: "Attach local STDIN/STDOUT/STDERR to a running container"
     )
 
-    /// Already how `attach` behaves: cocker never forwards stdin to a
-    /// running container (that needs the duplex PTY relay `exec -it` is
-    /// waiting on). Accepted so `docker attach --no-stdin` scripts parse.
+    /// `attach` used to be read-only — cocker had no way to reach a running
+    /// container's stdin, so this flag was documented as a no-op. It isn't
+    /// one any more: a container started with `-t` has a console the host
+    /// can write to, and `attach` now relays the local terminal into it.
     @Flag(name: .customLong("no-stdin"),
-          help: "No-op: attach is read-only, STDIN is never forwarded")
+          help: "Do not forward STDIN (view the output only)")
     var noStdin = false
 
     @Argument(help: "Container ID or name")
@@ -607,16 +608,48 @@ struct AttachCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+
+        // Only a container started with `-t` has a console the host can
+        // write into. Attaching stdin to one that hasn't would silently
+        // swallow every keystroke, so check first and stay read-only
+        // otherwise.
+        var containerHasTTY = false
+        if !noStdin, InteractiveSession.stdinIsTerminal {
+            let inspectReq = try IPCRequest(type: .inspect, payload: ContainerIDRequest(id: container))
+            if let info = try? await client.send(inspectReq).decode(Container.self) {
+                containerHasTTY = info.tty == true
+            }
+        }
+        let interactive = containerHasTTY
+
         let payload = ContainerIDRequest(id: container)
         let request = try IPCRequest(type: .attach, payload: payload)
 
         // Attach holds the terminal until the container stops, so it gets
         // the same pinned footer as the other continuous viewers. Piped, the
         // footer is inert and this is a plain pass-through.
+        //
+        // Not in interactive mode though: the footer reads stdin for its
+        // d/q keys, and two readers on one fd means it steals bytes out of
+        // the middle of what the user typed. The container owns the terminal.
         let footer = InteractiveFooter()
-        footer.start(footer: { footerLines(detach: true) }, onDetach: { true },
-                     plainFallback: false)
-        let view = StreamingLogView(footer: footer)
+        if !interactive {
+            footer.start(footer: { footerLines(detach: true) }, onDetach: { true },
+                         plainFallback: false)
+        }
+        let session: InteractiveSession? =
+            interactive ? InteractiveSession(sessionID: container) : nil
+        if let session {
+            session.enterRawMode()
+            session.startPump(containerStdin: true)
+            // The console is already up — nothing to hand-shake with.
+            session.markReady()
+        }
+        defer {
+            session?.stop()
+            session?.restore()
+        }
+        let view = StreamingLogView(footer: interactive ? nil : footer)
 
         let fail = UX.FailFlag()
         try await client.sendStreaming(request) { event in
@@ -632,6 +665,8 @@ struct AttachCommand: AsyncParsableCommand {
             }
         }
         view.finish()
+        session?.stop()
+        session?.restore()
         footer.restore()
         try fail.throwIfTripped()
     }
