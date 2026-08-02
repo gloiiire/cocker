@@ -135,8 +135,9 @@ public enum LeasePoolMonitor {
     /// recent IPv4 address handed out to that MAC, or nil if no entry
     /// matches. Used as a fallback when `/cocker-ip` polling times out
     /// because udhcpc inside the container raced and lost.
-    public static func lookupLeasedIP(forMAC mac: String) -> String? {
-        guard let text = try? String(contentsOfFile: leasesPath, encoding: .utf8)
+    public static func lookupLeasedIP(forMAC mac: String,
+                                      leasesAt: String = leasesPath) -> String? {
+        guard let text = try? String(contentsOfFile: leasesAt, encoding: .utf8)
         else { return nil }
         // Normalize MACs : drop leading zeros per octet so "02:cc:01:02:03:04"
         // matches "2:cc:1:2:3:4" (vmnet writes the short form).

@@ -181,6 +181,87 @@ struct LeasePoolMonitorTests {
         #expect(message.contains("clear-leases"))
     }
 
+    // MARK: - lookupLeasedIP
+    //
+    // The fallback used when `/cocker-ip` polling times out because udhcpc
+    // inside the container raced and lost. vmnet writes MACs with leading
+    // zeros stripped per octet, so a literal comparison against the MAC we
+    // handed the VM silently never matches.
+
+    private func leaseFile(_ body: String) throws -> (URL, String) {
+        let dir = try scratch()
+        let path = dir.appendingPathComponent("dhcpd_leases").path
+        try body.write(toFile: path, atomically: true, encoding: .utf8)
+        return (dir, path)
+    }
+
+    @Test func findsALeaseDespiteVmnetStrippingLeadingZeros() throws {
+        let (dir, path) = try leaseFile("""
+        {
+        \tip_address=192.168.64.7
+        \thw_address=1,2:cc:1:2:3:4
+        }
+        """)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect(LeasePoolMonitor.lookupLeasedIP(forMAC: "02:cc:01:02:03:04",
+                                                leasesAt: path) == "192.168.64.7")
+    }
+
+    /// vmnet appends new leases, so a MAC that was reissued an address must
+    /// resolve to the newest entry, not the first one seen.
+    @Test func theNewestLeaseForAMACWins() throws {
+        let (dir, path) = try leaseFile("""
+        {
+        \tip_address=192.168.64.7
+        \thw_address=1,2:cc:1:2:3:4
+        }
+        {
+        \tip_address=192.168.64.9
+        \thw_address=1,2:cc:1:2:3:4
+        }
+        """)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect(LeasePoolMonitor.lookupLeasedIP(forMAC: "02:cc:01:02:03:04",
+                                                leasesAt: path) == "192.168.64.9")
+    }
+
+    @Test func anUnknownMACHasNoLease() throws {
+        let (dir, path) = try leaseFile("""
+        {
+        \tip_address=192.168.64.7
+        \thw_address=1,2:cc:1:2:3:4
+        }
+        """)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect(LeasePoolMonitor.lookupLeasedIP(forMAC: "02:cc:99:99:99:99",
+                                                leasesAt: path) == nil)
+    }
+
+    // MARK: - deriveNATMAC
+
+    /// Must be stable: the MAC is how a container is found in the lease
+    /// file after a restart, so deriving a different one would lose the
+    /// address.
+    @Test func macIsDerivedDeterministicallyFromTheContainerID() {
+        let a = LeasePoolMonitor.deriveNATMAC(from: "abc123def456")
+        #expect(a == LeasePoolMonitor.deriveNATMAC(from: "abc123def456"))
+        #expect(a.hasPrefix("02:cc:"))
+        #expect(a.split(separator: ":").count == 6)
+    }
+
+    @Test func differentContainersGetDifferentMACs() {
+        #expect(LeasePoolMonitor.deriveNATMAC(from: "aaaaaaaa")
+                != LeasePoolMonitor.deriveNATMAC(from: "bbbbbbbb"))
+    }
+
+    /// A short or non-hex ID must still produce a well-formed address
+    /// rather than crashing on a prefix that isn't there.
+    @Test func shortIDsArePaddedIntoAValidMAC() {
+        let m = LeasePoolMonitor.deriveNATMAC(from: "a")
+        #expect(m.hasPrefix("02:cc:"))
+        #expect(m.split(separator: ":").count == 6)
+    }
+
     /// A reachable helper clears the pool in under two seconds, so a
     /// saturated pool must NOT block when the request lands.
     @Test func saturatedPoolWithAReachableHelperDoesNotBlock() throws {
