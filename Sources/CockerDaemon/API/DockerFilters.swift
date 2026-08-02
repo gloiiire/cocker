@@ -203,6 +203,7 @@ extension DockerFilters {
     func matches(network: NetworkInfo) -> Bool {
         guard matchesID(network.id) else { return false }
         guard matchesName(network.name) else { return false }
+        guard matchesLabels(network.labelMap) else { return false }
         guard matchesExact(network.driver.rawValue, key: "driver") else { return false }
         // Every cocker network is host-local and user-defined unless it's the
         // default bridge; report that vocabulary rather than dropping the key.

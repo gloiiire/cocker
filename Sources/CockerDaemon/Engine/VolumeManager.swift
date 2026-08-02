@@ -99,7 +99,8 @@ actor VolumeManager {
             name: request.name,
             mountpoint: imgURL.path,
             driver: request.driver,
-            labels: request.labels
+            labels: request.labels,
+            anonymous: request.anonymous ?? false
         )
 
         try await store.store(volume: volume)
@@ -115,6 +116,12 @@ actor VolumeManager {
 
     func list() async -> [VolumeInfo] {
         await store.allVolumes()
+    }
+
+    /// Like `get`, but nil rather than throwing for a volume that isn't
+    /// there — for callers doing cleanup, where "already gone" is fine.
+    func info(_ name: String) async -> VolumeInfo? {
+        await store.volume(id: name)
     }
 
     func remove(_ name: String, force: Bool = false) async throws {
@@ -171,8 +178,11 @@ actor VolumeManager {
         }
         // Named volume
         if await store.volume(id: mount.source) == nil {
-            // Auto-create anonymous volume
-            _ = try await create(request: VolumeCreateRequest(name: mount.source))
+            // Auto-create anonymous volume. Flagged as such so `rm -v` can
+            // tell it apart from a volume the user named and expects to
+            // outlive the container.
+            _ = try await create(request: VolumeCreateRequest(name: mount.source,
+                                                             anonymous: true))
         }
         let vol = try await get(mount.source)
         return vol.mountpoint

@@ -8,7 +8,11 @@ struct ImagesCommand: AsyncParsableCommand {
         abstract: "List images"
     )
 
-    @Flag(name: [.short, .customLong("all")], help: "Show all images")
+    /// Docker hides intermediate build layers without `-a`. Cocker never
+    /// records them as images, so the listing is already complete and this
+    /// flag has nothing to reveal. Accepted for script compatibility.
+    @Flag(name: [.short, .customLong("all")],
+          help: "No-op: cocker records no intermediate images, all are listed")
     var all = false
 
     @Flag(name: [.short, .customLong("quiet")], help: "Only show image IDs")

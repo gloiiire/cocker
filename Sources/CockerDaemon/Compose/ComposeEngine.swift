@@ -251,6 +251,27 @@ actor ComposeEngine {
 
         progressHandler(StreamEvent(stream: .status, data: "Starting project: \(projectName)\n"))
 
+        // `--remove-orphans` : drop containers still labelled for this project
+        // whose service the compose file no longer declares. The flag was
+        // declared on both `up` and `down` and referenced nowhere, so a
+        // renamed or deleted service left its container running forever with
+        // no way to reach it through compose.
+        //
+        // `down` needs no equivalent — it already sweeps every container
+        // carrying the project label, orphan or not.
+        if request.removeOrphans {
+            let known = Set(compose.services.keys)
+            let all = await containerEngine.list(all: true)
+            for container in all where container.labels["com.cocker.project"] == projectName {
+                guard let service = container.labels["com.cocker.service"],
+                      !known.contains(service) else { continue }
+                try? await containerEngine.stop(id: container.id)
+                try? await containerEngine.remove(id: container.id, force: true)
+                progressHandler(StreamEvent(stream: .status,
+                    data: "Removed orphan container: \(container.name)\n"))
+            }
+        }
+
         // Create networks first
         if let networks = compose.networks {
             for (name, netSpec) in networks where netSpec.external != true {
@@ -507,7 +528,19 @@ actor ComposeEngine {
             throw CockerError.invalidComposeFile("Service '\(serviceName)' not found")
         }
 
-        let runConfig = try buildRunConfig(service: service, serviceName: serviceName, projectName: projectName, compose: compose, composePath: request.composePath)
+        var runConfig = try buildRunConfig(service: service, serviceName: serviceName, projectName: projectName, compose: compose, composePath: request.composePath)
+        // `compose run <svc> <cmd...>` : the override was parsed by the CLI,
+        // never carried on the wire, and the service silently ran its
+        // compose-file command instead.
+        if let override = request.command, !override.isEmpty {
+            runConfig.command = override
+        }
+        // `--rm` was declared and never referenced, so one-off containers
+        // accumulated after every `compose run`.
+        runConfig.rm = request.removeAfterRun
+        // A one-off run gets its own container: reusing the service's name
+        // would collide with an `up` of the same project.
+        runConfig.name = nil
         let id = try await containerEngine.run(config: runConfig)
         progressHandler(StreamEvent(stream: .status, data: "Started container \(String(id.prefix(12)))\n"))
     }

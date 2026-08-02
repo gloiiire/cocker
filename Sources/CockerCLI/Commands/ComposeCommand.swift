@@ -112,7 +112,11 @@ struct ComposeUpCommand: AsyncParsableCommand {
             projectName: effectiveProjectName,
             services: services,
             detach: detach,
-            forceBuild: build
+            forceBuild: build,
+            // Declared and referenced nowhere before, so a renamed or deleted
+            // service left its container running with no way to reach it
+            // through compose.
+            removeOrphans: removeOrphans
         )
         let request = try IPCRequest(type: .composeUp, payload: payload)
 
@@ -348,7 +352,12 @@ struct ComposeDownCommand: AsyncParsableCommand {
     @Flag(name: [.customShort("v"), .customLong("volumes")], help: "Remove named volumes")
     var removeVolumes = false
 
-    @Flag(name: .customLong("remove-orphans"), help: "Remove orphaned containers")
+    /// Accepted for `docker compose` compatibility, but `down` already
+    /// removes every container carrying this project's label — orphans
+    /// included — so there is nothing extra to switch on. Kept (rather than
+    /// dropped) so existing scripts passing it don't fail to parse.
+    @Flag(name: .customLong("remove-orphans"),
+          help: "No-op: down always removes orphaned containers")
     var removeOrphans = false
 
     mutating func run() async throws {
@@ -596,7 +605,13 @@ struct ComposeRunCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let composePath = resolvePath(file)
         let client = IPCClient()
-        let payload = ComposeRequest(composePath: composePath, projectName: projectName, services: [service], detach: detach)
+        // `command` and `--rm` were parsed here and then dropped: the
+        // service ran its compose-file command and the one-off container
+        // was never cleaned up.
+        let payload = ComposeRequest(composePath: composePath, projectName: projectName,
+                                     services: [service], detach: detach,
+                                     command: command.isEmpty ? nil : command,
+                                     removeAfterRun: rm)
         let request = try IPCRequest(type: .composeRun, payload: payload)
 
         let fail = UX.FailFlag()

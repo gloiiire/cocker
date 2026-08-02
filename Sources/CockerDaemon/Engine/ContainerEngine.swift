@@ -987,7 +987,7 @@ final class ContainerEngine {
         emitEvent("container", action: "unpause", id: container.id)
     }
 
-    func remove(id: String, force: Bool = false) async throws {
+    func remove(id: String, force: Bool = false, removeVolumes: Bool = false) async throws {
         guard let container = await state.container(id: id) else {
             throw CockerError.containerNotFound(id)
         }
@@ -1013,7 +1013,41 @@ final class ContainerEngine {
         // disque pris par les modifications post-clonefile).
         try? await images.removeContainerRootfs(containerID: container.id)
         try await state.removeContainer(id: container.id)
+        // `rm -v` : drop the volumes cocker invented for this container. The
+        // flag was parsed and never acted on, so anonymous volumes accumulated
+        // on disk forever with no way to reclaim them by name.
+        //
+        // Only anonymous ones, and only when nothing else references them —
+        // a named volume outliving its container is the entire point of
+        // naming it. Removal happens after the container is out of the store
+        // so the in-use check below doesn't see the container we just removed.
+        if removeVolumes {
+            await removeAnonymousVolumes(of: container)
+        }
         emitEvent("container", action: "destroy", id: container.id)
+    }
+
+    /// Best-effort cleanup of a removed container's anonymous volumes.
+    /// A volume still referenced by another container is left alone, and a
+    /// single failure never fails the `rm` — the container is already gone.
+    private func removeAnonymousVolumes(of container: Container) async {
+        let survivors = await state.allContainers(includeAll: true)
+        for mount in container.volumes {
+            // Bind mounts are host paths, not managed volumes.
+            if mount.source.hasPrefix("/") { continue }
+            guard let volume = await volumes.info(mount.source), volume.isAnonymous else { continue }
+            let stillUsed = survivors.contains { other in
+                other.volumes.contains { $0.source == mount.source }
+            }
+            if stillUsed { continue }
+            do {
+                try await volumes.remove(mount.source)
+                emitEvent("volume", action: "destroy", id: mount.source)
+            } catch {
+                CockerLog.shared.warn("eng",
+                    "rm -v: could not remove anonymous volume \(mount.source): \(error)")
+            }
+        }
     }
 
     // MARK: - Query

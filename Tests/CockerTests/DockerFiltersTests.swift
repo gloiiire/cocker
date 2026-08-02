@@ -189,12 +189,24 @@ struct DockerFiltersTests {
         #expect(try filters(#"{"driver":["bridge"]}"#).matches(network: net))
     }
 
-    /// `NetworkInfo` carries no labels, so the key must be refused rather
-    /// than answered with networks nothing checked.
-    @Test func networkLabelFilterIsRefused() throws {
-        let f = try filters(#"{"label":["x=1"]}"#)
-        #expect(throws: DockerFilters.FilterError.self) {
-            try f.requireSupported(DockerFilters.networkKeys.filter { $0 != "label" })
-        }
+    /// `network create --label` reached the daemon and was dropped, so no
+    /// label filter could ever match. NetworkInfo carries them now.
+    @Test func networkFiltersOnLabel() throws {
+        let labelled = NetworkInfo(name: "shop_default", driver: .bridge,
+                                   labels: ["com.docker.compose.project": "shop"])
+        let bare = NetworkInfo(name: "blog_default", driver: .bridge)
+
+        let f = try filters(#"{"label":["com.docker.compose.project=shop"]}"#)
+        #expect(f.matches(network: labelled))
+        #expect(!f.matches(network: bare))
+        #expect(try filters(#"{"label":["x=1"]}"#).matches(network: bare) == false)
+    }
+
+    /// Networks written by an older daemon have no labels key at all; they
+    /// must decode rather than taking the whole state file down.
+    @Test func networkWithoutLabelsStillDecodes() throws {
+        let legacy = #"{"id":"abc","name":"bridge","driver":"bridge","subnet":"172.20.0.0/16","gateway":"172.20.0.1","subnet6":"fd00::/48","gateway6":"fd00::1","containers":[],"createdAt":0}"#
+        let net = try JSONDecoder().decode(NetworkInfo.self, from: Data(legacy.utf8))
+        #expect(net.labelMap.isEmpty)
     }
 }

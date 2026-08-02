@@ -405,6 +405,11 @@ public struct NetworkInfo: Codable, Sendable, Identifiable {
     public var gateway6: String
     public var containers: [String]
     public var createdAt: Date
+    /// `network create --label`. Optional so networks written by an older
+    /// daemon still decode; read it through `labelMap`.
+    public var labels: [String: String]?
+
+    public var labelMap: [String: String] { labels ?? [:] }
 
     public init(
         id: String = UUID().uuidString.prefix(12).lowercased(),
@@ -412,7 +417,8 @@ public struct NetworkInfo: Codable, Sendable, Identifiable {
         driver: NetworkDriver = .bridge,
         subnet: String = "172.20.0.0/16",
         gateway: String = "172.20.0.1",
-        containers: [String] = []
+        containers: [String] = [],
+        labels: [String: String] = [:]
     ) {
         self.id = String(id.prefix(12))
         self.name = name
@@ -422,6 +428,7 @@ public struct NetworkInfo: Codable, Sendable, Identifiable {
         self.subnet6 = "fd00:c0c4::/48"
         self.gateway6 = "fd00:c0c4::1"
         self.containers = containers
+        self.labels = labels
         self.createdAt = Date()
     }
 }
@@ -439,18 +446,30 @@ public struct VolumeInfo: Codable, Sendable, Identifiable {
     public var driver: String
     public var labels: [String: String]
     public var createdAt: Date
+    /// True when cocker invented this volume rather than the user naming it
+    /// — an auto-created mount source, or a compose service's anonymous
+    /// volume. Only these are eligible for `docker rm -v`; a named volume
+    /// outlives its containers by definition.
+    ///
+    /// Optional so volumes written by an older daemon still decode; read it
+    /// through `isAnonymous`.
+    public var anonymous: Bool?
+
+    public var isAnonymous: Bool { anonymous ?? false }
 
     public init(
         id: String = UUID().uuidString.prefix(12).lowercased(),
         name: String,
         mountpoint: String = "",
         driver: String = "local",
-        labels: [String: String] = [:]
+        labels: [String: String] = [:],
+        anonymous: Bool = false
     ) {
         self.id = String(id.prefix(12))
         self.name = name
         self.driver = driver
         self.labels = labels
+        self.anonymous = anonymous
         self.createdAt = Date()
         self.mountpoint = mountpoint.isEmpty
             ? "\(NSHomeDirectory())/.cocker/volumes/\(name)/_data"

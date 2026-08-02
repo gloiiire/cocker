@@ -46,7 +46,10 @@ actor NetworkManager {
             name: request.name,
             driver: request.driver,
             subnet: subnet,
-            gateway: gateway
+            gateway: gateway,
+            // `--label` reached this far and was then dropped on the floor,
+            // so `network ls --filter label=…` could never match anything.
+            labels: request.labels
         )
 
         try await store.store(network: network)

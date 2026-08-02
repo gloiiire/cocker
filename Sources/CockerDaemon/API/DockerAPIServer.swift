@@ -1121,10 +1121,7 @@ final class DockerAPIServer {
         let filters: DockerFilters
         do {
             filters = try DockerFilters.parse(req.query["filters"])
-            // `label` is absent from the supported set on purpose: NetworkInfo
-            // carries no labels, so accepting the key would answer with
-            // networks that were never checked against it.
-            try filters.requireSupported(DockerFilters.networkKeys.filter { $0 != "label" })
+            try filters.requireSupported(DockerFilters.networkKeys)
         } catch {
             return .error("\(error)", status: 400)
         }

@@ -124,7 +124,11 @@ struct StopCommand: AsyncParsableCommand {
         for id in containers {
             let start = Date()
             do {
-                let request = try IPCRequest(type: .stop, payload: ContainerIDRequest(id: id))
+                // `-t` was parsed and dropped; the grace period never left
+                // the CLI.
+                let request = try IPCRequest(type: .stop,
+                                             payload: ContainerIDRequest(id: id,
+                                                                         timeout: TimeInterval(timeout)))
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .stop, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
@@ -191,7 +195,9 @@ struct RestartCommand: AsyncParsableCommand {
         for id in containers {
             let start = Date()
             do {
-                let request = try IPCRequest(type: .restart, payload: ContainerIDRequest(id: id))
+                let request = try IPCRequest(type: .restart,
+                                             payload: ContainerIDRequest(id: id,
+                                                                         timeout: TimeInterval(timeout)))
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .restart, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
@@ -288,7 +294,11 @@ struct RmCommand: AsyncParsableCommand {
         for id in containers {
             let start = Date()
             do {
-                let request = try IPCRequest(type: .rm, payload: ContainerIDRequest(id: id, force: force))
+                // `-v` was parsed and never sent, so anonymous volumes piled
+                // up on disk with no way to reclaim them by name.
+                let request = try IPCRequest(type: .rm,
+                                             payload: ContainerIDRequest(id: id, force: force,
+                                                                         removeVolumes: volumes))
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
@@ -558,7 +568,11 @@ struct AttachCommand: AsyncParsableCommand {
         abstract: "Attach local STDIN/STDOUT/STDERR to a running container"
     )
 
-    @Flag(name: .customLong("no-stdin"), help: "Do not attach STDIN")
+    /// Already how `attach` behaves: cocker never forwards stdin to a
+    /// running container (that needs the duplex PTY relay `exec -it` is
+    /// waiting on). Accepted so `docker attach --no-stdin` scripts parse.
+    @Flag(name: .customLong("no-stdin"),
+          help: "No-op: attach is read-only, STDIN is never forwarded")
     var noStdin = false
 
     @Argument(help: "Container ID or name")

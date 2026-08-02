@@ -192,7 +192,9 @@ final class DaemonServer {
 
             case .stop:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
-                try await engine.stop(id: req.id)
+                // `-t` was parsed by the CLI and never sent, so the grace
+                // period was always the 10 s default.
+                try await engine.stop(id: req.id, timeout: req.timeout ?? 10)
                 try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
 
             case .kill:
@@ -202,7 +204,7 @@ final class DaemonServer {
 
             case .restart:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
-                try await engine.restart(id: req.id)
+                try await engine.restart(id: req.id, timeout: req.timeout ?? 10)
                 try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
 
             case .pause:
@@ -217,7 +219,8 @@ final class DaemonServer {
 
             case .rm:
                 let req = try JSONDecoder().decode(ContainerIDRequest.self, from: request.payload)
-                try await engine.remove(id: req.id, force: req.force ?? false)
+                try await engine.remove(id: req.id, force: req.force ?? false,
+                                        removeVolumes: req.removeVolumes ?? false)
                 try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
 
             case .ps:
