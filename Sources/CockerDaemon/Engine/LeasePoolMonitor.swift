@@ -10,22 +10,34 @@ import CockerCore
 /// minutes and every subsequent `cocker run` either gets stuck on DHCP
 /// or comes up with port-forwarding pointing at the fallback `127.0.0.1`.
 ///
-/// This module owns the four observability + admission-control checks
-/// cockerd performs around the lease pool :
+/// This module owns the observability + admission-control checks cockerd
+/// performs around the lease pool :
 ///
 ///   * `count()` — quick parse of how many leases are currently in the
 ///     file.
-///   * `helperInstalled()` — does the LaunchDaemon trigger plist exist ?
-///     If yes, the daemon can touch a file to ask root to truncate the
-///     pool.
-///   * `maybeTriggerClear()` — proactive nudge of the helper when the
-///     pool is approaching saturation. Cheap to call from the run path.
-///   * `preflightOrThrow()` — hard gate at the edge of saturation. Refuses
-///     `cocker run` with an actionable error message when the user has no
-///     helper installed AND the pool is full.
+///   * `helperInstalled()` — does the LaunchDaemon plist exist ? That and
+///     nothing more. It is **not** evidence the pool will get cleared,
+///     and must never decide that on its own.
+///   * `requestClear()` — ask the helper to truncate, and report whether
+///     the request was actually delivered. This is the predicate every
+///     decision below is built on.
+///   * `maybeTriggerClear()` — proactive nudge when the pool is
+///     approaching saturation. Cheap to call from the run path.
+///   * `preflightOrThrow()` — hard gate at the edge of saturation.
+///     Refuses `cocker run` with an actionable error whenever the pool is
+///     full and the helper did not accept the request.
 ///
-/// Pure, stateless, deliberately easy to unit-test : no actor isolation,
-/// no I/O beyond the lease file + the trigger file.
+/// The distinction between the second and third bullet is the whole point
+/// and was, for a while, the bug: three call sites read "the plist is on
+/// disk" as "root will fix this". A plist can sit installed while
+/// `launchctl` has never loaded it, and `/var/run` is root-owned while
+/// cockerd runs as the user — so the request was delivered to nobody. The
+/// inert plist then suppressed both the nudge and the warning, and the
+/// pool ran to 317 against a 256 ceiling while the daemon logged nothing.
+///
+/// Pure, stateless, and now genuinely easy to unit-test : every path it
+/// touches is a parameter, so the saturated-and-unreachable case is
+/// exercised without going near `/var/db`.
 public enum LeasePoolMonitor {
     /// Path of the bootp lease file vmnet uses for the shared NAT network.
     public static let leasesPath = "/var/db/dhcpd_leases"
