@@ -88,7 +88,9 @@ func main() async {
             }
         }
     } catch {
-        fputs("Failed to create data directories: \(error)\n", stderr)
+        DaemonMessage.failure("Cannot create the data directories",
+                              reason: "\(error)",
+                              hint: "check permissions on the --root path")
         exit(1)
     }
 
@@ -672,7 +674,7 @@ private func linkKernel(_ k: DiscoveredKernel, into kernelDir: URL) -> Bool {
     // ~/.container ; printing the path makes the trust decision
     // visible at install time so the user can spot anything odd.
     if !kernelPathLooksTrusted(k.vmlinuz) {
-        print("Warning: kernel path \(k.vmlinuz) is outside the usual " +
+        DaemonMessage.warning("kernel path \(k.vmlinuz) is outside the usual " +
               "Homebrew / Apple container / ~/.container prefixes. " +
               "Verify it's the kernel you intended to install before " +
               "starting cockerd.")
@@ -698,12 +700,14 @@ private func linkKernel(_ k: DiscoveredKernel, into kernelDir: URL) -> Bool {
         // an opaque VZ "config validate" error. fileExists follows symlinks,
         // so a true return == the underlying file is reachable.
         guard FileManager.default.fileExists(atPath: dstKernel.path) else {
-            print("Error: kernel symlink at \(dstKernel.path) doesn't resolve to a file (broken link or missing source).")
+            DaemonMessage.failure("Kernel symlink is broken",
+                              reason: "\(dstKernel.path) doesn't resolve to a file",
+                              hint: "re-run `cockerd setup` to re-create it")
             return false
         }
         return true
     } catch {
-        print("Warning: could not symlink kernel files: \(error)")
+        DaemonMessage.warning("could not symlink kernel files", note: "\(error)")
         return false
     }
 }
@@ -741,11 +745,12 @@ func runSetup(rootURL: URL) async {
                         )
                         print("✓ Linked cocker's shipped initrd: \(shippedInitrd)")
                     } catch {
-                        print("Warning: found shipped initrd at \(shippedInitrd) but failed to symlink: \(error)")
+                        DaemonMessage.warning("found a shipped initrd but could not symlink it",
+                                              note: "\(shippedInitrd): \(error)")
                     }
                 } else {
                     print("")
-                    print("⚠ initrd.img is still missing at \(cockerInitrd)")
+                    DaemonMessage.warning("initrd.img is still missing at \(cockerInitrd)")
                     print("  Apple's `container` doesn't ship a Linux initrd next to its kernel")
                     print("  (it builds per-container init filesystems instead). Cocker needs")
                     print("  its own initrd. Either run `./install.sh` from the cocker checkout")
@@ -792,7 +797,7 @@ func runSetup(rootURL: URL) async {
         return
     }
     guard FileManager.default.fileExists(atPath: entered) else {
-        print("✗ \(entered) does not exist.")
+        DaemonMessage.failure("\(entered) does not exist")
         return
     }
     let initrdSibling = (entered as NSString).deletingLastPathComponent + "/initrd.img"
