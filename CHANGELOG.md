@@ -1,0 +1,96 @@
+# Changelog
+
+Notable changes per release. Versions are `MAJOR.MINOR.PATCH.BUILD` — see
+[`docs/ROADMAP-1.0.md`](docs/ROADMAP-1.0.md) for what each segment means and what
+1.0 commits to.
+
+Entries describe what changed for *you*, not what moved in the code. A user
+should be able to read one line and know whether it affects them.
+
+## Unreleased
+
+The 1.0 correctness pass. Almost everything here is a case where cocker either
+reported success for something that failed, or lost data quietly. Verified on
+Apple silicon against real VMs.
+
+### Fixed — cocker was reporting success for failures
+
+- **`cocker run img false` exited 0.** The foreground path never read the
+  container's exit code. `run`, `wait`, `exec`, `compose exec` and the Docker
+  API's `/wait` and `/exec/{id}/json` all report the real code now. Anything
+  that shelled out to cocker in CI was passing unconditionally.
+- **`docker compose down` could tear down another project.** `?filters=` was
+  ignored on every list endpoint, so compose — which identifies its containers
+  purely by label — received every container on the host and treated the rest
+  as orphans.
+- **The 125/126/127 exit codes were flattened to 1.** Both by the IPC layer
+  dropping the error's kind and by commands throwing a blanket failure. A
+  script can now tell "no such container" (127) from "the daemon is down" (125).
+- **`login` never contacted the registry**, so a typo'd password "succeeded".
+- **`context create --docker host=tcp://…`** was accepted and silently routed
+  to the local daemon. **`network create -d overlay`** silently gave you a
+  bridge. Both refuse now.
+- **`node ls` invented a fresh UUID on every call**; `buildx ls` claimed a
+  BuildKit builder that doesn't exist; `container diff` marked the whole
+  filesystem as changed; `/containers/{id}/top` reported the same fake process
+  for every container. All either implemented properly or failing honestly.
+
+### Fixed — data loss
+
+- **A failed volume mount only logged a warning**, so the container started
+  with nothing mounted and wrote into the ephemeral rootfs. Everything was
+  gone at removal, silently. Fatal now.
+- **No filesystem check ever ran, and volumes were never unmounted** before
+  power-off — every volume was left dirty on every stop, forever.
+- **Two containers could mount the same volume image read-write.**
+- **`volume rm --force` deleted a volume out from under a running container.**
+- **`--shm-size` was dropped on every state reload**, so a database that asked
+  for 1 GiB of `/dev/shm` quietly got the default back after a daemon restart.
+
+### Fixed — things that never worked
+
+- **`cocker exec` failed for a window after every container start.** Measured:
+  20 consecutive plain `exec` calls all failed on a fresh container.
+- **`cocker buildx` was entirely broken** — a malformed flag declaration made
+  every subcommand, including `--help`, fail before running.
+- **The real `docker build` sent an empty context.** Request bodies arrive
+  chunked and the parser only read `Content-Length`.
+- **`docker-compose.override.yml` was ignored**, as were extra `-f` files.
+- **`build: ./dir`, long-syntax `ports`/`volumes`/`env_file`** rejected the
+  entire compose file. `entrypoint:` was parsed and discarded. `command:` in
+  string form was never shell-wrapped, so it couldn't run.
+- **`profiles:` made a service unstartable** — nothing populated the active set,
+  and there was no `--profile` flag.
+- **`cocker exec` couldn't see the container's environment.**
+- **`/containers/{id}/archive` was 501**, so Dev Containers couldn't inject the
+  VS Code server and `docker cp` didn't work.
+
+### Added
+
+- **Interactive terminals.** `run -it`, `exec -it`, `compose exec -it` and
+  `attach` all carry keystrokes, propagate exit codes, and follow window
+  resizes. Previously `exec -it` printed a warning saying typed input would
+  not reach the container.
+- **`cocker wait`.**
+- Docker API: `/containers/{id}/attach`, `/resize`, `/exec/{id}/resize`, and
+  hijacked raw streams so exec output is no longer corrupted by chunk framing.
+- `compose --profile` (and `COMPOSE_PROFILES`), repeatable `-f` with override
+  merging, `build.target`.
+
+### Changed
+
+- **Releases are gated on tests.** A tag used to be built, signed, attested and
+  published to the Homebrew tap without `swift test` ever running on it.
+- `swarm`, `stack`, `service`, `node` and `buildx` no longer appear in
+  `cocker --help`. The commands still exist and still parse.
+- Man pages are regenerated on every version bump — they had been frozen at
+  v0.5.0, and 14 commands had no page at all.
+- Coverage reporting publishes two numbers: the gated scope and all of
+  `Sources/`.
+
+### Known limitations
+
+See [`docs/ROADMAP-1.0.md`](docs/ROADMAP-1.0.md). In short: healthchecks go
+through virtiofs rather than vsock; roughly 256 concurrent containers; a
+100 MiB cap on request bodies sent to the Docker socket; `COPY --chown`,
+`--chmod`, `ONBUILD` and `SHELL` are parsed but not applied (they warn).
