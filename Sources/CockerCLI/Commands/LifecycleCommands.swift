@@ -428,12 +428,23 @@ struct ExecCommand: AsyncParsableCommand {
         //      real-time interactive yet (needs duplex IPC + PTY relay).
         //      Print a clear warning and leave stdin empty.
         //   3. `-i` not set : skip stdin handling entirely.
+        // Live interactive session : raw mode locally, stdin streamed to the
+        // daemon on a side channel, PTY allocated in the guest. This branch
+        // used to print "typed input will not reach the container" and drop
+        // the keystrokes on the floor.
+        let session: InteractiveSession? =
+            (interactive && InteractiveSession.stdinIsTerminal) ? InteractiveSession() : nil
+        if let session {
+            config.sessionID = session.sessionID
+            if tty, let size = InteractiveSession.windowSize() {
+                config.rows = size.rows
+                config.cols = size.cols
+            }
+        }
+
         if interactive {
             if isatty(fileno(stdin)) == 1 {
-                UX.Warning.emit(
-                    "live interactive stdin (TTY) isn't supported yet",
-                    note: "pipe input via `echo … | cocker exec -i …` or file redirection ; typed input will not reach the container"
-                )
+                // Handled by the live session above — nothing to slurp.
             } else {
                 let maxBytes = 64 * 1024 * 1024
                 var collected = Data()
@@ -463,14 +474,29 @@ struct ExecCommand: AsyncParsableCommand {
         // `.status` event carrying `exit:<n>` used to be dropped here, so
         // `cocker exec c false` reported success.
         let status = ExitStatusBox()
+        // Raw mode goes on before the first byte of output and comes off no
+        // matter how we leave — a half-restored terminal is the worst
+        // possible failure mode for an interactive command.
+        // Read stdin from the start so nothing typed early is lost; the
+        // pump holds it until the daemon reports its vsock is up.
+        session?.enterRawMode()
+        session?.startPump()
+        defer {
+            session?.stop()
+            session?.restore()
+        }
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: UX.writeStreamChunk(event.data)
             case .stderr: UX.writeStderr(event.data)
-            case .status: status.consume(statusPayload: event.data)
+            case .status:
+                if event.data == "exec-ready" { session?.markReady() }
+                status.consume(statusPayload: event.data)
             case .error: UX.writeStderr(event.data)
             }
         }
+        session?.stop()
+        session?.restore()
         if status.code != 0 { throw ExitCode(status.code) }
     }
 }
