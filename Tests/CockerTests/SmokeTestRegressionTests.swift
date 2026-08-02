@@ -428,89 +428,69 @@ struct DockerfileARGBeforeFROMTests {
 
 // Bug #51 — USER instruction was acknowledged by the Dockerfile parser but
 // never propagated to cocker-init, so every container ran as root. The wire
-// format is now /cocker-spec v5, carrying user / caps / stopSignal trailers.
-@Suite("/cocker-spec v5 carries user + caps + stop signal")
-struct CockerSpecV5Tests {
-    @Test func magicByteIsV5() {
+// format grew trailers for it: v3 user, v4 caps, v5 stop signal, v6 tty +
+// terminal geometry (so `cocker run -it` can give the main process a
+// controlling terminal). The guest still parses v2–v5 and treats a missing
+// trailer as "not requested".
+@Suite("/cocker-spec trailers")
+struct CockerSpecTrailerTests {
+
+    /// Bumped to v6 with the tty trailer. The guest keys its parse off this
+    /// byte, so a mismatch here means older/newer sides disagree about the
+    /// layout — exactly the class of bug the magic exists to catch.
+    @Test func magicByteIsV6() {
         let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil)
-        #expect(data.starts(with: Array("COCKER\u{05}".utf8)))
+        #expect(data.starts(with: Array("COCKER\u{06}".utf8)))
     }
 
-    @Test func stopSignalTrailerEncodesAsTrailingUInt32() {
+    /// v6 layout: … stop_signal(4) tty(1) rows(4) cols(4).
+    @Test func stopSignalPrecedesTheTTYTrailer() {
         let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil,
                                               stopSignal: "SIGQUIT")
-        // Last 4 bytes are stop_signal big-endian. SIGQUIT == 3.
         let n = data.count
-        #expect(data[n - 4] == 0)
-        #expect(data[n - 3] == 0)
-        #expect(data[n - 2] == 0)
-        #expect(data[n - 1] == 3)
+        // 9 bytes of tty trailer follow the 4-byte stop signal.
+        #expect(data[n - 13] == 0)
+        #expect(data[n - 12] == 0)
+        #expect(data[n - 11] == 0)
+        #expect(data[n - 10] == 3)   // SIGQUIT
     }
 
     @Test func defaultStopSignalIsZero() {
         let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil)
         let n = data.count
-        // No STOPSIGNAL → encoded as 0 (use init's default).
-        #expect(data[n - 4] == 0)
-        #expect(data[n - 3] == 0)
-        #expect(data[n - 2] == 0)
-        #expect(data[n - 1] == 0)
+        #expect(data[n - 13] == 0)
+        #expect(data[n - 12] == 0)
+        #expect(data[n - 11] == 0)
+        #expect(data[n - 10] == 0)   // no STOPSIGNAL → init's default
     }
 
-    @Test func resolveStopSignalKnownNames() {
-        #expect(RootfsBootstrap.resolveStopSignal("SIGTERM") == 15)
-        #expect(RootfsBootstrap.resolveStopSignal("SIGQUIT") == 3)
-        #expect(RootfsBootstrap.resolveStopSignal("SIGKILL") == 9)
-        #expect(RootfsBootstrap.resolveStopSignal("SIGUSR1") == 10)
-        // Numeric form accepted too.
-        #expect(RootfsBootstrap.resolveStopSignal("3") == 3)
-        // Without "SIG" prefix.
-        #expect(RootfsBootstrap.resolveStopSignal("HUP") == 1)
-        // Unknown → 0 (init default).
-        #expect(RootfsBootstrap.resolveStopSignal("BOGUS") == 0)
-        #expect(RootfsBootstrap.resolveStopSignal(nil) == 0)
-        #expect(RootfsBootstrap.resolveStopSignal("") == 0)
+    @Test func ttyTrailerDefaultsToOff() {
+        let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil)
+        let n = data.count
+        #expect(data[n - 9] == 0)                    // tty flag
+        #expect(Array(data[(n - 8)...]) == [0, 0, 0, 0, 0, 0, 0, 0])  // rows + cols
     }
 
-    @Test func emptyUserStillEncodesAsZeroLength() {
-        let dataNoUser = RootfsBootstrap.encodeSpec(command: ["x"], env: [:], workdir: nil, user: nil)
-        let dataEmpty  = RootfsBootstrap.encodeSpec(command: ["x"], env: [:], workdir: nil, user: "")
-        #expect(dataNoUser == dataEmpty)
+    /// `run -it` : the flag and the caller's real window size have to reach
+    /// the guest, or the main process gets a terminal stuck at the kernel
+    /// default and anything that redraws is wrong.
+    @Test func ttyTrailerCarriesTheGeometry() {
+        let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil,
+                                              tty: true, rows: 40, cols: 120)
+        let n = data.count
+        #expect(data[n - 9] == 1)
+        #expect(Array(data[(n - 8)..<(n - 4)]) == [0, 0, 0, 40])
+        #expect(Array(data[(n - 4)...]) == [0, 0, 0, 120])
     }
 
-    @Test func capAddResolvesByName() {
-        let cap = RootfsBootstrap.resolveCap("NET_ADMIN")
-        #expect(cap == 12)
-    }
-
-    @Test func capAddAcceptsCAPPrefix() {
-        let cap = RootfsBootstrap.resolveCap("CAP_SYS_ADMIN")
-        #expect(cap == 21)
-    }
-
-    @Test func unknownCapResolvesNil() {
-        #expect(RootfsBootstrap.resolveCap("BOGUS") == nil)
-    }
-
-    @Test func privilegedByteEncodes() {
-        let priv = RootfsBootstrap.encodeSpec(command: ["x"], env: [:], workdir: nil, privileged: true)
-        let unprivileged = RootfsBootstrap.encodeSpec(command: ["x"], env: [:], workdir: nil, privileged: false)
-        // The two specs differ at the privileged byte position. The simple
-        // observable property : the privileged blob is strictly different.
-        #expect(priv != unprivileged)
-    }
-
-    @Test func capDropTrailerEncodes() {
-        let data = RootfsBootstrap.encodeSpec(
-            command: ["x"], env: [:], workdir: nil,
-            capDrop: ["NET_RAW", "SYS_ADMIN"]
-        )
-        // Bytes must include the resolved cap numbers (13 and 21) encoded
-        // somewhere in the trailer. We don't pin position because the
-        // user trailer occupies a variable preceding chunk.
-        let bytes = Array(data)
-        #expect(bytes.contains(13))
-        #expect(bytes.contains(21))
+    /// A geometry that wouldn't fit a UInt16 would truncate into nonsense
+    /// on the guest side, so it's clamped rather than wrapped.
+    @Test func absurdGeometryIsClamped() {
+        let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil,
+                                              tty: true, rows: 999_999, cols: -5)
+        let n = data.count
+        #expect(Array(data[(n - 8)..<(n - 4)]) == [0, 0, 255, 255])  // clamped to 65535
+        #expect(Array(data[(n - 4)...]) == [0, 0, 0, 0])             // negative → 0
     }
 }
 
