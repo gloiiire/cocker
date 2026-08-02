@@ -62,6 +62,11 @@ public struct Container: Codable, Sendable, Identifiable {
     /// device" errors. Plumbed through the kernel cmdline so cocker-init
     /// can size the shm mount before the user process starts.
     public var shmSizeMB: UInt64?
+    /// `run -it` : the main process gets the console as a controlling
+    /// terminal. Optional so containers written by an older daemon decode.
+    public var tty: Bool?
+    public var ttyRows: Int?
+    public var ttyCols: Int?
 
     public init(
         id: String = UUID().uuidString.prefix(12).lowercased(),
@@ -534,6 +539,10 @@ public struct RunConfig: Codable, Sendable {
     /// all before, so both paths decoded the value and discarded it and an
     /// ENTRYPOINT override was simply impossible.
     public var entrypoint: [String]?
+    /// Terminal geometry for `run -it`, so the container's main process
+    /// starts at the caller's real size.
+    public var rows: Int?
+    public var cols: Int?
     public var name: String?
     public var detach: Bool
     public var interactive: Bool
@@ -586,6 +595,8 @@ public struct RunConfig: Codable, Sendable {
         self.image = image
         self.command = command
         self.entrypoint = nil
+        self.rows = nil
+        self.cols = nil
         self.name = nil
         self.detach = false
         self.interactive = false

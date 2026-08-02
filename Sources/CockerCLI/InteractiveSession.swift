@@ -16,8 +16,11 @@ import CockerCore
 /// sharing one connection would deadlock.
 final class InteractiveSession: @unchecked Sendable {
 
-    /// Identifies this exec to the daemon across both connections.
-    let sessionID = UUID().uuidString
+    /// Identifies this exec to the daemon across both connections — or, for
+    /// `run -it`, the container whose console receives the bytes.
+    let sessionID: String
+
+    init(sessionID: String = UUID().uuidString) { self.sessionID = sessionID }
 
     private let lock = NSLock()
     private var original = termios()
@@ -96,7 +99,8 @@ final class InteractiveSession: @unchecked Sendable {
     /// for hours and must never park a Swift cooperative-executor thread —
     /// while one long-lived Task drains the stream, keeping chunks ordered on
     /// a single connection.
-    func startPump(socketPath: String = IPCClient.defaultSocketPath) {
+    func startPump(socketPath: String = IPCClient.defaultSocketPath,
+                   containerStdin: Bool = false) {
         let session = sessionID
         let (chunks, feed) = AsyncStream.makeStream(of: ExecInputRequest.self)
 
@@ -134,11 +138,13 @@ final class InteractiveSession: @unchecked Sendable {
                 let n = read(fileno(stdin), &buffer, buffer.count)
                 if n < 0 && errno == EINTR { continue }
                 guard n > 0 else { break }  // EOF or error
-                feed.yield(ExecInputRequest(sessionID: session, data: Data(buffer.prefix(n))))
+                feed.yield(ExecInputRequest(sessionID: session, data: Data(buffer.prefix(n)),
+                                            isContainerStdin: containerStdin))
             }
             // Local stdin closed. Tell the daemon to half-close the vsock so
             // a child blocked in read() sees EOF instead of hanging.
-            feed.yield(ExecInputRequest(sessionID: session, eof: true))
+            feed.yield(ExecInputRequest(sessionID: session, eof: true,
+                                        isContainerStdin: containerStdin))
             feed.finish()
         }
     }

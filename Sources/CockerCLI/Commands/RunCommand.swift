@@ -133,6 +133,14 @@ struct RunCommand: AsyncParsableCommand {
         config.detach = detach
         config.interactive = interactive
         config.tty = tty
+        // `run -it` : the container's main process gets the console as a
+        // controlling terminal, sized to the caller's window. Only when we
+        // actually have a terminal to relay — piping into `run -t` would
+        // otherwise put the guest in a tty it can never receive input from.
+        if tty, let size = InteractiveSession.windowSize() {
+            config.rows = size.rows
+            config.cols = size.cols
+        }
         config.rm = rm
         config.ports = try portSpecs.map { try PortMapping.parse($0) }
         config.volumes = try volumeSpecs.map { try VolumeMount.parse($0) }
@@ -201,9 +209,20 @@ struct RunCommand: AsyncParsableCommand {
                 header.append("   " + UX.TTY.paint("http://localhost:\(p.hostPort)", .accent))
             }
             let cid = result.containerID
+            // `-it` hands the terminal to the container, so the footer must
+            // not also be reading stdin. Two readers on one fd means the
+            // footer's key handler steals bytes out of the middle of what the
+            // user typed — verified on hardware: `exit` reached the shell as
+            // `xit`. In interactive mode we show the header once and keep our
+            // hands off the keyboard.
+            let interactiveTTY = interactive && tty && InteractiveSession.stdinIsTerminal
             let footer = InteractiveFooter()
             // Pinned footer: the container URLs and the d/q hints stay
             // visible at the bottom while output scrolls above them.
+            if interactiveTTY {
+                // One-shot header, no key capture.
+                for line in header { print(line) }
+            } else {
             footer.start(
                 footer: { footerLines(header: header, detach: true, quit: true) },
                 onDetach: {
@@ -221,14 +240,35 @@ struct RunCommand: AsyncParsableCommand {
                 },
                 // Piped: no keyboard, so no key hints in the output.
                 plainFallback: false)
+            }
 
-            let view = StreamingLogView(footer: footer)
+            // `-it` : relay the local terminal into the container's console.
+            // Without this the container had a tty it could never be typed
+            // into — `cocker run -it alpine sh` showed a prompt and ignored
+            // every keystroke.
+            let session: InteractiveSession? =
+                interactiveTTY ? InteractiveSession(sessionID: result.containerID) : nil
+            if let session {
+                session.enterRawMode()
+                session.startPump(containerStdin: true)
+                // The console is up as soon as the container is running;
+                // there is no connect handshake to wait for here.
+                session.markReady()
+            }
+            defer {
+                session?.stop()
+                session?.restore()
+            }
+
+            let view = StreamingLogView(footer: interactiveTTY ? nil : footer)
             let logsReq = LogsRequest(id: result.containerID, follow: true, tail: 0)
             let streamReq = try IPCRequest(type: .logs, payload: logsReq)
             try await client.sendStreaming(streamReq) { event in
                 view.emit(event)
             }
             view.finish()
+            session?.stop()
+            session?.restore()
             footer.restore()
 
             // Docker parity : a foreground `run` exits with the container's

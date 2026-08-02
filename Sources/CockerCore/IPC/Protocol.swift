@@ -319,13 +319,21 @@ public struct VolumesResponse: Codable, Sendable {
 
 /// A chunk of live stdin for an in-flight exec, or the EOF that ends it.
 public struct ExecInputRequest: Codable, Sendable {
+    /// Exec session id, or — when `isContainerStdin` is set — the container
+    /// whose *main* process should receive the bytes. `run -it` needs the
+    /// same side channel for the same reason exec did: the connection
+    /// streaming output can't read a second frame.
     public let sessionID: String
+    /// Route to the container's console rather than to an exec session.
+    public let isContainerStdin: Bool?
     public let data: Data?
     /// The caller closed its stdin. The daemon half-closes the vsock so the
     /// in-VM child sees EOF instead of blocking forever.
     public let eof: Bool
-    public init(sessionID: String, data: Data? = nil, eof: Bool = false) {
+    public init(sessionID: String, data: Data? = nil, eof: Bool = false,
+                isContainerStdin: Bool = false) {
         self.sessionID = sessionID; self.data = data; self.eof = eof
+        self.isContainerStdin = isContainerStdin
     }
 }
 

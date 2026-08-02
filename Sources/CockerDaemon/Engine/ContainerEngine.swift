@@ -276,6 +276,12 @@ final class ContainerEngine {
             stopSignal: config.stopSignal ?? imageInfo?.stopSignal
         )
         container.shmSizeMB = config.shmSizeMB
+        // `run -it` : remembered on the container so the spec written at
+        // start time asks init for a controlling terminal, and so a restart
+        // keeps it.
+        container.tty = config.tty
+        container.ttyRows = config.rows
+        container.ttyCols = config.cols
         if let workdir = resolvedWorkdir { container.env["WORKDIR"] = workdir }
 
         CockerLog.shared.debug("eng", "container struct created")
@@ -1165,6 +1171,15 @@ final class ContainerEngine {
 
     /// Route a chunk of live stdin (or its EOF) into an in-flight exec.
     func execInput(_ req: ExecInputRequest) {
+        if req.isContainerStdin == true {
+            // `run -it` / `attach` : straight to the container's console,
+            // which init has made the main process's controlling terminal.
+            if let data = req.data, !data.isEmpty {
+                vmRuntime.writeContainerInput(containerID: req.sessionID, data: data)
+            }
+            if req.eof { vmRuntime.closeContainerInput(containerID: req.sessionID) }
+            return
+        }
         if let data = req.data, !data.isEmpty {
             vmRuntime.writeExecInput(session: req.sessionID, data: data)
         }
