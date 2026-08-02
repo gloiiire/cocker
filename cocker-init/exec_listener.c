@@ -481,11 +481,19 @@ static void handle_one(int client_fd) {
          * any error / EOF, then we'll waitpid the child and emit marker. */
         fd_set rfds;
         char buf[4096];
+        /* The host may close its stdin long before the command finishes —
+         * `printf … | cocker exec -it c sh`, or a user pressing Ctrl-D. That
+         * must not end the session: the child keeps running and its output
+         * still has to reach the host. Breaking the loop here abandoned that
+         * output and closed the socket the host was still reading, which it
+         * saw as ECONNRESET. */
+        int client_eof = 0;
         for (;;) {
             FD_ZERO(&rfds);
             FD_SET(master_fd, &rfds);
-            FD_SET(client_fd, &rfds);
-            int maxfd = master_fd > client_fd ? master_fd : client_fd;
+            if (!client_eof) FD_SET(client_fd, &rfds);
+            int maxfd = master_fd;
+            if (!client_eof && client_fd > maxfd) maxfd = client_fd;
             struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
             int rv = select(maxfd + 1, &rfds, NULL, NULL, &tv);
             if (rv < 0) { if (errno == EINTR) continue; break; }
@@ -494,10 +502,18 @@ static void handle_one(int client_fd) {
                 if (n <= 0) break;
                 write(client_fd, buf, (size_t)n);
             }
-            if (FD_ISSET(client_fd, &rfds)) {
+            if (!client_eof && FD_ISSET(client_fd, &rfds)) {
                 ssize_t n = read(client_fd, buf, sizeof(buf));
-                if (n <= 0) break;
-                write(master_fd, buf, (size_t)n);
+                if (n <= 0) {
+                    /* Deliver EOF to the child the way a terminal does — ^D
+                     * on the master — then stop watching this side and keep
+                     * pumping the child's output until it exits. */
+                    client_eof = 1;
+                    char eot = 0x04;
+                    write(master_fd, &eot, 1);
+                } else {
+                    write(master_fd, buf, (size_t)n);
+                }
             }
             /* Detect child exit non-blocking : if waitpid would reap, break. */
             int wstat;

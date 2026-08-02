@@ -168,6 +168,11 @@ final class VMRuntime: NSObject {
     /// absorb indefinitely.
     private static let execInputPendingCap = 1 << 20  // 1 MiB
 
+    /// Sessions whose caller closed stdin before the vsock was up. Verified
+    /// on hardware: dropping this made `echo x | cocker exec -i c cat` hang
+    /// forever, because the child never saw EOF.
+    private var execInputPendingEOF: Set<String> = []
+
     /// Called once the vsock is up: adopt the fd and flush anything buffered.
     private func registerExecInput(session: String, fd: Int32) {
         execInputFDs[session] = fd
@@ -177,11 +182,17 @@ final class VMRuntime: NSObject {
                 return writeAllFD(fd, base, buf.count)
             }
         }
+        // Apply a deferred EOF *after* the buffered bytes, or the child reads
+        // an empty stdin.
+        if execInputPendingEOF.remove(session) != nil {
+            _ = Darwin.shutdown(fd, SHUT_WR)
+        }
     }
 
     private func unregisterExecInput(session: String) {
         execInputFDs.removeValue(forKey: session)
         execInputPending.removeValue(forKey: session)
+        execInputPendingEOF.remove(session)
     }
 
     /// Write a chunk of live stdin into an exec. Buffers if the vsock hasn't
@@ -203,7 +214,12 @@ final class VMRuntime: NSObject {
     /// The caller's stdin hit EOF. Half-close so the in-VM child sees it and
     /// stops waiting for more; the read side stays open for its output.
     func closeExecInput(session: String) {
-        guard let fd = execInputFDs[session] else { return }
+        guard let fd = execInputFDs[session] else {
+            // The vsock isn't up yet. Remember, and apply at register time —
+            // silently dropping this is what made a piped `exec -i` hang.
+            execInputPendingEOF.insert(session)
+            return
+        }
         _ = Darwin.shutdown(fd, SHUT_WR)
     }
 

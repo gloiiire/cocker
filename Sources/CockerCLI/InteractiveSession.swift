@@ -23,6 +23,7 @@ final class InteractiveSession: @unchecked Sendable {
     private var original = termios()
     private var rawActive = false
     private var stopped = false
+    private var sendTask: Task<Void, Never>?
 
     // MARK: - Terminal
 
@@ -75,49 +76,60 @@ final class InteractiveSession: @unchecked Sendable {
 
     /// Stream stdin to the daemon until EOF or `stop()`.
     ///
-    /// Runs the blocking `read(2)` on a GCD queue rather than a Task, so it
-    /// never parks a Swift cooperative-executor thread while waiting on a
-    /// keystroke that may not come for hours.
+    /// Two halves on purpose. A GCD queue owns the blocking `read(2)` — a
+    /// keystroke may not come for hours and that must never park a Swift
+    /// cooperative-executor thread. A single long-lived Task owns the
+    /// sending, draining an AsyncStream so chunks reach the daemon strictly
+    /// in order on one connection.
+    ///
+    /// An earlier version blocked the reader on a semaphore waiting for a
+    /// per-chunk Task. Under load that Task wasn't always scheduled before
+    /// the timeout, so input was silently dropped — caught on hardware, not
+    /// by any unit test.
     func startPump(socketPath: String = IPCClient.defaultSocketPath) {
         let session = sessionID
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let (chunks, feed) = AsyncStream.makeStream(of: ExecInputRequest.self)
+
+        sendTask = Task.detached(priority: .userInitiated) {
             let client = IPCClient(socketPath: socketPath)
+            for await request in chunks {
+                guard let frame = try? IPCRequest(type: .execInput, payload: request) else { continue }
+                // A dropped chunk isn't worth tearing the session down over;
+                // the output stream is the authority on whether it's alive.
+                _ = try? await client.send(frame)
+            }
+            await client.disconnect()
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var buffer = [UInt8](repeating: 0, count: 4096)
             while true {
                 if self?.isStopped ?? true { break }
                 let n = read(fileno(stdin), &buffer, buffer.count)
                 if n < 0 && errno == EINTR { continue }
                 guard n > 0 else { break }  // EOF or error
-                let chunk = Data(buffer.prefix(n))
-                Self.send(ExecInputRequest(sessionID: session, data: chunk), via: client)
+                feed.yield(ExecInputRequest(sessionID: session, data: Data(buffer.prefix(n))))
             }
             // Local stdin closed. Tell the daemon to half-close the vsock so
-            // a child blocked on read() sees EOF instead of hanging.
-            Self.send(ExecInputRequest(sessionID: session, eof: true), via: client)
+            // a child blocked in read() sees EOF instead of hanging.
+            feed.yield(ExecInputRequest(sessionID: session, eof: true))
+            feed.finish()
         }
     }
 
     func stop() {
-        lock.lock(); stopped = true; lock.unlock()
+        lock.lock()
+        let alreadyStopped = stopped
+        stopped = true
+        let task = sendTask
+        sendTask = nil
+        lock.unlock()
+        guard !alreadyStopped else { return }
+        task?.cancel()
     }
 
     private var isStopped: Bool {
         lock.lock(); defer { lock.unlock() }
         return stopped
-    }
-
-    /// Fire-and-forget. A dropped stdin chunk is not worth tearing the
-    /// session down over — the output stream is the authority on whether the
-    /// exec is still alive.
-    private static func send(_ request: ExecInputRequest, via client: IPCClient) {
-        guard let frame = try? IPCRequest(type: .execInput, payload: request) else { return }
-        let semaphore = DispatchSemaphore(value: 0)
-        Task {
-            _ = try? await client.send(frame)
-            semaphore.signal()
-        }
-        // Keep the pump serial: chunks must reach the daemon in order, and
-        // the guest's PTY is a byte stream where reordering corrupts input.
-        _ = semaphore.wait(timeout: .now() + 5)
     }
 }
