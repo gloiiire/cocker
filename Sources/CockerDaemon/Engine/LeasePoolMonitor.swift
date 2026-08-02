@@ -45,46 +45,89 @@ public enum LeasePoolMonitor {
     /// else macOS hands out while we're checking.
     public static let hardThreshold = 252
 
-    public static func count() -> Int {
-        guard let s = try? String(contentsOfFile: leasesPath, encoding: .utf8)
+    public static func count(leasesAt: String = leasesPath) -> Int {
+        guard let s = try? String(contentsOfFile: leasesAt, encoding: .utf8)
         else { return 0 }
         return s.components(separatedBy: "ip_address=").count - 1
     }
 
-    public static func helperInstalled() -> Bool {
-        FileManager.default.fileExists(atPath: helperPlistPath)
+    /// The plist is on disk. That is all this answers — it is **not**
+    /// proof the helper can act, and must never be used on its own to
+    /// decide whether the pool will get cleared. Use `requestClear()`.
+    public static func helperInstalled(plistPath: String = helperPlistPath) -> Bool {
+        FileManager.default.fileExists(atPath: plistPath)
     }
 
-    /// Proactive nudge — touch the trigger file when the pool is past
-    /// `softWatermark`. Only meaningful if the helper is installed ;
-    /// otherwise we no-op (the watchdog in main.swift surfaces the
-    /// situation to the user with a high-priority log line).
+    /// Ask the helper to truncate the pool. Returns whether the request
+    /// was actually delivered.
+    ///
+    /// The return value is the point. Every caller here used to treat
+    /// "the plist exists" as proof the helper would act, and discard the
+    /// result of the write with `try?`. Two things make that wrong at the
+    /// same time, and this machine had both:
+    ///
+    ///  * The plist can sit installed while `launchctl` has never loaded
+    ///    it — nothing consumes the trigger file, so the request is
+    ///    delivered to no one.
+    ///  * `/var/run` is `root:daemon` and `cockerd` runs as the user, so
+    ///    the write fails with `EACCES` regardless.
+    ///
+    /// Observed consequence: the pool walked to 317 against a ceiling of
+    /// 256 while `cockerd` logged *nothing at all* — the presence of an
+    /// inert plist suppressed both the nudge and the warning — and
+    /// containers failed DHCP in silence. A saturated pool is now
+    /// reported whenever the request cannot be delivered.
+    @discardableResult
+    public static func requestClear(triggerAt: String = triggerPath,
+                                    plistPath: String = helperPlistPath) -> Bool {
+        guard helperInstalled(plistPath: plistPath) else { return false }
+        // Always attempt the write rather than short-circuiting on an
+        // existing trigger file: a trigger nobody consumes lingers
+        // forever, and treating it as "a clear is already pending" is
+        // exactly how a dead helper passes for a live one.
+        do {
+            try Data().write(to: URL(fileURLWithPath: triggerAt))
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Proactive nudge — ask for a clear when the pool is past
+    /// `softWatermark`.
     public static func maybeTriggerClear() {
         let c = count()
         guard c > softWatermark else { return }
-        guard helperInstalled() else { return }
-        let trigger = URL(fileURLWithPath: triggerPath)
-        guard !FileManager.default.fileExists(atPath: trigger.path) else { return }
-        _ = try? Data().write(to: trigger)
-        CockerLog.shared.debug("lease-gc", "pool at \(c) — touched helper trigger")
+        if requestClear() {
+            CockerLog.shared.debug("lease-gc", "pool at \(c) — touched helper trigger")
+        }
+        // Silence here is deliberate: the watchdog in main.swift owns the
+        // rate-limited warning, and this runs on the container start path.
     }
 
     /// Hard pre-flight gate. Called from `ContainerEngine.run()` before any
     /// VM resource is allocated. Refusing early with the exact fix command
     /// in the message turns a 30-min debugging session into a 10 s helper
     /// install.
-    public static func preflightOrThrow() throws {
-        let c = count()
+    public static func preflightOrThrow(leasesAt: String = leasesPath,
+                                        triggerAt: String = triggerPath,
+                                        plistPath: String = helperPlistPath) throws {
+        let c = count(leasesAt: leasesAt)
         guard c >= hardThreshold else { return }
-        // Helper present : the watchdog / runPreflight path will touch the
-        // trigger and clear it in <2 s. Don't block.
-        if helperInstalled() { return }
+        // A helper we can actually reach clears the pool in <2 s, so don't
+        // block. "Installed" is not the test — "reachable" is; see
+        // `requestClear()` for what an installed-but-inert helper cost.
+        if requestClear(triggerAt: triggerAt, plistPath: plistPath) { return }
+        let fix = helperInstalled(plistPath: plistPath)
+            ? "The lease helper is installed but did not accept the request — "
+              + "reinstall it with `cocker daemon helper-install`, "
+              + "or clear once with `cocker daemon clear-leases`."
+            : "Fix once and forever : `cocker daemon helper-install` "
+              + "(one sudo prompt, then forget). "
+              + "Or one-shot : `cocker daemon clear-leases`."
         throw CockerError.internalError(
-            "macOS DHCP pool saturated (\(c)/\(approximateCeiling)). " +
-            "New containers can't get an IP. " +
-            "Fix once and forever : `cocker daemon helper-install` " +
-            "(one sudo prompt, then forget). " +
-            "Or one-shot : `cocker daemon clear-leases`."
+            "macOS DHCP pool saturated (\(c)/\(approximateCeiling)). "
+            + "New containers can't get an IP. " + fix
         )
     }
 

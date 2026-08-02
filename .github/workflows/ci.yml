@@ -477,6 +477,17 @@ jobs:
       - name: Start a daemon on an isolated root
         # A dedicated --root keeps CI containers, images and build cache
         # away from whatever the machine's owner is running.
+        #
+        # --root and --socket do NOT isolate the DNS listener, which binds
+        # a fixed port (default 5300). The self-hosted runner is somebody's
+        # actual Mac, so their own cockerd is usually up and already holds
+        # it: the CI daemon then logs `WARN [dns] TCP listener bind failed`,
+        # both daemons end up bound to the same UDP port on the same
+        # bridge, and container DHCP becomes a coin flip. Results go flaky
+        # rather than failing outright, which is worse — this cost a full
+        # e2e run reporting four failures that had nothing to do with the
+        # commit. `Tests/e2e/README.md` has said "COCKER_DNS_PORT is not
+        # optional" for a while; this is the workflow finally obeying it.
         run: |
           ROOT="$RUNNER_TEMP/cocker-ci-root"
           rm -rf "$ROOT" && mkdir -p "$ROOT/kernel"
@@ -485,7 +496,9 @@ jobs:
           cp cocker-init/initrd.img "$ROOT/kernel/initrd.img"
           echo "COCKER_CI_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "COCKER_HOST=unix://$ROOT/cocker.sock" >> "$GITHUB_ENV"
-          nohup ./.build/release/cockerd --root "$ROOT" --socket "$ROOT/cocker.sock" \
+          echo "COCKER_DNS_PORT=5399" >> "$GITHUB_ENV"
+          nohup env COCKER_DNS_PORT=5399 \
+            ./.build/release/cockerd --root "$ROOT" --socket "$ROOT/cocker.sock" \
             > "$RUNNER_TEMP/cockerd.log" 2>&1 &
           for _ in $(seq 1 30); do
             COCKER_HOST="unix://$ROOT/cocker.sock" ./.build/release/cocker info >/dev/null 2>&1 && break
