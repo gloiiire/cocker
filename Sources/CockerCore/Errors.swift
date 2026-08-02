@@ -48,7 +48,10 @@ public enum CockerError: Error, CustomStringConvertible {
     /// message VERBATIM — unlike `requestFailed`, its `description` adds no
     /// prefix, so the CLI doesn't stack "Request failed: Build failed: …".
     /// The transport throws this instead of re-wrapping daemon errors.
-    case daemon(String)
+    /// A failure reported by cockerd. The `Int32?` is the daemon's own
+    /// `exitCode` for that error, so the taxonomy survives the socket —
+    /// without it every remote failure collapsed to a plain 1.
+    case daemon(String, Int32? = nil)
 
     // Config errors
     case invalidPortMapping(String)
@@ -106,7 +109,7 @@ public enum CockerError: Error, CustomStringConvertible {
         case .connectionFailed(let msg): return "Connection failed: \(msg)"
         case .requestFailed(let msg): return "Request failed: \(msg)"
         case .responseDecodingFailed(let msg): return "Response decoding failed: \(msg)"
-        case .daemon(let msg): return msg
+        case .daemon(let msg, _): return msg
         case .invalidPortMapping(let s): return "Invalid port mapping: \(s) (expected format: host:container)"
         case .invalidVolumeSpec(let s): return "Invalid volume spec: \(s) (expected format: source:dest[:ro])"
         case .invalidEnvironmentVar(let s): return "Invalid environment variable: \(s)"
@@ -147,7 +150,7 @@ public enum CockerError: Error, CustomStringConvertible {
             return ("Invalid port mapping: \(s)", nil, "expected `host:container`")
         case .invalidVolumeSpec(let s):
             return ("Invalid volume spec: \(s)", nil, "expected `source:dest[:ro]`")
-        case .daemon(let msg):
+        case .daemon(let msg, _):
             // The daemon already wrote a good message. Lift a leading
             // "Xxx failed: …" into headline + reason so it reads as a block
             // (e.g. "Build failed: RUN … exited 1" → what/why), otherwise
@@ -173,6 +176,10 @@ public enum CockerError: Error, CustomStringConvertible {
             return 127  // no such object
         case .permissionDenied, .notImplemented:
             return 126  // found but not runnable
+        case .daemon(_, let code):
+            // The daemon told us what kind of failure this was ; keep it.
+            // An older daemon sends nothing, so a plain failure it is.
+            return code ?? 1
         case .daemonNotRunning, .connectionFailed, .responseDecodingFailed,
              .kernelNotFound, .initrdNotFound, .vmStartFailed, .vmStopFailed,
              .vmCommunicationFailed:

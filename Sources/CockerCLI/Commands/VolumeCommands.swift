@@ -99,7 +99,7 @@ struct VolumeCreateCommand: AsyncParsableCommand {
                 reason: error.description,
                 hint: "another volume may already be named `\(volumeName)` — `cocker volume ls`"
             )
-            throw ExitCode.failure
+            throw ExitCode(error.exitCode)
         }
     }
 }
@@ -115,7 +115,7 @@ struct VolumeRmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for name in volumes {
             let start = Date()
             do {
@@ -131,7 +131,7 @@ struct VolumeRmCommand: AsyncParsableCommand {
                 // `cocker volume rm -f x && …` continued as if the volume
                 // were gone. `--force` relaxes *which* volumes may be
                 // removed; it never turns a refusal into a success.
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot remove volume \(name)",
                     reason: error.description,
@@ -139,7 +139,7 @@ struct VolumeRmCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 

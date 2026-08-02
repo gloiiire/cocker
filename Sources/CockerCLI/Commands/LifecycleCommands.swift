@@ -36,7 +36,7 @@ struct StartCommand: AsyncParsableCommand {
         }
 
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -62,7 +62,7 @@ struct StartCommand: AsyncParsableCommand {
                     footer.restore()
                 }
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot start container \(id)",
                     reason: error.description,
@@ -70,7 +70,7 @@ struct StartCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -85,7 +85,7 @@ struct WaitCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             do {
                 let request = try IPCRequest(type: .wait, payload: ContainerIDRequest(id: id))
@@ -94,7 +94,7 @@ struct WaitCommand: AsyncParsableCommand {
                 // code is data here, not this command's own status.
                 print(try response.decode(WaitResponse.self).exitCode)
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot wait on container \(id)",
                     reason: error.description,
@@ -102,7 +102,7 @@ struct WaitCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -120,7 +120,7 @@ struct StopCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -132,7 +132,7 @@ struct StopCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .stop, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot stop container \(id)",
                     reason: error.description,
@@ -140,7 +140,7 @@ struct StopCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -158,7 +158,7 @@ struct KillCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -166,14 +166,14 @@ struct KillCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .kill, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot kill container \(id)",
                     reason: error.description
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -191,7 +191,7 @@ struct RestartCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -201,14 +201,14 @@ struct RestartCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .restart, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot restart container \(id)",
                     reason: error.description
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -223,7 +223,7 @@ struct PauseCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -231,7 +231,7 @@ struct PauseCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .pause, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot pause container \(id)",
                     reason: error.description,
@@ -239,7 +239,7 @@ struct PauseCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -254,7 +254,7 @@ struct UnpauseCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -262,14 +262,14 @@ struct UnpauseCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .unpause, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot unpause container \(id)",
                     reason: error.description
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -290,7 +290,7 @@ struct RmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for id in containers {
             let start = Date()
             do {
@@ -302,7 +302,7 @@ struct RmCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.container, id, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot remove container \(id)",
                     reason: error.description,
@@ -310,7 +310,7 @@ struct RmCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -546,6 +546,7 @@ struct CpCommand: AsyncParsableCommand {
                     reason: "neither source nor destination starts with `<container>:`",
                     hint: "format : `cocker cp <container>:/src /host/dst` or `cocker cp /host/src <container>:/dst`"
                 )
+                // Usage error, not a daemon failure — plain 1.
                 throw ExitCode.failure
             }
             UX.printResult(.container, containerLabel, verb: .copy, elapsed: Date().timeIntervalSince(start))
@@ -554,7 +555,7 @@ struct CpCommand: AsyncParsableCommand {
                 headline: "Cannot copy files",
                 reason: error.description
             )
-            throw ExitCode.failure
+            throw ExitCode(error.exitCode)
         }
     }
 }
