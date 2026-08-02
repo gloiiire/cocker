@@ -987,7 +987,7 @@ final class ContainerEngine {
         emitEvent("container", action: "unpause", id: container.id)
     }
 
-    func remove(id: String, force: Bool = false) async throws {
+    func remove(id: String, force: Bool = false, removeVolumes: Bool = false) async throws {
         guard let container = await state.container(id: id) else {
             throw CockerError.containerNotFound(id)
         }
@@ -1013,7 +1013,41 @@ final class ContainerEngine {
         // disque pris par les modifications post-clonefile).
         try? await images.removeContainerRootfs(containerID: container.id)
         try await state.removeContainer(id: container.id)
+        // `rm -v` : drop the volumes cocker invented for this container. The
+        // flag was parsed and never acted on, so anonymous volumes accumulated
+        // on disk forever with no way to reclaim them by name.
+        //
+        // Only anonymous ones, and only when nothing else references them —
+        // a named volume outliving its container is the entire point of
+        // naming it. Removal happens after the container is out of the store
+        // so the in-use check below doesn't see the container we just removed.
+        if removeVolumes {
+            await removeAnonymousVolumes(of: container)
+        }
         emitEvent("container", action: "destroy", id: container.id)
+    }
+
+    /// Best-effort cleanup of a removed container's anonymous volumes.
+    /// A volume still referenced by another container is left alone, and a
+    /// single failure never fails the `rm` — the container is already gone.
+    private func removeAnonymousVolumes(of container: Container) async {
+        let survivors = await state.allContainers(includeAll: true)
+        for mount in container.volumes {
+            // Bind mounts are host paths, not managed volumes.
+            if mount.source.hasPrefix("/") { continue }
+            guard let volume = await volumes.info(mount.source), volume.isAnonymous else { continue }
+            let stillUsed = survivors.contains { other in
+                other.volumes.contains { $0.source == mount.source }
+            }
+            if stillUsed { continue }
+            do {
+                try await volumes.remove(mount.source)
+                emitEvent("volume", action: "destroy", id: mount.source)
+            } catch {
+                CockerLog.shared.warn("eng",
+                    "rm -v: could not remove anonymous volume \(mount.source): \(error)")
+            }
+        }
     }
 
     // MARK: - Query
@@ -1023,13 +1057,24 @@ final class ContainerEngine {
 
         for (key, value) in filter {
             switch key {
-            case "status": containers = containers.filter { $0.status.rawValue == value }
+            case "status":
+                // Accept both vocabularies : cocker's state machine says
+                // `stopped` where Docker says `exited`, and users type the
+                // Docker one.
+                containers = containers.filter {
+                    $0.status.rawValue == value || DockerFilters.dockerStatusName($0.status) == value
+                }
             case "name": containers = containers.filter { $0.name.contains(value) }
             case "image": containers = containers.filter { $0.image.contains(value) }
             case "label":
+                // `label=key=value` (exact) or `label=key` (presence). The
+                // presence form used to be dropped, so `--filter label=foo`
+                // silently returned every container.
                 let kv = value.split(separator: "=", maxSplits: 1)
                 if kv.count == 2 {
                     containers = containers.filter { $0.labels[String(kv[0])] == String(kv[1]) }
+                } else {
+                    containers = containers.filter { $0.labels[value] != nil }
                 }
             default: break
             }
@@ -1234,6 +1279,64 @@ final class ContainerEngine {
         AuditLog.write(type: type, action: action, id: id)
     }
 
+    // MARK: - Exit-code publication
+
+    /// How many finished containers keep a readable exit code after their
+    /// state entry is gone. Only `--rm` containers ever need this, and a
+    /// caller that hasn't asked within 128 exits has lost interest.
+    private static let recentExitCapacity = 128
+
+    /// Callers parked in `wait(id:)`, keyed by canonical container id.
+    /// Resolved by the watcher at the instant the container reaches a
+    /// terminal state — before `--rm` removes it from the state store.
+    private var exitWaiters: [String: [CheckedContinuation<Int32, Never>]] = [:]
+
+    /// Bounded FIFO of recently-observed exit codes. This is what lets
+    /// `cocker run --rm alpine false` still report 1 : by the time the CLI
+    /// asks, the container no longer exists anywhere else.
+    private var recentExits: [(id: String, code: Int32)] = []
+
+    /// Record a terminal exit and wake everyone waiting on it.
+    private func publishExit(id: String, code: Int32) {
+        recentExits.append((id: id, code: code))
+        if recentExits.count > Self.recentExitCapacity {
+            recentExits.removeFirst(recentExits.count - Self.recentExitCapacity)
+        }
+        for waiter in exitWaiters.removeValue(forKey: id) ?? [] {
+            waiter.resume(returning: code)
+        }
+    }
+
+    private func recentExit(for id: String) -> Int32? {
+        recentExits.last(where: { $0.id == id })?.code
+    }
+
+    /// Block until `id` reaches a terminal state, then return its exit code.
+    /// Backs both `cocker run` in the foreground and `GET /containers/{id}/wait`.
+    ///
+    /// Returns immediately for a container that has already finished,
+    /// including one `--rm` has since removed (see `recentExits`).
+    func wait(id: String) async throws -> Int32 {
+        guard let container = await state.container(id: id) else {
+            // Already reaped by `--rm`. The watcher stashed the code on its
+            // way out ; anything older than that is genuinely unknown.
+            if let code = recentExit(for: id) { return code }
+            throw CockerError.containerNotFound(id)
+        }
+        // Terminal already — no need to park.
+        if container.status == .stopped || container.status == .dead {
+            return container.exitCode ?? 0
+        }
+        let cid = container.id
+        // Everything below runs without an await until the continuation is
+        // registered, and `publishExit` is @MainActor too — so the watcher
+        // cannot slip an exit past us between this check and the parking.
+        if let code = recentExit(for: cid) { return code }
+        return await withCheckedContinuation { cont in
+            exitWaiters[cid, default: []].append(cont)
+        }
+    }
+
     // MARK: - Container watcher
 
     private func watchContainer(id: String, rm: Bool) async {
@@ -1361,6 +1464,11 @@ final class ContainerEngine {
                 // --rm` cycle leaked ~8 FDs into cockerd → daemon hits
                 // its FD ceiling after a few hundred runs.
                 await vmRuntime.cleanup(containerID: id)
+                // Publish the code *before* `--rm` drops the container, so
+                // `cocker run` / `docker wait` can still read it. Racing an
+                // inspect against removal is what made `cocker run --rm img
+                // false` report success.
+                publishExit(id: id, code: exitCode)
                 if rm {
                     try? await state.removeContainer(id: id)
                 }

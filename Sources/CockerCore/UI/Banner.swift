@@ -258,6 +258,7 @@ public enum Banner {
         out += row("stop",      "Stop one or more running containers")
         out += row("kill",      "Send a signal to running containers")
         out += row("restart",   "Restart one or more containers")
+        out += row("wait",      "Block until containers stop, print exit codes")
         out += row("pause",     "Pause processes in container(s)")
         out += row("unpause",   "Unpause processes in container(s)")
         out += row("rm",        "Remove one or more containers")

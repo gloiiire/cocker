@@ -230,6 +230,21 @@ struct RunCommand: AsyncParsableCommand {
             }
             view.finish()
             footer.restore()
+
+            // Docker parity : a foreground `run` exits with the container's
+            // code. Without this the CLI always returned 0, so
+            // `cocker run img false && echo ok` printed ok and every CI step
+            // shelling out to cocker passed no matter what the container did.
+            //
+            // `.wait` rather than an inspect because `--rm` removes the
+            // container the instant it stops — the daemon publishes the code
+            // before the removal, so this is race-free where an inspect
+            // would 404. Reaching here means the stream ended on its own :
+            // `q` and `d` exit from inside the footer, above.
+            let waitReq = try IPCRequest(type: .wait, payload: ContainerIDRequest(id: result.containerID))
+            let waitResp = try await client.send(waitReq)
+            let code = try waitResp.decode(WaitResponse.self).exitCode
+            if code != 0 { throw ExitCode(code) }
         }
     }
 

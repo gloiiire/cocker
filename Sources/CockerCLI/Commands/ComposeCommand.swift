@@ -112,7 +112,11 @@ struct ComposeUpCommand: AsyncParsableCommand {
             projectName: effectiveProjectName,
             services: services,
             detach: detach,
-            forceBuild: build
+            forceBuild: build,
+            // Declared and referenced nowhere before, so a renamed or deleted
+            // service left its container running with no way to reach it
+            // through compose.
+            removeOrphans: removeOrphans
         )
         let request = try IPCRequest(type: .composeUp, payload: payload)
 
@@ -348,7 +352,12 @@ struct ComposeDownCommand: AsyncParsableCommand {
     @Flag(name: [.customShort("v"), .customLong("volumes")], help: "Remove named volumes")
     var removeVolumes = false
 
-    @Flag(name: .customLong("remove-orphans"), help: "Remove orphaned containers")
+    /// Accepted for `docker compose` compatibility, but `down` already
+    /// removes every container carrying this project's label — orphans
+    /// included — so there is nothing extra to switch on. Kept (rather than
+    /// dropped) so existing scripts passing it don't fail to parse.
+    @Flag(name: .customLong("remove-orphans"),
+          help: "No-op: down always removes orphaned containers")
     var removeOrphans = false
 
     mutating func run() async throws {
@@ -557,13 +566,18 @@ struct ComposeExecCommand: AsyncParsableCommand {
         let payload = ExecRequest(config: config)
         let request = try IPCRequest(type: .exec, payload: payload)
 
+        // Same contract as `cocker exec` : propagate the command's exit code
+        // instead of swallowing the `exit:<n>` status event.
+        let status = ExitStatusBox()
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: UX.writeStderr(event.data)
-            default: break
+            case .status: status.consume(statusPayload: event.data)
+            case .error: UX.writeStderr(event.data)
             }
         }
+        if status.code != 0 { throw ExitCode(status.code) }
     }
 }
 
@@ -591,7 +605,13 @@ struct ComposeRunCommand: AsyncParsableCommand {
     mutating func run() async throws {
         let composePath = resolvePath(file)
         let client = IPCClient()
-        let payload = ComposeRequest(composePath: composePath, projectName: projectName, services: [service], detach: detach)
+        // `command` and `--rm` were parsed here and then dropped: the
+        // service ran its compose-file command and the one-off container
+        // was never cleaned up.
+        let payload = ComposeRequest(composePath: composePath, projectName: projectName,
+                                     services: [service], detach: detach,
+                                     command: command.isEmpty ? nil : command,
+                                     removeAfterRun: rm)
         let request = try IPCRequest(type: .composeRun, payload: payload)
 
         let fail = UX.FailFlag()

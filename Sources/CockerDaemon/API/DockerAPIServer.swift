@@ -25,11 +25,20 @@ final class DockerAPIServer {
     // In-flight exec sessions: execID -> container ID + command
     private var execSessions: [String: ExecSession] = [:]
 
+    /// How many finished exec sessions stay inspectable. Well past what any
+    /// client reads back, and bounded so the daemon's footprint stays flat.
+    private static let finishedExecRetention = 64
+
     struct ExecSession {
         let containerID: String
         let command: [String]
         let env: [String: String]
         let tty: Bool
+        var user: String?
+        var workdir: String?
+        /// nil until the command finishes. `/exec/{id}/json` reports
+        /// `Running: true` while it is nil, exactly like Docker.
+        var exitCode: Int32?
     }
 
     init(socketPath: String, engine: ContainerEngine) {
@@ -551,9 +560,23 @@ final class DockerAPIServer {
     // MARK: - Container handlers
 
     private func handleContainerList(req: HTTPRequest) async -> HTTPResponse {
-        let all = req.query["all"] == "true" || req.query["all"] == "1"
+        var all = req.query["all"] == "true" || req.query["all"] == "1"
+        let filters: DockerFilters
+        do {
+            filters = try DockerFilters.parse(req.query["filters"])
+            try filters.requireSupported(DockerFilters.containerKeys)
+        } catch {
+            return .error("\(error)", status: 400)
+        }
+        // Asking for a non-running status implies looking past running
+        // containers, exactly as Docker does — otherwise
+        // `--filter status=exited` returns nothing without `-a`.
+        if filters.values("status").contains(where: { $0 != "running" }) || !filters.values("exited").isEmpty {
+            all = true
+        }
         let containers = await engine.list(all: all)
-        let summaries = containers.map { DockerContainerSummary(from: $0) }
+        let summaries = containers.filter { filters.matches(container: $0) }
+                                  .map { DockerContainerSummary(from: $0) }
         return .json(summaries)
     }
 
@@ -809,9 +832,23 @@ final class DockerAPIServer {
     }
 
     private func handleContainerWait(id: String) async -> HTTPResponse {
-        struct WaitResponse: Encodable { let StatusCode: Int; let Error: WaitError?
+        struct WaitBody: Encodable { let StatusCode: Int; let Error: WaitError?
             struct WaitError: Encodable { let Message: String } }
-        return .json(WaitResponse(StatusCode: 0, Error: nil))
+        // Really block until the container is done, and report the real code.
+        // This used to return StatusCode 0 immediately, which made every
+        // exit-code-dependent client — `docker run`, `compose up
+        // --abort-on-container-exit`, `depends_on: service_completed_
+        // successfully`, every CI runner — see unconditional success.
+        //
+        // Parking here suspends rather than blocks : the router is actor-
+        // isolated, so the actor is released while we wait and other
+        // requests keep flowing on their own connections.
+        do {
+            let code = try await engine.wait(id: id)
+            return .json(WaitBody(StatusCode: Int(code), Error: nil))
+        } catch {
+            return .notFound(id)
+        }
     }
 
     private func handleContainerPrune() async -> HTTPResponse {
@@ -839,9 +876,24 @@ final class DockerAPIServer {
             containerID: id,
             command: execReq.Cmd,
             env: env,
-            tty: execReq.Tty ?? false
+            tty: execReq.Tty ?? false,
+            user: execReq.User,
+            workdir: execReq.WorkingDir
         )
+        pruneFinishedExecSessions()
         return .json(DockerExecCreateResponse(Id: execID), status: 201)
+    }
+
+    /// Finished exec sessions stay readable so `/exec/{id}/json` can report
+    /// the exit code — Docker keeps them for the container's lifetime. We
+    /// keep a bounded window instead, so a long-lived daemon doing
+    /// thousands of `docker exec` calls doesn't grow without limit.
+    private func pruneFinishedExecSessions() {
+        let finished = execSessions.filter { $0.value.exitCode != nil }
+        guard finished.count > Self.finishedExecRetention else { return }
+        for key in finished.keys.sorted().prefix(finished.count - Self.finishedExecRetention) {
+            execSessions.removeValue(forKey: key)
+        }
     }
 
     private func handleExecStart(id: String, req: HTTPRequest, fd: Int32) async {
@@ -854,22 +906,46 @@ final class DockerAPIServer {
         let writer = HTTPStreamWriter(fd: fd)
         writer.writeHeaders(contentType: "application/octet-stream")
 
+        var exitCode: Int32 = 0
         do {
-            let config = ExecConfig(containerID: session.containerID, command: session.command)
+            // Carry the whole request through. These fields were decoded and
+            // dropped before, so `docker exec -e/-w/-u` silently did nothing.
+            var config = ExecConfig(containerID: session.containerID, command: session.command)
+            config.env = session.env
+            config.tty = session.tty
+            config.user = session.user
+            config.workdir = session.workdir
             let stream = try await engine.exec(config: config)
             for await event in stream {
-                let data = Data(event.data.utf8)
-                if session.tty {
-                    writer.writeChunk(data)
-                } else {
-                    writer.writeLogFrame(stream: event.stream == .stderr ? 2 : 1, data: data)
+                switch event.stream {
+                case .status:
+                    // The runtime reports completion as `exit:<n>` on the
+                    // status channel. This used to be framed as stdout, so a
+                    // literal "exit:0" was appended to the command's output
+                    // and any script parsing that output broke.
+                    if let code = ExitMarker.parse(event.data) { exitCode = code }
+                case .error:
+                    writer.writeLogFrame(stream: 2, data: Data(event.data.utf8))
+                case .stdout, .stderr:
+                    let data = Data(event.data.utf8)
+                    if session.tty {
+                        writer.writeChunk(data)
+                    } else {
+                        writer.writeLogFrame(stream: event.stream == .stderr ? 2 : 1, data: data)
+                    }
                 }
             }
         } catch {
             writer.writeChunk(Data("Error: \(error.localizedDescription)\n".utf8))
+            // Mirror the shell convention for "command could not be run" so
+            // callers see a failure rather than a silent success.
+            exitCode = 126
         }
         writer.finish()
-        execSessions.removeValue(forKey: id)
+        // Keep the session so `/exec/{id}/json` can report the code. Deleting
+        // it here is what made the CLI's post-attach inspect 404 and fall
+        // back to a hardcoded 0.
+        execSessions[id]?.exitCode = exitCode
     }
 
     private func handleExecInspect(id: String) -> HTTPResponse {
@@ -881,7 +957,9 @@ final class DockerAPIServer {
         }
         guard let session = execSessions[id] else { return .notFound(id) }
         return .json(ExecInspect(
-            ID: id, Running: false, ExitCode: 0,
+            ID: id,
+            Running: session.exitCode == nil,
+            ExitCode: Int(session.exitCode ?? 0),
             ProcessConfig: .init(tty: session.tty, entrypoint: session.command.first ?? "", arguments: Array(session.command.dropFirst())),
             OpenStdin: false, OpenStdout: true, OpenStderr: true,
             ContainerID: session.containerID
@@ -891,8 +969,16 @@ final class DockerAPIServer {
     // MARK: - Image handlers
 
     private func handleImageList(req: HTTPRequest) async -> HTTPResponse {
+        let filters: DockerFilters
+        do {
+            filters = try DockerFilters.parse(req.query["filters"])
+            try filters.requireSupported(DockerFilters.imageKeys)
+        } catch {
+            return .error("\(error)", status: 400)
+        }
         let images = await engine.images.list()
-        return .json(images.map { DockerImageSummary(from: $0) })
+        return .json(images.filter { filters.matches(image: $0) }
+                           .map { DockerImageSummary(from: $0) })
     }
 
     private func handleImagePull(req: HTTPRequest, fd: Int32) async {
@@ -1032,8 +1118,16 @@ final class DockerAPIServer {
     // MARK: - Network handlers
 
     private func handleNetworkList(req: HTTPRequest) async -> HTTPResponse {
+        let filters: DockerFilters
+        do {
+            filters = try DockerFilters.parse(req.query["filters"])
+            try filters.requireSupported(DockerFilters.networkKeys)
+        } catch {
+            return .error("\(error)", status: 400)
+        }
         let networks = await engine.networks.list()
-        return .json(networks.map { DockerNetworkResource(from: $0) })
+        return .json(networks.filter { filters.matches(network: $0) }
+                             .map { DockerNetworkResource(from: $0) })
     }
 
     private func handleNetworkCreate(req: HTTPRequest) async -> HTTPResponse {
@@ -1092,9 +1186,17 @@ final class DockerAPIServer {
     // MARK: - Volume handlers
 
     private func handleVolumeList(req: HTTPRequest) async -> HTTPResponse {
+        let filters: DockerFilters
+        do {
+            filters = try DockerFilters.parse(req.query["filters"])
+            try filters.requireSupported(DockerFilters.volumeKeys)
+        } catch {
+            return .error("\(error)", status: 400)
+        }
         let volumes = await engine.volumes.list()
         return .json(DockerVolumeListResponse(
-            Volumes: volumes.map { DockerVolumeResource(from: $0) },
+            Volumes: volumes.filter { filters.matches(volume: $0) }
+                            .map { DockerVolumeResource(from: $0) },
             Warnings: []
         ))
     }

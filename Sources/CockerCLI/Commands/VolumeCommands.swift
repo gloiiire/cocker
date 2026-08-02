@@ -115,21 +115,31 @@ struct VolumeRmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        var failed = false
         for name in volumes {
             let start = Date()
             do {
-                let request = try IPCRequest(type: .volumeRm, payload: ContainerIDRequest(id: name))
+                // `force` used to be parsed and never sent, so `-f` did
+                // nothing at all on the daemon side.
+                let request = try IPCRequest(type: .volumeRm,
+                                             payload: ContainerIDRequest(id: name, force: force))
                 _ = try await client.send(request)
                 UX.printResult(.volume, name, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
+                // Report every failure, then fail. Previously `--force`
+                // printed this block and still exited 0, so a script doing
+                // `cocker volume rm -f x && …` continued as if the volume
+                // were gone. `--force` relaxes *which* volumes may be
+                // removed; it never turns a refusal into a success.
+                failed = true
                 UX.Failure.emit(
                     headline: "Cannot remove volume \(name)",
                     reason: error.description,
                     hint: "the volume may be in use — `cocker volume inspect \(name)`"
                 )
-                if !force { throw error }
             }
         }
+        if failed { throw ExitCode.failure }
     }
 }
 

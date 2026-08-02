@@ -218,6 +218,29 @@ public actor RegistryClient {
         }
     }
 
+    /// Resolve the blob-upload `PUT` target from a registry's `Location`
+    /// header, which may be absolute or relative to the registry.
+    ///
+    /// `location` is remote input, so this returns nil rather than
+    /// force-unwrapping `URL(string:)` — a header carrying a space, a control
+    /// character or a non-ASCII byte used to crash the whole daemon mid-push.
+    static func uploadPutURL(location: String, base: URL, digest: String) -> URL? {
+        guard !location.isEmpty else { return nil }
+        let separator = location.contains("?") ? "&" : "?"
+        let candidate: String
+        if location.hasPrefix("http://") || location.hasPrefix("https://") {
+            candidate = "\(location)\(separator)digest=\(digest)"
+        } else {
+            guard let scheme = base.scheme, let host = base.host else { return nil }
+            let port = base.port.map { ":\($0)" } ?? ""
+            // A relative Location is defined against the registry root and
+            // always starts with '/'; tolerate a server that omits it.
+            let path = location.hasPrefix("/") ? location : "/\(location)"
+            candidate = "\(scheme)://\(host)\(port)\(path)\(separator)digest=\(digest)"
+        }
+        return URL(string: candidate)
+    }
+
     private func uploadBlob(ref: ImageReference, digest: String, data: Data, token: String?) async throws {
         // Step A : POST to /v2/<name>/blobs/uploads/ → 202 Accepted + Location.
         let startURL = try pushURL(ref: ref, path: "blobs/uploads/")
@@ -233,17 +256,26 @@ public actor RegistryClient {
 
         // Step B : PUT to <Location>?digest=<sha256:...>.
         // The Location may be absolute OR relative.
-        let putURL: URL
-        if location.hasPrefix("http://") || location.hasPrefix("https://") {
-            putURL = URL(string: "\(location)\(location.contains("?") ? "&" : "?")digest=\(digest)")!
-        } else {
-            putURL = URL(string: "\(startURL.scheme!)://\(startURL.host!)\(startURL.port.map { ":\($0)" } ?? "")\(location)\(location.contains("?") ? "&" : "?")digest=\(digest)")!
+        //
+        // `location` is a header from a remote server, so it cannot be
+        // force-unwrapped through `URL(string:)` — a value with a space, a
+        // control character or a non-ASCII byte makes that return nil, and
+        // this used to crash the whole daemon mid-push.
+        guard let putURL = Self.uploadPutURL(location: location, base: startURL, digest: digest) else {
+            throw CockerError.layerDownloadFailed(
+                digest, "registry returned an unusable upload Location: \(location)")
         }
         var put = URLRequest(url: putURL)
         put.httpMethod = "PUT"
         put.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         put.setValue("\(data.count)", forHTTPHeaderField: "Content-Length")
-        if let token { put.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        // Only send the bearer token to the registry that issued it. A
+        // Location pointing at another host is a normal blob-storage handoff
+        // and carries its own pre-signed credentials; forwarding ours there
+        // would hand a push token to a third party the registry named.
+        if let token, putURL.host == startURL.host {
+            put.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         let (_, putResp) = try await session.upload(for: put, from: data)
         guard let putHTTP = putResp as? HTTPURLResponse,
               putHTTP.statusCode == 201 || putHTTP.statusCode == 204 else {

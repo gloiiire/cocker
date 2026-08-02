@@ -7,6 +7,8 @@ public enum IPCRequestType: String, Codable, Sendable {
     case run, start, stop, kill, restart, rm, pause, unpause
     // Container info
     case ps, inspect, logs, top
+    // Block until a container exits, then report its code
+    case wait
     // Exec
     case exec
     // Copy
@@ -187,9 +189,38 @@ public struct ContainerIDRequest: Codable, Sendable {
     public let id: String
     public let signal: String?
     public let force: Bool?
-    public init(id: String, signal: String? = nil, force: Bool? = nil) {
+    /// Grace period for `stop` / `restart` (`-t`). nil keeps the daemon's
+    /// 10 s default. Optional so an older CLI's payload still decodes.
+    public let timeout: TimeInterval?
+    /// `rm -v` — also remove the anonymous volumes this container created.
+    public let removeVolumes: Bool?
+    public init(id: String, signal: String? = nil, force: Bool? = nil,
+                timeout: TimeInterval? = nil, removeVolumes: Bool? = nil) {
         self.id = id; self.signal = signal; self.force = force
+        self.timeout = timeout; self.removeVolumes = removeVolumes
     }
+}
+
+/// The daemon reports a finished `exec` as a `.status` stream event whose
+/// payload is `exit:<n>`. Both the CLI and the Docker-API server have to read
+/// it back, and both used to drop it — so `cocker exec c false` and
+/// `docker exec c false` each reported success. One parser, so the two can't
+/// drift apart.
+public enum ExitMarker {
+    /// `exit:<n>` → n. Tolerates the trailing newline the guest may leave on
+    /// the marker. Any other status payload (pull progress and the like)
+    /// returns nil and must be left for the caller to handle.
+    public static func parse(_ raw: String) -> Int32? {
+        guard raw.hasPrefix("exit:") else { return nil }
+        return Int32(raw.dropFirst(5).trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+}
+
+/// Reply to `.wait` — the container's real exit code, readable even after
+/// `--rm` has removed the container.
+public struct WaitResponse: Codable, Sendable {
+    public let exitCode: Int32
+    public init(exitCode: Int32) { self.exitCode = exitCode }
 }
 
 public struct PSRequest: Codable, Sendable {
@@ -257,8 +288,13 @@ public struct VolumeCreateRequest: Codable, Sendable {
     public let name: String
     public let driver: String
     public let labels: [String: String]
-    public init(name: String, driver: String = "local", labels: [String: String] = [:]) {
+    /// Set when cocker is inventing the volume for a mount the user didn't
+    /// name. Marks it eligible for `rm -v`. Optional for older CLIs.
+    public let anonymous: Bool?
+    public init(name: String, driver: String = "local", labels: [String: String] = [:],
+                anonymous: Bool = false) {
         self.name = name; self.driver = driver; self.labels = labels
+        self.anonymous = anonymous
     }
 }
 
@@ -322,10 +358,21 @@ public struct ComposeRequest: Codable, Sendable {
     /// `compose build --no-cache`: execute every RUN instruction instead of
     /// consulting the on-disk layer cache.
     public let noCache: Bool
+    /// `compose run <service> <cmd...>` : argv overriding the service's
+    /// command. Parsed by the CLI but dropped on the floor before — the
+    /// service always ran its compose-file command instead.
+    public let command: [String]?
+    /// `compose run --rm` : remove the one-off container when it exits.
+    public let removeAfterRun: Bool
+    /// `compose up/down --remove-orphans` : also remove containers labelled
+    /// for this project that the compose file no longer declares.
+    public let removeOrphans: Bool
     public init(composePath: String, projectName: String? = nil, services: [String] = [],
                 detach: Bool = false, activeProfiles: [String]? = nil,
                 removeVolumes: Bool = false, follow: Bool = false, tail: Int = 50,
-                forceBuild: Bool = false, noCache: Bool = false) {
+                forceBuild: Bool = false, noCache: Bool = false,
+                command: [String]? = nil, removeAfterRun: Bool = false,
+                removeOrphans: Bool = false) {
         self.composePath = composePath; self.projectName = projectName
         self.services = services; self.detach = detach
         self.activeProfiles = activeProfiles
@@ -334,10 +381,14 @@ public struct ComposeRequest: Codable, Sendable {
         self.tail = tail
         self.forceBuild = forceBuild
         self.noCache = noCache
+        self.command = command
+        self.removeAfterRun = removeAfterRun
+        self.removeOrphans = removeOrphans
     }
 
     enum CodingKeys: String, CodingKey {
         case composePath, projectName, services, detach, activeProfiles, removeVolumes, follow, tail, forceBuild, noCache
+        case command, removeAfterRun, removeOrphans
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -356,6 +407,11 @@ public struct ComposeRequest: Codable, Sendable {
         // "skip rebuild when image already exists" behaviour.
         self.forceBuild     = try c.decodeIfPresent(Bool.self, forKey: .forceBuild) ?? false
         self.noCache        = try c.decodeIfPresent(Bool.self, forKey: .noCache) ?? false
+        // Absent from older CLIs : nil command means "use the compose file's",
+        // and both flags default off.
+        self.command        = try c.decodeIfPresent([String].self, forKey: .command)
+        self.removeAfterRun = try c.decodeIfPresent(Bool.self, forKey: .removeAfterRun) ?? false
+        self.removeOrphans  = try c.decodeIfPresent(Bool.self, forKey: .removeOrphans) ?? false
     }
 }
 
