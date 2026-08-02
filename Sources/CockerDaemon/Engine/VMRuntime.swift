@@ -152,6 +152,77 @@ final class VMRuntime: NSObject {
     /// out. Cleared on container stop / remove.
     fileprivate var pendingNATMACs: [String: String] = [:]
 
+    /// Live exec sessions that accept streamed stdin, keyed by the id the CLI
+    /// minted. The value is the vsock fd the guest is relaying to the PTY
+    /// master, so writing here lands on the child's stdin.
+    private var execInputFDs: [String: Int32] = [:]
+
+    /// Bytes that arrived before the vsock connected. The CLI starts pumping
+    /// as soon as it sends the request, so a fast typist (or a pipe) can beat
+    /// the connect callback; holding them briefly is simpler than making the
+    /// CLI wait for a ready signal.
+    private var execInputPending: [String: Data] = [:]
+
+    /// Cap on that buffer. Past it we drop rather than grow without bound —
+    /// a stdin flood before the guest is even listening is not something to
+    /// absorb indefinitely.
+    private static let execInputPendingCap = 1 << 20  // 1 MiB
+
+    /// Sessions whose caller closed stdin before the vsock was up. Verified
+    /// on hardware: dropping this made `echo x | cocker exec -i c cat` hang
+    /// forever, because the child never saw EOF.
+    private var execInputPendingEOF: Set<String> = []
+
+    /// Called once the vsock is up: adopt the fd and flush anything buffered.
+    private func registerExecInput(session: String, fd: Int32) {
+        execInputFDs[session] = fd
+        if let pending = execInputPending.removeValue(forKey: session), !pending.isEmpty {
+            _ = pending.withUnsafeBytes { buf -> Bool in
+                guard let base = buf.baseAddress else { return false }
+                return writeAllFD(fd, base, buf.count)
+            }
+        }
+        // Apply a deferred EOF *after* the buffered bytes, or the child reads
+        // an empty stdin.
+        if execInputPendingEOF.remove(session) != nil {
+            _ = Darwin.shutdown(fd, SHUT_WR)
+        }
+    }
+
+    private func unregisterExecInput(session: String) {
+        execInputFDs.removeValue(forKey: session)
+        execInputPending.removeValue(forKey: session)
+        execInputPendingEOF.remove(session)
+    }
+
+    /// Write a chunk of live stdin into an exec. Buffers if the vsock hasn't
+    /// connected yet.
+    func writeExecInput(session: String, data: Data) {
+        guard let fd = execInputFDs[session] else {
+            var pending = execInputPending[session] ?? Data()
+            guard pending.count + data.count <= Self.execInputPendingCap else { return }
+            pending.append(data)
+            execInputPending[session] = pending
+            return
+        }
+        _ = data.withUnsafeBytes { buf -> Bool in
+            guard let base = buf.baseAddress else { return false }
+            return writeAllFD(fd, base, buf.count)
+        }
+    }
+
+    /// The caller's stdin hit EOF. Half-close so the in-VM child sees it and
+    /// stops waiting for more; the read side stays open for its output.
+    func closeExecInput(session: String) {
+        guard let fd = execInputFDs[session] else {
+            // The vsock isn't up yet. Remember, and apply at register time —
+            // silently dropping this is what made a piped `exec -i` hang.
+            execInputPendingEOF.insert(session)
+            return
+        }
+        _ = Darwin.shutdown(fd, SHUT_WR)
+    }
+
     /// Exclusive `flock`s held on each container's block-volume images for as
     /// long as its VM runs, keyed by container id.
     ///
@@ -1363,7 +1434,8 @@ final class VMRuntime: NSObject {
     }
 
     func exec(containerID: String, command: [String], env: [String: String], tty: Bool = false,
-              stdin: Data? = nil, workdir: String? = nil, user: String? = nil) async throws -> AsyncStream<StreamEvent> {
+              stdin: Data? = nil, workdir: String? = nil, user: String? = nil,
+              sessionID: String? = nil, rows: Int? = nil, cols: Int? = nil) async throws -> AsyncStream<StreamEvent> {
         guard let running = runningVMs[containerID] else {
             throw CockerError.containerNotRunning(containerID)
         }
@@ -1423,9 +1495,14 @@ final class VMRuntime: NSObject {
                         let tty: Bool
                         let workdir: String?
                         let user: String?
+                        /// Terminal geometry, so the guest's openpty starts at
+                        /// the caller's real size rather than 80x24.
+                        let rows: Int?
+                        let cols: Int?
                     }
                     let req = ExecReq(cmd: command, env: env, tty: tty,
-                                      workdir: workdir, user: user)
+                                      workdir: workdir, user: user,
+                                      rows: rows, cols: cols)
                     // `.sortedKeys` gives a deterministic wire order. The in-VM
                     // parser is now key-order independent either way, but a
                     // stable byte stream keeps logs and the exec-parser tests
@@ -1490,6 +1567,34 @@ final class VMRuntime: NSObject {
                         _ = Darwin.shutdown(fd, SHUT_WR)
                     }
 
+                    // Only now publish the fd to the side channel carrying
+                    // live stdin.
+                    //
+                    // This used to be dispatched right after `connect`
+                    // returned, i.e. *before* the JSON request above was
+                    // written. Registering flushes buffered stdin and may
+                    // apply a deferred `shutdown(SHUT_WR)`, so the hop
+                    // routinely won the race on real hardware: the guest read
+                    // stdin bytes — or an immediate EOF — where it expected
+                    // its request line, failed to parse, and closed. The host
+                    // saw ECONNRESET at connect and `exec -it` never worked.
+                    //
+                    // The request is fully on the wire by this point, so the
+                    // ordering is now safe whenever the hop lands.
+                    if let sessionID {
+                        Task { @MainActor in
+                            self.registerExecInput(session: sessionID, fd: fd)
+                            // Only now is it safe for the caller to stream
+                            // stdin. Starting the pump optimistically instead
+                            // meant a burst of `.execInput` frames hit the
+                            // daemon *before* this exec existed, and the vsock
+                            // connect then failed with ECONNRESET — proven on
+                            // hardware by toggling the pump off, which made
+                            // the identical command succeed.
+                            continuation.yield(StreamEvent(stream: .status, data: "exec-ready"))
+                        }
+                    }
+
                     // Capture `connection` strongly so ARC doesn't release it
                     // (and tear down the vsock fd) the moment the callback
                     // returns. Without this, the host side closes its end
@@ -1497,7 +1602,12 @@ final class VMRuntime: NSObject {
                     let retained = ConnectionHolder(connection)
                     DispatchQueue.global(qos: .userInitiated).async {
                         _ = retained.connection  // keep alive for the lifetime of the stream
-                        defer { lifetime.complete() }
+                        defer {
+                            lifetime.complete()
+                            if let sessionID {
+                                Task { @MainActor in self.unregisterExecInput(session: sessionID) }
+                            }
+                        }
                         var buffer = Data()
                         var chunk = [UInt8](repeating: 0, count: 4096)
                         let exitMarker = Data("__COCKER_EXIT__".utf8)

@@ -522,6 +522,17 @@ struct ComposeExecCommand: AsyncParsableCommand {
     @Flag(name: .customShort("T"), help: "Disable pseudo-TTY allocation")
     var noTTY = false
 
+    /// `docker compose exec -it` is the muscle-memory form. Neither flag was
+    /// declared here at all, so it failed at *parse* time — before any of the
+    /// missing TTY plumbing even mattered.
+    @Flag(name: [.customShort("i"), .customLong("interactive")],
+          help: "Keep STDIN open")
+    var interactive = false
+
+    @Flag(name: [.customShort("t"), .customLong("tty")],
+          help: "Allocate a pseudo-TTY")
+    var tty = false
+
     @Option(name: [.short, .customLong("file")], help: "Compose file path")
     var file: String = "cocker-compose.yml"
 
@@ -559,24 +570,53 @@ struct ComposeExecCommand: AsyncParsableCommand {
         }
 
         var config = ExecConfig(containerID: container.id, command: command)
-        config.tty = !noTTY
+        // `-T` is Docker's explicit opt-out; `-t` its opt-in. Either way the
+        // guest only gets a PTY when we're actually on a terminal.
+        config.tty = !noTTY && (tty || InteractiveSession.stdinIsTerminal)
         config.env = container.env
         config.workdir = container.env["WORKDIR"]
         config.user = container.env["USER"]
+
+        // Same live session as `cocker exec -it`. Before this, `-i`/`-t`
+        // weren't even declared on this command, so `compose exec -it svc sh`
+        // failed at parse time.
+        let session: InteractiveSession? =
+            (!noTTY && (interactive || tty) && InteractiveSession.stdinIsTerminal)
+            ? InteractiveSession() : nil
+        if let session {
+            config.sessionID = session.sessionID
+            if let size = InteractiveSession.windowSize() {
+                config.rows = size.rows
+                config.cols = size.cols
+            }
+        }
+
         let payload = ExecRequest(config: config)
         let request = try IPCRequest(type: .exec, payload: payload)
 
         // Same contract as `cocker exec` : propagate the command's exit code
         // instead of swallowing the `exit:<n>` status event.
         let status = ExitStatusBox()
+        // Read stdin from the start so nothing typed early is lost; the
+        // pump holds it until the daemon reports its vsock is up.
+        session?.enterRawMode()
+        session?.startPump()
+        defer {
+            session?.stop()
+            session?.restore()
+        }
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: UX.writeStderr(event.data)
-            case .status: status.consume(statusPayload: event.data)
+            case .status:
+                if event.data == "exec-ready" { session?.markReady() }
+                status.consume(statusPayload: event.data)
             case .error: UX.writeStderr(event.data)
             }
         }
+        session?.stop()
+        session?.restore()
         if status.code != 0 { throw ExitCode(status.code) }
     }
 }
