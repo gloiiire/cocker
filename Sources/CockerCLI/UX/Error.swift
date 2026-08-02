@@ -1,5 +1,6 @@
 import Foundation
 import ArgumentParser
+import CockerCore
 
 // Cocker UX charter §6 — three-line error formatter. Every error a
 // command emits answers the same three questions :
@@ -32,20 +33,12 @@ public extension UX {
             hint: String? = nil,
             details: String? = nil
         ) -> String {
-            var lines: [String] = []
-            let icon = UX.TTY.paint(Icon.failure.rawValue, .failure)
-            let head = UX.TTY.paint(headline, .failure)
-            lines.append(" \(icon) \(head)")
-            if let reason {
-                lines.append("   " + UX.TTY.paint("reason :", .dim) + " \(reason)")
-            }
-            if let hint {
-                lines.append("   " + UX.TTY.paint("hint   :", .dim) + " \(hint)")
-            }
-            if let details {
-                lines.append("   " + UX.TTY.paint("details:", .dim) + " \(details)")
-            }
-            return lines.joined(separator: "\n")
+            // One implementation, shared with cockerd — see
+            // CockerCore.FailureBlock. Duplicating the shape is how the two
+            // surfaces drifted apart in the first place.
+            return FailureBlock.render(
+                headline: headline, reason: reason, hint: hint, details: details,
+                colored: UX.TTY.current.colorEnabled)
         }
 
         // Emit to stderr, matching Docker convention (errors don't pollute

@@ -74,6 +74,7 @@ int spec_resolve_user(const char *spec, unsigned int *uid, unsigned int *gid) {
 #define SPEC_MAGIC_V3 "COCKER\x03"
 #define SPEC_MAGIC_V4 "COCKER\x04"
 #define SPEC_MAGIC_V5 "COCKER\x05"
+#define SPEC_MAGIC_V6 "COCKER\x06"
 #define SPEC_MAGIC_LEN 7
 #define SPEC_BUF_SIZE  (256 * 1024)
 
@@ -96,6 +97,12 @@ int privileged_spec = 0;
  * configured to graceful-shutdown on SIGQUIT actually receive SIGQUIT
  * instead of being killed without notice. */
 int stop_signal_spec = 0;
+
+/* v6 : does the container's main process get a controlling terminal, and at
+ * what size. See spec_load(). */
+int tty_spec = 0;
+int tty_rows_spec = 0;
+int tty_cols_spec = 0;
 
 static unsigned int read_u32_be(const unsigned char *p) {
     return ((unsigned int)p[0] << 24) |
@@ -123,8 +130,10 @@ int spec_load(char **argv, int max) {
     const unsigned char *p = (const unsigned char *)spec_buf;
     const unsigned char *end = (const unsigned char *)spec_buf + spec_len;
 
-    int has_user = 0, has_caps = 0, has_stop = 0;
-    if (memcmp(p, SPEC_MAGIC_V5, SPEC_MAGIC_LEN) == 0) {
+    int has_user = 0, has_caps = 0, has_stop = 0, has_tty = 0;
+    if (memcmp(p, SPEC_MAGIC_V6, SPEC_MAGIC_LEN) == 0) {
+        has_user = 1; has_caps = 1; has_stop = 1; has_tty = 1;
+    } else if (memcmp(p, SPEC_MAGIC_V5, SPEC_MAGIC_LEN) == 0) {
         has_user = 1; has_caps = 1; has_stop = 1;
     } else if (memcmp(p, SPEC_MAGIC_V4, SPEC_MAGIC_LEN) == 0) {
         has_user = 1; has_caps = 1;
@@ -225,6 +234,17 @@ int spec_load(char **argv, int max) {
     /* stop signal (v5+) : POSIX signal number. 0 = use init's default. */
     if (has_stop && p + 4 <= end) {
         stop_signal_spec = (int)read_u32_be(p); p += 4;
+    }
+
+    /* tty + geometry (v6+). Without a controlling terminal the container's
+     * main process sees isatty() == false, so shells run non-interactive and
+     * anything that redraws is wrong. 0x0 means "keep the console's size". */
+    if (has_tty && p + 1 <= end) {
+        tty_spec = (*p != 0); p += 1;
+        if (p + 8 <= end) {
+            tty_rows_spec = (int)read_u32_be(p); p += 4;
+            tty_cols_spec = (int)read_u32_be(p); p += 4;
+        }
     }
 
     return n;

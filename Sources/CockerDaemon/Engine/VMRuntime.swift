@@ -152,6 +152,28 @@ final class VMRuntime: NSObject {
     /// out. Cleared on container stop / remove.
     fileprivate var pendingNATMACs: [String: String] = [:]
 
+    /// Write ends of the console stdin pipe for `-t` containers, keyed by
+    /// container id. Writing here reaches the container's main process,
+    /// which init has given the console as its controlling terminal.
+    private var consoleStdinPipes: [String: Pipe] = [:]
+
+    /// Stream a chunk of stdin into a running container's main process.
+    func writeContainerInput(containerID: String, data: Data) {
+        guard let pipe = consoleStdinPipes[containerID], !data.isEmpty else { return }
+        let fd = pipe.fileHandleForWriting.fileDescriptor
+        _ = data.withUnsafeBytes { buf -> Bool in
+            guard let base = buf.baseAddress else { return false }
+            return writeAllFD(fd, base, buf.count)
+        }
+    }
+
+    /// The caller's stdin ended. Closing the write end gives the container's
+    /// console an EOF rather than leaving it waiting forever.
+    func closeContainerInput(containerID: String) {
+        guard let pipe = consoleStdinPipes.removeValue(forKey: containerID) else { return }
+        try? pipe.fileHandleForWriting.close()
+    }
+
     /// Live exec sessions that accept streamed stdin, keyed by the id the CLI
     /// minted. The value is the vsock fd the guest is relaying to the PTY
     /// master, so writing here lands on the child's stdin.
@@ -349,15 +371,28 @@ final class VMRuntime: NSObject {
         // Memory balloon (allows host to reclaim memory)
         config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 
-        // Serial console — branche le stdout du VM (kernel + cocker-init + container)
-        // sur un Pipe qu'on lit côté hôte pour alimenter le log buffer.
-        // /dev/null en lecture car la VM n'a pas besoin d'input pour l'instant.
-        let nullDev = FileHandle(forReadingAtPath: "/dev/null") ?? FileHandle.standardInput
+        // Serial console — the VM's stdout (kernel + cocker-init + container)
+        // goes to a Pipe the host reads to feed the log buffer.
+        //
+        // The read side used to be /dev/null: "the VM doesn't need input for
+        // now". That is what made `cocker run -it` impossible — with nothing
+        // writable attached, the container's main process could never receive
+        // a keystroke. A tty container gets a real pipe so the host can write
+        // into its console; everything else keeps /dev/null, so a normal
+        // container still sees stdin closed the way it always did.
+        let consoleInput: FileHandle
+        if container.tty == true {
+            let pipe = Pipe()
+            consoleStdinPipes[container.id] = pipe
+            consoleInput = pipe.fileHandleForReading
+        } else {
+            consoleInput = FileHandle(forReadingAtPath: "/dev/null") ?? FileHandle.standardInput
+        }
         let consoleDevice = VZVirtioConsoleDeviceConfiguration()
         let port0 = VZVirtioConsolePortConfiguration()
         port0.isConsole = true
         port0.attachment = VZFileHandleSerialPortAttachment(
-            fileHandleForReading: nullDev,
+            fileHandleForReading: consoleInput,
             fileHandleForWriting: stdoutPipe.fileHandleForWriting
         )
         consoleDevice.ports[0] = port0
@@ -1055,6 +1090,10 @@ final class VMRuntime: NSObject {
         // volumes never registers a RunningVM, and leaving the flock held
         // would lock the user out of their own volume until cockerd restarts.
         releaseVolumeLocks(containerID: containerID)
+        if let pipe = consoleStdinPipes.removeValue(forKey: containerID) {
+            try? pipe.fileHandleForWriting.close()
+            try? pipe.fileHandleForReading.close()
+        }
         guard let running = runningVMs[containerID] else { return }
         // Finish live log streams before dropping the RunningVM. Consumers
         // receive a clean end-of-stream immediately instead of polling
@@ -1139,7 +1178,10 @@ final class VMRuntime: NSObject {
             privileged: container.privileged,
             capAdd: container.capAdd,
             capDrop: container.capDrop,
-            stopSignal: container.stopSignal
+            stopSignal: container.stopSignal,
+            tty: container.tty ?? false,
+            rows: container.ttyRows ?? 0,
+            cols: container.ttyCols ?? 0
         )
     }
 

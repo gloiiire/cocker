@@ -79,9 +79,9 @@ failed, or losing data. Shipped in #357.
 | ✅ | `/volumes/*` no longer eaten by the API-version strip; `/networks/{id}` and `/volumes/{name}` no longer dead code; registry-qualified image names no longer 501 (#358) |
 | ✅ | Compose long syntax, `build:` shorthand, `entrypoint:`, shell-form `command:`, udp/range/host-IP ports (#358) |
 | ✅ | `/containers/{id}/archive` — Dev Containers can't inject the VS Code server without it |
-| ✅ | **Interactive TTY** — `exec -it` and `compose exec -it` work. Verified on an M3 Max: 5/5 interactive shell sessions, exit codes propagate through the shell (`exit 7` → 7), Ctrl-D reaches the container. Still missing: SIGWINCH mid-session, `run -it`, `attach` |
+| ✅ | **Interactive TTY** — `run -it`, `exec -it` and `compose exec -it` work. Verified on an M3 Max: 5/5 interactive shell sessions, exit codes propagate through the shell (`exit 7` → 7), Ctrl-D reaches the container. Still missing: SIGWINCH mid-session, and `attach` |
 | ⬜ | Hijacked raw streams on the API side, plus `/attach` and `/resize`. Today exec output is chunk-framed, so chunk headers land inside the stdcopy stream and corrupt it. (The *native* CLI path works — this is the Docker-socket surface) |
-| ⬜ | Multiple `-f` / `override.yml` merging, and `--profile` (compose parses profiles but nothing ever populates the active set) |
+| ✅ | Multiple `-f` / `override.yml` merging, and `--profile` |
 
 ### v0.10 — "Focus"
 
@@ -89,9 +89,9 @@ failed, or losing data. Shipped in #357.
 |---|---|
 | ⬜ | **Decide the punt.** `ROADMAP.md` said to cut `swarm`/`stack`/`service`/`node` in v0.5 and it never happened — 23 commands still ship, still lead the help screen, and some invent data (`node ls` returns a fresh UUID per call). This is a breaking change for anyone scripting them, so it needs a decision, not a patch |
 | ⬜ | README: the tagline still never adopted the iCloud positioning, and iCloud — the actual differentiator — first appears at line 427 of 677. (The broken `cocker completion` lines, the hardcoded test count and the contradictory API version are fixed.) |
-| ⬜ | `docs/man/` dates from v0.5.0, and the Formula *prefers* those committed pages over regenerating — so every Homebrew user reads two-version-old docs |
+| ✅ | `docs/man/` regenerated (145 → 159 pages) and `bump-version.sh` keeps it current |
 | ⬜ | **Decide the `*.md` policy.** `.gitignore` deliberately keeps every markdown file out of the repo except `README.md` and named spec docs, so there is no `CHANGELOG.md`, `CONTRIBUTING.md` or `SECURITY.md` by choice rather than by oversight. A 1.0 arguably needs at least a changelog — a user currently cannot tell what changed between `0.7.13.19` and `0.7.13.26` — and a security file, since cocker installs a root LaunchDaemon and stores registry passwords in plaintext at `~/.cocker/credentials.json`. Either add exceptions for those three or write down why they live outside the repo |
-| ⬜ | `cockerd` never adopted the UX charter (~53 raw `print`s, an `exit(64)` outside the documented scheme), and 63 `throw ExitCode(1)` flatten the 125/126/127 taxonomy the charter promises |
+| ✅ | `cockerd` and the `daemon` command group now use the charter §6 block, shared with the CLI rather than copied. The 125/126/127 taxonomy reaches scripts — it was flattened both by the IPC layer dropping the error kind and by commands throwing a blanket 1. (`exit(64)` stays: it's a documented EX_USAGE for schema-too-new, deliberately preserved.) |
 
 ### v1.0.0.0 — "Guaranteed"
 
@@ -100,7 +100,7 @@ failed, or losing data. Shipped in #357.
 | ⬜ | **Run the e2e suite in CI.** The job targets a self-hosted `vm-capable` runner that doesn't exist, and is explicitly designed never to block a PR. Needs one M-series Mac — hosted runners are M1/M2 VMs and nested virtualisation is M3+, so this is hardware, not configuration |
 | ✅ | **Releases gated on tests.** `build-and-sign` now `needs: test` — `swift test` plus a cocker-init cross-compile and its C test, which `swift test` never covered |
 | 🚧 | e2e coverage. Added `11-exit-codes` and `12-exec-after-start`; suite is 12/12 green on real hardware. Still uncovered: registry push/pull, block volumes, `compose down`, `logs -f`, volume/network lifecycle |
-| ⬜ | Honest coverage reporting. The "90%" gate excludes 69.5% of `Sources/`, including `ImageManager`, `VMRuntime`, `ContainerEngine`, `DockerAPIServer` and all of `CockerCLI/Commands/` |
+| ✅ | Coverage reports two numbers — the gated scope and all of `Sources/` — and says which is which |
 | ⬜ | This document's commitments written into the README, and a deprecation policy |
 
 ---
