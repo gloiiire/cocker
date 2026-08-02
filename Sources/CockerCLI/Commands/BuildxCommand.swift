@@ -179,8 +179,15 @@ struct BuildxBuildCommand: AsyncParsableCommand {
     @Flag(name: .customLong("push"), help: "Push to registry after build")
     var push = false
 
-    @Flag(name: .customLong("load"), help: "Load into image store")
-    var load = true
+    /// A `@Flag` defaulting to `true` can never be false, and ArgumentParser
+    /// refuses to build a command tree containing one — which meant *every*
+    /// `cocker buildx` subcommand died with a validation error before it ran.
+    /// `buildx ls`, `create`, `use`, `rm`, `build`, `install-qemu`: none of
+    /// them worked. Cocker always loads what it builds into the image store,
+    /// so the flag is accepted (docker scripts pass it) and is a no-op.
+    @Flag(name: .customLong("load"),
+          help: "No-op: cocker always loads the built image into the store")
+    var load = false
 
     @Flag(name: .customLong("no-cache"), help: "Do not use cache")
     var noCache = false
@@ -280,8 +287,11 @@ struct BuildxLsCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "ls", abstract: "List builder instances")
 
     mutating func run() async throws {
-        print("NAME/NODE    DRIVER/ENDPOINT    STATUS    BUILDKIT    PLATFORMS")
-        print("default *    cocker             running   v0.1.0      linux/arm64,linux/amd64")
+        // Claimed a running BuildKit v0.1.0 builder advertising amd64. None
+        // of that exists — there is no BuildKit in cocker and no cross-arch
+        // builder — and a client that trusts this listing plans work it
+        // cannot do.
+        throw CockerError.notImplemented("buildx ls")
     }
 }
 
@@ -292,8 +302,9 @@ struct BuildxCreateCommand: AsyncParsableCommand {
     @Option var driver: String = "cocker"
 
     mutating func run() async throws {
-        let n = name ?? "builder-\(Int(Date().timeIntervalSince1970))"
-        print(n)
+        // Printed a builder name that was never created or persisted; the
+        // next `buildx use` of it "succeeded" too.
+        throw CockerError.notImplemented("buildx create")
     }
 }
 
@@ -303,7 +314,8 @@ struct BuildxUseCommand: AsyncParsableCommand {
     @Argument var name: String
 
     mutating func run() async throws {
-        print("Switched to builder \(name)")
+        // Nothing was written, and `buildx build` never read a selection.
+        throw CockerError.notImplemented("buildx use")
     }
 }
 
@@ -313,6 +325,7 @@ struct BuildxRmCommand: AsyncParsableCommand {
     @Argument var name: String
 
     mutating func run() async throws {
-        print("Deleted \(name)")
+        // Nothing was ever removed.
+        throw CockerError.notImplemented("buildx rm")
     }
 }

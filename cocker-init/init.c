@@ -672,6 +672,36 @@ int main(int argc, char **argv) {
     }
 
     if (child == 0) {
+        /* `cocker run -it` : give the main process a controlling terminal.
+         *
+         * The process already inherits init's stdio, which is the virtio
+         * console — a real tty. What it lacked was a *controlling* terminal,
+         * so isatty() was true but there was no session and no foreground
+         * process group: shells started non-interactive, job control was
+         * absent, and ^C from the host went nowhere.
+         *
+         * setsid() makes this child a session leader, TIOCSCTTY attaches the
+         * console to that session, and the winsize tells anything that
+         * redraws how big the caller's terminal actually is instead of
+         * leaving it at the kernel default.
+         *
+         * Best-effort throughout: a container that can't get a tty should
+         * still run, just without one. */
+        if (tty_spec) {
+            if (setsid() >= 0) {
+                if (ioctl(STDIN_FILENO, TIOCSCTTY, 0) < 0) {
+                    fprintf(stderr, "[cocker-init] TIOCSCTTY: %s\n", strerror(errno));
+                }
+            }
+            if (tty_rows_spec > 0 && tty_cols_spec > 0) {
+                struct winsize ws;
+                memset(&ws, 0, sizeof(ws));
+                ws.ws_row = (unsigned short)tty_rows_spec;
+                ws.ws_col = (unsigned short)tty_cols_spec;
+                ioctl(STDIN_FILENO, TIOCSWINSZ, &ws);
+            }
+        }
+
         /* Caps first — drop unwanted ones from the bounded set BEFORE
          * setuid. With SECBIT_NOROOT off (the default), root keeps full
          * caps on uid change ; once we setuid to an unprivileged user the

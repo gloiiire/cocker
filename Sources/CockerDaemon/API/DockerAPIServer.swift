@@ -278,6 +278,26 @@ final class DockerAPIServer {
         case ("DELETE", "containers") where segments.count == 2:
             response = await handleContainerRemove(id: segments[1], req: req)
 
+        case ("POST", "containers") where segments.count == 3 && segments[2] == "attach":
+            await handleContainerAttach(id: segments[1], req: req, fd: fd)
+            response = nil
+
+        case ("POST", "containers") where segments.count == 3 && segments[2] == "resize":
+            response = await handleResize(id: segments[1], req: req, isExec: false)
+
+        case ("POST", "exec") where segments.count == 3 && segments[2] == "resize":
+            response = await handleResize(id: segments[1], req: req, isExec: true)
+
+        // ── Archive (docker cp, Dev Containers, Testcontainers) ──
+        case ("GET", "containers") where segments.count == 3 && segments[2] == "archive":
+            response = await handleArchiveGet(id: segments[1], req: req)
+
+        case ("HEAD", "containers") where segments.count == 3 && segments[2] == "archive":
+            response = await handleArchiveHead(id: segments[1], req: req)
+
+        case ("PUT", "containers") where segments.count == 3 && segments[2] == "archive":
+            response = await handleArchivePut(id: segments[1], req: req)
+
         case ("GET", "containers") where segments.count == 3 && segments[2] == "top":
             response = await handleContainerTop(id: segments[1])
 
@@ -309,14 +329,19 @@ final class DockerAPIServer {
             await handleImagePull(req: req, fd: fd)
             response = nil
 
-        case ("GET", "images") where segments.count == 3 && segments[2] == "json":
-            response = await handleImageInspect(name: segments[1])
+        // `>= 3` and a rejoined name : a registry- or namespace-qualified
+        // reference (`ghcr.io/org/app`, `library/redis`) contributes several
+        // path segments, so the old `== 3` guard sent every one of them to
+        // the 501 fallback. Compose inspects an image right after pulling it.
+        case ("GET", "images") where segments.count >= 3 && segments.last == "json":
+            response = await handleImageInspect(name: Self.imageName(from: segments))
 
-        case ("DELETE", "images") where segments.count == 2:
-            response = await handleImageRemove(name: segments[1], req: req)
+        case ("DELETE", "images") where segments.count >= 2:
+            response = await handleImageRemove(
+                name: Self.imageName(from: segments, hasVerbSuffix: false), req: req)
 
-        case ("POST", "images") where segments.count == 3 && segments[2] == "tag":
-            response = await handleImageTag(name: segments[1], req: req)
+        case ("POST", "images") where segments.count >= 3 && segments.last == "tag":
+            response = await handleImageTag(name: Self.imageName(from: segments), req: req)
 
         case ("POST", "build"):
             await handleImageBuild(req: req, fd: fd)
@@ -326,7 +351,11 @@ final class DockerAPIServer {
             response = .json([DockerEmpty]())
 
         // ── Networks ────────────────────────────────────────────
-        case ("GET", "networks"):
+        // `segments.count == 1` matters : without it this case also matched
+        // `/networks/{id}`, shadowing the inspect case below into dead code.
+        // `compose up` does a NetworkInspect on every run and got a JSON
+        // *array* where it expected an object.
+        case ("GET", "networks") where segments.count == 1:
             response = await handleNetworkList(req: req)
 
         case ("POST", "networks") where segments.count == 2 && segments[1] == "create":
@@ -349,7 +378,8 @@ final class DockerAPIServer {
                                     body: Data(#"{"NetworksDeleted":[]}"#.utf8))
 
         // ── Volumes ─────────────────────────────────────────────
-        case ("GET", "volumes"):
+        // Same shadowing bug as `/networks` above.
+        case ("GET", "volumes") where segments.count == 1:
             response = await handleVolumeList(req: req)
 
         case ("POST", "volumes") where segments.count == 2 && segments[1] == "create":
@@ -379,8 +409,8 @@ final class DockerAPIServer {
         // history yet ; we synthesise one entry per layer digest so the
         // common consumer (a UI listing layer sizes) gets a reasonable
         // shape instead of a 501.
-        case ("GET", "images") where segments.count == 3 && segments[2] == "history":
-            response = await handleImageHistory(name: segments[1])
+        case ("GET", "images") where segments.count >= 3 && segments.last == "history":
+            response = await handleImageHistory(name: Self.imageName(from: segments))
 
         // ── Container filesystem diff (no-op) ────────────────────
         // `docker container diff <id>` lists files added/changed/deleted
@@ -389,7 +419,7 @@ final class DockerAPIServer {
         // we return an empty list rather than a 501 so tooling like
         // Portainer doesn't error out at inspect time.
         case ("GET", "containers") where segments.count == 3 && segments[2] == "changes":
-            response = .json([DockerEmpty]())
+            response = await handleContainerChanges(id: segments[1])
 
         // ── Ping / version handshake ─────────────────────────────
         // `docker version` issues GET /_ping (and tolerates the HEAD
@@ -589,6 +619,9 @@ final class DockerAPIServer {
         var config = RunConfig(image: createReq.Image)
         config.name = name
         config.command = createReq.Cmd?.array ?? []
+        // Decoded and dropped before — `docker run --entrypoint` and compose
+        // `entrypoint:` over the API both had no effect.
+        config.entrypoint = createReq.Entrypoint?.array
         config.hostname = createReq.Hostname
         config.workdir = createReq.WorkingDir
         config.tty = createReq.Tty ?? false
@@ -787,14 +820,57 @@ final class DockerAPIServer {
         } catch { return .notFound(id) }
     }
 
+    /// `GET /containers/{id}/changes` used to answer a hardcoded `[]`, which
+    /// tooling reads as "nothing changed" — a confident lie. It now runs the
+    /// same real diff the CLI does.
+    private func handleContainerChanges(id: String) async -> HTTPResponse {
+        struct Change: Encodable { let Path: String; let Kind: Int }
+        do {
+            let diff = try await engine.diff(containerID: id)
+            // Docker's Kind: 0 modified, 1 added, 2 deleted.
+            return .json(diff.entries.map { entry in
+                Change(Path: entry.path,
+                       Kind: entry.kind == "A" ? 1 : (entry.kind == "D" ? 2 : 0))
+            })
+        } catch {
+            return .notFound(id)
+        }
+    }
+
     private func handleContainerTop(id: String) async -> HTTPResponse {
         struct TopResponse: Encodable {
             let Titles: [String]; let Processes: [[String]]
         }
-        return .json(TopResponse(
-            Titles: ["PID", "USER", "TIME", "COMMAND"],
-            Processes: [["1", "root", "0:00", "/sbin/init"]]
-        ))
+        // This used to return a hardcoded `1 root 0:00 /sbin/init` for every
+        // container, whatever was actually running. The CLI never hit it —
+        // `cocker top` execs `ps` itself — so only API clients (JetBrains'
+        // process tab, `docker top`) saw the fabrication. Same exec, one
+        // implementation.
+        do {
+            var config = ExecConfig(containerID: id, command: ["ps", "-eo", "pid,user,time,args"])
+            config.tty = false
+            var lines: [String] = []
+            for await event in try await engine.exec(config: config)
+            where event.stream == .stdout {
+                lines.append(contentsOf: event.data
+                    .split(separator: "\n", omittingEmptySubsequences: true)
+                    .map(String.init))
+            }
+            // First line is `ps`'s own header; the rest are processes.
+            let rows = lines.dropFirst().compactMap { line -> [String]? in
+                let fields = line.split(separator: " ", maxSplits: 3,
+                                        omittingEmptySubsequences: true).map(String.init)
+                return fields.count == 4 ? fields : nil
+            }
+            guard !rows.isEmpty else {
+                return .error("could not read the process list in container \(id)", status: 409)
+            }
+            return .json(TopResponse(Titles: ["PID", "USER", "TIME", "COMMAND"], Processes: rows))
+        } catch let error as CockerError {
+            return .error(error.description, status: 409)
+        } catch {
+            return .error("\(error)", status: 500)
+        }
     }
 
     private func handleContainerRename(id: String, req: HTTPRequest) async -> HTTPResponse {
@@ -860,6 +936,76 @@ final class DockerAPIServer {
         ))
     }
 
+    // MARK: - Archive handlers
+
+    /// `GET /containers/{id}/archive?path=…` → a tar of that path.
+    private func handleArchiveGet(id: String, req: HTTPRequest) async -> HTTPResponse {
+        guard let path = req.query["path"], !path.isEmpty else {
+            return .error("path parameter is required", status: 400)
+        }
+        do {
+            let target = try await engine.archiveTarget(containerID: id, path: path,
+                                                        forWriting: false)
+            guard FileManager.default.fileExists(atPath: target.path) else {
+                return .error("Could not find the file \(path) in container \(id)", status: 404)
+            }
+            var headers = ["Content-Type": "application/x-tar"]
+            if let stat = ContainerArchive.statHeader(for: target) {
+                headers["X-Docker-Container-Path-Stat"] = stat
+            }
+            return HTTPResponse(status: 200, headers: headers,
+                                body: try ContainerArchive.pack(target))
+        } catch let error as CockerError {
+            return .error(error.description, status: 404)
+        } catch {
+            return .error("\(error)", status: 500)
+        }
+    }
+
+    /// `HEAD` is how clients probe whether a path exists and whether it is a
+    /// directory, before deciding how to unpack into it.
+    private func handleArchiveHead(id: String, req: HTTPRequest) async -> HTTPResponse {
+        guard let path = req.query["path"], !path.isEmpty else {
+            return .error("path parameter is required", status: 400)
+        }
+        do {
+            let target = try await engine.archiveTarget(containerID: id, path: path,
+                                                        forWriting: false)
+            guard FileManager.default.fileExists(atPath: target.path),
+                  let stat = ContainerArchive.statHeader(for: target) else {
+                return .error("Could not find the file \(path) in container \(id)", status: 404)
+            }
+            return HTTPResponse(status: 200,
+                                headers: ["X-Docker-Container-Path-Stat": stat])
+        } catch let error as CockerError {
+            return .error(error.description, status: 404)
+        } catch {
+            return .error("\(error)", status: 500)
+        }
+    }
+
+    /// `PUT /containers/{id}/archive?path=…` extracts the tar body there.
+    /// The context arrives chunked from most clients, which is why this
+    /// needed the parser's chunked branch first.
+    private func handleArchivePut(id: String, req: HTTPRequest) async -> HTTPResponse {
+        guard let path = req.query["path"], !path.isEmpty else {
+            return .error("path parameter is required", status: 400)
+        }
+        guard !req.body.isEmpty else {
+            return .error("empty archive body", status: 400)
+        }
+        do {
+            let target = try await engine.archiveTarget(containerID: id, path: path,
+                                                        forWriting: true)
+            try ContainerArchive.unpack(req.body, into: target)
+            return HTTPResponse(status: 200)
+        } catch let error as CockerError {
+            return .error(error.description, status: 400)
+        } catch {
+            return .error("\(error)", status: 500)
+        }
+    }
+
     // MARK: - Exec handlers
 
     private func handleExecCreate(id: String, req: HTTPRequest) async -> HTTPResponse {
@@ -903,8 +1049,13 @@ final class DockerAPIServer {
             return
         }
 
-        let writer = HTTPStreamWriter(fd: fd)
-        writer.writeHeaders(contentType: "application/octet-stream")
+        // Docker hijacks this connection: after the response head it reads
+        // the socket raw. Chunked framing put chunk-size lines inside the
+        // stdcopy stream, so clients saw "unrecognized input header" or
+        // corrupted output.
+        var writer = HTTPStreamWriter(fd: fd)
+        writer.isRaw = true
+        writer.writeHijackHeaders(upgrade: Self.wantsUpgrade(req))
 
         var exitCode: Int32 = 0
         do {
@@ -948,6 +1099,70 @@ final class DockerAPIServer {
         execSessions[id]?.exitCode = exitCode
     }
 
+    /// Docker sends `Connection: Upgrade` + `Upgrade: tcp` and expects a
+    /// `101 UPGRADED`; older clients just POST and read the body. Answer in
+    /// whichever dialect was asked for.
+    nonisolated static func wantsUpgrade(_ req: HTTPRequest) -> Bool {
+        (req.headers["upgrade"]?.lowercased().contains("tcp") ?? false)
+            || (req.headers["connection"]?.lowercased().contains("upgrade") ?? false)
+    }
+
+    /// `POST /containers/{id}/attach` — the container's live output, and its
+    /// stdin when the client asked for it.
+    ///
+    /// This was 501, so `docker run` without `-d` (the default!),
+    /// `compose up` on a `tty:`/`stdin_open:` service, JetBrains' "attach
+    /// console" and a dev-container terminal all failed outright.
+    private func handleContainerAttach(id: String, req: HTTPRequest, fd: Int32) async {
+        guard let container = await engine.state.container(id: id) else {
+            _ = HTTPResponse.notFound(id).write(to: fd)
+            return
+        }
+        var writer = HTTPStreamWriter(fd: fd)
+        writer.isRaw = true
+        writer.writeHijackHeaders(upgrade: Self.wantsUpgrade(req))
+
+        // A tty container's output is a raw terminal stream; a non-tty one is
+        // multiplexed with the 8-byte stdcopy header, exactly as Docker does.
+        let multiplexed = container.tty != true
+        do {
+            let stream = try await engine.logs(id: container.id,
+                                               request: LogsRequest(id: container.id,
+                                                                    follow: true, tail: 0))
+            for await event in stream {
+                let data = Data(event.data.utf8)
+                if multiplexed {
+                    writer.writeLogFrame(stream: event.stream == .stderr ? 2 : 1, data: data)
+                } else {
+                    writer.writeChunk(data)
+                }
+            }
+        } catch {
+            writer.writeChunk(Data("attach failed: \(error)\n".utf8))
+        }
+    }
+
+    /// `POST /containers/{id}/resize` and `POST /exec/{id}/resize`.
+    ///
+    /// Both were 501, so every interactive terminal opened through the Docker
+    /// socket stayed at whatever size it started with — 80x24 for an exec —
+    /// and anything that redraws wrapped at the wrong column.
+    private func handleResize(id: String, req: HTTPRequest, isExec: Bool) async -> HTTPResponse {
+        let rows = Int(req.query["h"] ?? "") ?? 0
+        let cols = Int(req.query["w"] ?? "") ?? 0
+        guard rows > 0, cols > 0 else {
+            return .error("h and w must be positive", status: 400)
+        }
+        // An exec session resize targets the container it runs in.
+        let containerID = isExec ? execSessions[id]?.containerID : id
+        guard let containerID,
+              let container = await engine.state.container(id: containerID) else {
+            return .notFound(id)
+        }
+        await engine.vmRuntime.resizeTerminal(containerID: container.id, rows: rows, cols: cols)
+        return .noContent()
+    }
+
     private func handleExecInspect(id: String) -> HTTPResponse {
         struct ExecInspect: Encodable {
             let ID: String; let Running: Bool; let ExitCode: Int
@@ -967,6 +1182,23 @@ final class DockerAPIServer {
     }
 
     // MARK: - Image handlers
+
+    /// Rebuild an image reference from the path segments it was split across.
+    ///
+    /// `/images/ghcr.io/org/app/json` arrives as
+    /// `["images", "ghcr.io", "org", "app", "json"]`. Taking `segments[1]`
+    /// yielded "ghcr.io" and the `== 3` count guards missed entirely, so
+    /// every namespaced or registry-qualified reference 501'd.
+    ///
+    /// `hasVerbSuffix` is false for routes whose last segment is part of the
+    /// name (DELETE) rather than an action (`json`, `tag`, `history`).
+    /// Clients that percent-encode the slashes instead are handled too.
+    nonisolated static func imageName(from segments: [String], hasVerbSuffix: Bool = true) -> String {
+        let upper = hasVerbSuffix ? segments.count - 1 : segments.count
+        guard upper > 1 else { return "" }
+        let joined = segments[1..<upper].joined(separator: "/")
+        return joined.removingPercentEncoding ?? joined
+    }
 
     private func handleImageList(req: HTTPRequest) async -> HTTPResponse {
         let filters: DockerFilters

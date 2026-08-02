@@ -211,9 +211,13 @@ final class ContainerEngine {
         //       ENTRYPOINT + args
         //   - if there's no ENTRYPOINT, the final argv is just args (which
         //     defaults to the image's CMD if the user passed none)
+        //   - an explicit `entrypoint:` / `Entrypoint` replaces the image's
+        //     (and, per Docker, an empty one clears it entirely)
         let imageInfo = try? await images.find(config.image)
         var resolvedCommand = config.command
-        if let entrypoint = imageInfo?.entrypoint, !entrypoint.isEmpty {
+        if let override = config.entrypoint {
+            resolvedCommand = override + resolvedCommand
+        } else if let entrypoint = imageInfo?.entrypoint, !entrypoint.isEmpty {
             // User args replace CMD ; entrypoint is always prepended.
             let cmdPart = resolvedCommand.isEmpty ? (imageInfo?.cmd ?? []) : resolvedCommand
             resolvedCommand = entrypoint + cmdPart
@@ -272,6 +276,12 @@ final class ContainerEngine {
             stopSignal: config.stopSignal ?? imageInfo?.stopSignal
         )
         container.shmSizeMB = config.shmSizeMB
+        // `run -it` : remembered on the container so the spec written at
+        // start time asks init for a controlling terminal, and so a restart
+        // keeps it.
+        container.tty = config.tty
+        container.ttyRows = config.rows
+        container.ttyCols = config.cols
         if let workdir = resolvedWorkdir { container.env["WORKDIR"] = workdir }
 
         CockerLog.shared.debug("eng", "container struct created")
@@ -1141,10 +1151,46 @@ final class ContainerEngine {
         guard container.status == .running else {
             throw CockerError.containerNotRunning(config.containerID)
         }
+        // Docker's `exec` runs inside the container's environment. Ours passed
+        // only what the caller supplied with `-e`, so
+        // `cocker exec c sh -c 'echo $DATABASE_URL'` printed nothing even
+        // though the variable was right there in the running container — and
+        // anything the image's ENV or compose's `environment:` set was
+        // invisible to every exec'd command.
+        //
+        // Caller-supplied values still win, which is what `-e` is for.
+        var env = container.env
+        for (key, value) in config.env { env[key] = value }
+
         return try await vmRuntime.exec(
-            containerID: container.id, command: config.command, env: config.env,
+            containerID: container.id, command: config.command, env: env,
             tty: config.tty, stdin: config.stdin,
-            workdir: config.workdir, user: config.user)
+            workdir: config.workdir, user: config.user,
+            sessionID: config.sessionID, rows: config.rows, cols: config.cols)
+    }
+
+    /// Route a chunk of live stdin (or its EOF) into an in-flight exec.
+    func execInput(_ req: ExecInputRequest) async {
+        if req.isContainerStdin == true {
+            // `run -it` / `attach` : straight to the container's console,
+            // which init has made the main process's controlling terminal.
+            //
+            // Resolve first. `run -it` sends the id it just got back, but
+            // `attach` sends whatever the user typed — a name or a short id —
+            // and the console pipes are keyed by canonical id. Skipping this
+            // made `cocker attach <name>` hang with every keystroke going
+            // nowhere.
+            let canonical = await state.container(id: req.sessionID)?.id ?? req.sessionID
+            if let data = req.data, !data.isEmpty {
+                vmRuntime.writeContainerInput(containerID: canonical, data: data)
+            }
+            if req.eof { vmRuntime.closeContainerInput(containerID: canonical) }
+            return
+        }
+        if let data = req.data, !data.isEmpty {
+            vmRuntime.writeExecInput(session: req.sessionID, data: data)
+        }
+        if req.eof { vmRuntime.closeExecInput(session: req.sessionID) }
     }
 
     // MARK: - System info

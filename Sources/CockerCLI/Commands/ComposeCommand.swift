@@ -36,8 +36,12 @@ struct ComposeUpCommand: AsyncParsableCommand {
     @Flag(name: [.short, .customLong("detach")], help: "Run in background")
     var detach = false
 
-    @Option(name: [.short, .customLong("file")], help: "Compose file path")
-    var file: String = "cocker-compose.yml"
+    /// Repeatable, like Docker's. The first is the base; each subsequent one
+    /// is merged on top in order. A single `-f` was accepted before and every
+    /// extra file was dropped without a word.
+    @Option(name: [.short, .customLong("file")],
+            help: "Compose file path (repeatable; later files override earlier)")
+    var files: [String] = []
 
     @Option(name: [.short, .customLong("project-name")], help: "Project name")
     var projectName: String?
@@ -47,6 +51,16 @@ struct ComposeUpCommand: AsyncParsableCommand {
 
     @Flag(name: .customLong("remove-orphans"), help: "Remove containers for services not in compose file")
     var removeOrphans = false
+
+    /// Compose already filters services by profile, but nothing ever
+    /// populated the active set — so a service declaring `profiles:` could
+    /// never be started at all except by naming it on the command line. The
+    /// filter was there; the switch to turn it on wasn't.
+    ///
+    /// `COMPOSE_PROFILES` is honoured too, as Docker does.
+    @Option(name: .customLong("profile"),
+            help: "Enable a profile (repeatable; also reads COMPOSE_PROFILES)")
+    var profiles: [String] = []
 
     /// Docker semantics : an attached `up` aggregates every service's
     /// output, and `--attach` RESTRICTS that set rather than enabling it.
@@ -64,10 +78,30 @@ struct ComposeUpCommand: AsyncParsableCommand {
     @Argument(help: "Services to start (default: all)", completion: .none)
     var services: [String] = []
 
+    /// `--profile web --profile debug`, plus `COMPOSE_PROFILES=web,debug`.
+    /// The flag wins where both are present, matching Docker.
+    static func resolvedProfiles(flag: [String],
+                                 environment: [String: String] = ProcessInfo.processInfo.environment) -> [String] {
+        if !flag.isEmpty { return flag }
+        guard let raw = environment["COMPOSE_PROFILES"], !raw.isEmpty else { return [] }
+        return raw.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
     mutating func run() async throws {
-        let originalPath = resolvePath(file)
+        // First `-f` is the base; the rest are merged on top in order. With
+        // no `-f` at all we fall back to the conventional filenames and pick
+        // up `*.override.*` automatically, as Docker does.
+        let explicitFiles = !files.isEmpty
+        let originalPath = resolvePath(files.first ?? "cocker-compose.yml")
         guard FileManager.default.fileExists(atPath: originalPath) else {
             throw CockerError.invalidComposeFile("File not found: \(originalPath)")
+        }
+        var overridePaths = files.dropFirst().map { resolvePath($0) }
+        overridePaths += discoverOverrideFiles(base: originalPath, explicit: explicitFiles)
+        for override in overridePaths where !FileManager.default.fileExists(atPath: override) {
+            throw CockerError.invalidComposeFile("File not found: \(override)")
         }
 
         // `-d` means "don't hold the terminal", so there is nothing to
@@ -112,11 +146,15 @@ struct ComposeUpCommand: AsyncParsableCommand {
             projectName: effectiveProjectName,
             services: services,
             detach: detach,
+            // Compose could filter by profile but nothing ever populated the
+            // active set, so a service declaring `profiles:` was unstartable.
+            activeProfiles: Self.resolvedProfiles(flag: profiles),
             forceBuild: build,
             // Declared and referenced nowhere before, so a renamed or deleted
             // service left its container running with no way to reach it
             // through compose.
-            removeOrphans: removeOrphans
+            removeOrphans: removeOrphans,
+            overrideFiles: overridePaths.isEmpty ? nil : overridePaths
         )
         let request = try IPCRequest(type: .composeUp, payload: payload)
 
@@ -522,6 +560,17 @@ struct ComposeExecCommand: AsyncParsableCommand {
     @Flag(name: .customShort("T"), help: "Disable pseudo-TTY allocation")
     var noTTY = false
 
+    /// `docker compose exec -it` is the muscle-memory form. Neither flag was
+    /// declared here at all, so it failed at *parse* time — before any of the
+    /// missing TTY plumbing even mattered.
+    @Flag(name: [.customShort("i"), .customLong("interactive")],
+          help: "Keep STDIN open")
+    var interactive = false
+
+    @Flag(name: [.customShort("t"), .customLong("tty")],
+          help: "Allocate a pseudo-TTY")
+    var tty = false
+
     @Option(name: [.short, .customLong("file")], help: "Compose file path")
     var file: String = "cocker-compose.yml"
 
@@ -559,24 +608,53 @@ struct ComposeExecCommand: AsyncParsableCommand {
         }
 
         var config = ExecConfig(containerID: container.id, command: command)
-        config.tty = !noTTY
+        // `-T` is Docker's explicit opt-out; `-t` its opt-in. Either way the
+        // guest only gets a PTY when we're actually on a terminal.
+        config.tty = !noTTY && (tty || InteractiveSession.stdinIsTerminal)
         config.env = container.env
         config.workdir = container.env["WORKDIR"]
         config.user = container.env["USER"]
+
+        // Same live session as `cocker exec -it`. Before this, `-i`/`-t`
+        // weren't even declared on this command, so `compose exec -it svc sh`
+        // failed at parse time.
+        let session: InteractiveSession? =
+            (!noTTY && (interactive || tty) && InteractiveSession.stdinIsTerminal)
+            ? InteractiveSession() : nil
+        if let session {
+            config.sessionID = session.sessionID
+            if let size = InteractiveSession.windowSize() {
+                config.rows = size.rows
+                config.cols = size.cols
+            }
+        }
+
         let payload = ExecRequest(config: config)
         let request = try IPCRequest(type: .exec, payload: payload)
 
         // Same contract as `cocker exec` : propagate the command's exit code
         // instead of swallowing the `exit:<n>` status event.
         let status = ExitStatusBox()
+        // Read stdin from the start so nothing typed early is lost; the
+        // pump holds it until the daemon reports its vsock is up.
+        session?.enterRawMode()
+        session?.startPump()
+        defer {
+            session?.stop()
+            session?.restore()
+        }
         try await client.sendStreaming(request) { event in
             switch event.stream {
             case .stdout: print(event.data, terminator: "")
             case .stderr: UX.writeStderr(event.data)
-            case .status: status.consume(statusPayload: event.data)
+            case .status:
+                if event.data == "exec-ready" { session?.markReady() }
+                status.consume(statusPayload: event.data)
             case .error: UX.writeStderr(event.data)
             }
         }
+        session?.stop()
+        session?.restore()
         if status.code != 0 { throw ExitCode(status.code) }
     }
 }
@@ -1050,6 +1128,37 @@ struct ComposeEventsCommand: AsyncParsableCommand {
         }
         if !outputJSON { footer.restore() }
     }
+}
+
+/// Override files that apply on top of `base`.
+///
+/// `docker-compose.override.yml` is loaded automatically by Docker Compose,
+/// and it is one of the most common things in a real project — a dev-only
+/// port, a bind mount, an extra env var. Cocker read a single file and never
+/// merged, so all of that was **silently ignored**: the project came up,
+/// looked healthy, and was not configured the way its author wrote it.
+///
+/// Only auto-discovered when the user didn't pass `-f` explicitly, matching
+/// Docker: naming a file means you're taking control of the file list.
+func discoverOverrideFiles(base: String, explicit: Bool) -> [String] {
+    guard !explicit else { return [] }
+    let dir = (base as NSString).deletingLastPathComponent
+    let stem = (base as NSString).lastPathComponent
+    // `compose.yaml` → `compose.override.yaml`, and so on for each spelling.
+    let candidates: [String]
+    switch stem {
+    case "compose.yaml":            candidates = ["compose.override.yaml", "compose.override.yml"]
+    case "compose.yml":             candidates = ["compose.override.yml", "compose.override.yaml"]
+    case "docker-compose.yaml":     candidates = ["docker-compose.override.yaml", "docker-compose.override.yml"]
+    case "docker-compose.yml":      candidates = ["docker-compose.override.yml", "docker-compose.override.yaml"]
+    case "cocker-compose.yml":      candidates = ["cocker-compose.override.yml", "cocker-compose.override.yaml"]
+    default:                        candidates = []
+    }
+    for candidate in candidates {
+        let path = dir + "/" + candidate
+        if FileManager.default.fileExists(atPath: path) { return [path] }
+    }
+    return []
 }
 
 private func resolvePath(_ path: String) -> String {

@@ -58,7 +58,7 @@ struct NetworkLsCommand: AsyncParsableCommand {
 struct NetworkCreateCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "create", abstract: "Create a network")
 
-    @Option(name: .customShort("d"), help: "Driver (bridge|host|none|overlay)")
+    @Option(name: .customShort("d"), help: "Driver (bridge|host|none)")
     var driver: String = "bridge"
 
     @Option(name: .customLong("subnet"), help: "Subnet in CIDR format (e.g. 172.20.0.0/16)")
@@ -73,9 +73,36 @@ struct NetworkCreateCommand: AsyncParsableCommand {
     @Argument(help: "Network name")
     var name: String
 
+    /// `--label k=v` repeated. A bare `k` records an empty value, matching
+    /// Docker.
+    static func parseLabels(_ pairs: [String]) -> [String: String] {
+        var out: [String: String] = [:]
+        for pair in pairs {
+            let parts = pair.split(separator: "=", maxSplits: 1)
+            if parts.count == 2 { out[String(parts[0])] = String(parts[1]) }
+            else if parts.count == 1 { out[String(parts[0])] = "" }
+        }
+        return out
+    }
+
     mutating func run() async throws {
-        let driver = NetworkDriver(rawValue: self.driver) ?? .bridge
-        let payload = NetworkCreateRequest(name: name, driver: driver, subnet: subnet, gateway: gateway)
+        // `overlay` is advertised in the help and stored on the network, but
+        // nothing implements it — every driver behaves as a bridge. Accepting
+        // it produced a network the user believed was multi-host and wasn't.
+        // Refuse the ones we don't implement rather than coercing silently.
+        guard let driver = NetworkDriver(rawValue: self.driver),
+              driver != .overlay else {
+            UX.Failure.emit(
+                headline: "Cannot create network \(name)",
+                reason: "unsupported driver '\(self.driver)'",
+                hint: "cocker implements bridge, host and none. There is no overlay "
+                    + "networking on a single Mac — use `apple/container` or Docker "
+                    + "Desktop if you need it."
+            )
+            throw ExitCode.failure
+        }
+        let payload = NetworkCreateRequest(name: name, driver: driver, subnet: subnet, gateway: gateway,
+                                           labels: Self.parseLabels(labels))
         let client = IPCClient()
         let start = Date()
         do {
@@ -97,7 +124,7 @@ struct NetworkCreateCommand: AsyncParsableCommand {
                 reason: error.description,
                 hint: "another network may already be named `\(name)` — `cocker network ls`"
             )
-            throw ExitCode.failure
+            throw ExitCode(error.exitCode)
         }
     }
 }
@@ -110,7 +137,7 @@ struct NetworkRmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
-        var failed = false
+        let failures = FailureCode()
         for name in networks {
             let start = Date()
             do {
@@ -118,7 +145,7 @@ struct NetworkRmCommand: AsyncParsableCommand {
                 _ = try await client.send(request)
                 UX.printResult(.network, name, verb: .remove, elapsed: Date().timeIntervalSince(start))
             } catch let error as CockerError {
-                failed = true
+                failures.record(error)
                 UX.Failure.emit(
                     headline: "Cannot remove network \(name)",
                     reason: error.description,
@@ -126,7 +153,7 @@ struct NetworkRmCommand: AsyncParsableCommand {
                 )
             }
         }
-        if failed { throw ExitCode.failure }
+        try failures.throwIfFailed()
     }
 }
 
@@ -180,7 +207,7 @@ struct NetworkConnectCommand: AsyncParsableCommand {
                 headline: "Cannot connect \(container) to \(network)",
                 reason: error.description
             )
-            throw ExitCode.failure
+            throw ExitCode(error.exitCode)
         }
     }
 }
@@ -217,7 +244,7 @@ struct NetworkDisconnectCommand: AsyncParsableCommand {
                 reason: error.description,
                 hint: force ? nil : "use `--force` (-f) if the container is unresponsive"
             )
-            throw ExitCode.failure
+            throw ExitCode(error.exitCode)
         }
     }
 }

@@ -42,7 +42,10 @@ public enum RootfsBootstrap {
 
     /// Magic header for the v5 spec format. cocker-init's spec_load() reads
     /// these 7 bytes first and refuses to proceed on mismatch.
-    public static let specMagic: [UInt8] = Array("COCKER\u{05}".utf8)
+    /// v6 adds the tty flag and terminal geometry, so `cocker run -it` can
+    /// give the container's *main* process a controlling terminal. The guest
+    /// still accepts v2–v5 and treats the missing trailer as "no tty".
+    public static let specMagic: [UInt8] = Array("COCKER\u{06}".utf8)
 
     /// Resolve a Dockerfile `STOPSIGNAL` value (`"SIGQUIT"`, `"SIGTERM"`,
     /// `"3"`, …) into a POSIX signal number. Returns 0 ("use default") on
@@ -122,7 +125,10 @@ public enum RootfsBootstrap {
                                   privileged: Bool = false,
                                   capAdd: [String] = [],
                                   capDrop: [String] = [],
-                                  stopSignal: String? = nil) -> Data {
+                                  stopSignal: String? = nil,
+                                  tty: Bool = false,
+                                  rows: Int = 0,
+                                  cols: Int = 0) -> Data {
         var data = Data()
         data.append(contentsOf: specMagic)
 
@@ -176,6 +182,14 @@ public enum RootfsBootstrap {
         // stop_signal (v5+). 0 = init's built-in default (SIGTERM).
         data.appendUInt32BE(resolveStopSignal(stopSignal))
 
+        // tty + geometry (v6+). Without a controlling terminal the container's
+        // main process sees `isatty() == false`, so shells run non-interactive
+        // and anything that redraws is wrong. 0x0 means "let the guest keep
+        // the console's own size".
+        data.append(tty ? 1 : 0)
+        data.appendUInt32BE(UInt32(max(0, min(rows, Int(UInt16.max)))))
+        data.appendUInt32BE(UInt32(max(0, min(cols, Int(UInt16.max)))))
+
         return data
     }
 
@@ -188,11 +202,15 @@ public enum RootfsBootstrap {
                                  privileged: Bool = false,
                                  capAdd: [String] = [],
                                  capDrop: [String] = [],
-                                 stopSignal: String? = nil) throws {
+                                 stopSignal: String? = nil,
+                                 tty: Bool = false,
+                                 rows: Int = 0,
+                                 cols: Int = 0) throws {
         let data = encodeSpec(command: command, env: env, workdir: workdir,
                               user: user, privileged: privileged,
                               capAdd: capAdd, capDrop: capDrop,
-                              stopSignal: stopSignal)
+                              stopSignal: stopSignal,
+                              tty: tty, rows: rows, cols: cols)
         try data.write(to: rootfsPath.appendingPathComponent("cocker-spec"), options: .atomic)
     }
 

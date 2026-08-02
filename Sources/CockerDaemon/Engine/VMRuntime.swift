@@ -152,6 +152,99 @@ final class VMRuntime: NSObject {
     /// out. Cleared on container stop / remove.
     fileprivate var pendingNATMACs: [String: String] = [:]
 
+    /// Write ends of the console stdin pipe for `-t` containers, keyed by
+    /// container id. Writing here reaches the container's main process,
+    /// which init has given the console as its controlling terminal.
+    private var consoleStdinPipes: [String: Pipe] = [:]
+
+    /// Stream a chunk of stdin into a running container's main process.
+    func writeContainerInput(containerID: String, data: Data) {
+        guard let pipe = consoleStdinPipes[containerID], !data.isEmpty else { return }
+        let fd = pipe.fileHandleForWriting.fileDescriptor
+        _ = data.withUnsafeBytes { buf -> Bool in
+            guard let base = buf.baseAddress else { return false }
+            return writeAllFD(fd, base, buf.count)
+        }
+    }
+
+    /// The caller's stdin ended. Closing the write end gives the container's
+    /// console an EOF rather than leaving it waiting forever.
+    func closeContainerInput(containerID: String) {
+        guard let pipe = consoleStdinPipes.removeValue(forKey: containerID) else { return }
+        try? pipe.fileHandleForWriting.close()
+    }
+
+    /// Live exec sessions that accept streamed stdin, keyed by the id the CLI
+    /// minted. The value is the vsock fd the guest is relaying to the PTY
+    /// master, so writing here lands on the child's stdin.
+    private var execInputFDs: [String: Int32] = [:]
+
+    /// Bytes that arrived before the vsock connected. The CLI starts pumping
+    /// as soon as it sends the request, so a fast typist (or a pipe) can beat
+    /// the connect callback; holding them briefly is simpler than making the
+    /// CLI wait for a ready signal.
+    private var execInputPending: [String: Data] = [:]
+
+    /// Cap on that buffer. Past it we drop rather than grow without bound —
+    /// a stdin flood before the guest is even listening is not something to
+    /// absorb indefinitely.
+    private static let execInputPendingCap = 1 << 20  // 1 MiB
+
+    /// Sessions whose caller closed stdin before the vsock was up. Verified
+    /// on hardware: dropping this made `echo x | cocker exec -i c cat` hang
+    /// forever, because the child never saw EOF.
+    private var execInputPendingEOF: Set<String> = []
+
+    /// Called once the vsock is up: adopt the fd and flush anything buffered.
+    private func registerExecInput(session: String, fd: Int32) {
+        execInputFDs[session] = fd
+        if let pending = execInputPending.removeValue(forKey: session), !pending.isEmpty {
+            _ = pending.withUnsafeBytes { buf -> Bool in
+                guard let base = buf.baseAddress else { return false }
+                return writeAllFD(fd, base, buf.count)
+            }
+        }
+        // Apply a deferred EOF *after* the buffered bytes, or the child reads
+        // an empty stdin.
+        if execInputPendingEOF.remove(session) != nil {
+            _ = Darwin.shutdown(fd, SHUT_WR)
+        }
+    }
+
+    private func unregisterExecInput(session: String) {
+        execInputFDs.removeValue(forKey: session)
+        execInputPending.removeValue(forKey: session)
+        execInputPendingEOF.remove(session)
+    }
+
+    /// Write a chunk of live stdin into an exec. Buffers if the vsock hasn't
+    /// connected yet.
+    func writeExecInput(session: String, data: Data) {
+        guard let fd = execInputFDs[session] else {
+            var pending = execInputPending[session] ?? Data()
+            guard pending.count + data.count <= Self.execInputPendingCap else { return }
+            pending.append(data)
+            execInputPending[session] = pending
+            return
+        }
+        _ = data.withUnsafeBytes { buf -> Bool in
+            guard let base = buf.baseAddress else { return false }
+            return writeAllFD(fd, base, buf.count)
+        }
+    }
+
+    /// The caller's stdin hit EOF. Half-close so the in-VM child sees it and
+    /// stops waiting for more; the read side stays open for its output.
+    func closeExecInput(session: String) {
+        guard let fd = execInputFDs[session] else {
+            // The vsock isn't up yet. Remember, and apply at register time —
+            // silently dropping this is what made a piped `exec -i` hang.
+            execInputPendingEOF.insert(session)
+            return
+        }
+        _ = Darwin.shutdown(fd, SHUT_WR)
+    }
+
     /// Exclusive `flock`s held on each container's block-volume images for as
     /// long as its VM runs, keyed by container id.
     ///
@@ -278,15 +371,28 @@ final class VMRuntime: NSObject {
         // Memory balloon (allows host to reclaim memory)
         config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
 
-        // Serial console — branche le stdout du VM (kernel + cocker-init + container)
-        // sur un Pipe qu'on lit côté hôte pour alimenter le log buffer.
-        // /dev/null en lecture car la VM n'a pas besoin d'input pour l'instant.
-        let nullDev = FileHandle(forReadingAtPath: "/dev/null") ?? FileHandle.standardInput
+        // Serial console — the VM's stdout (kernel + cocker-init + container)
+        // goes to a Pipe the host reads to feed the log buffer.
+        //
+        // The read side used to be /dev/null: "the VM doesn't need input for
+        // now". That is what made `cocker run -it` impossible — with nothing
+        // writable attached, the container's main process could never receive
+        // a keystroke. A tty container gets a real pipe so the host can write
+        // into its console; everything else keeps /dev/null, so a normal
+        // container still sees stdin closed the way it always did.
+        let consoleInput: FileHandle
+        if container.tty == true {
+            let pipe = Pipe()
+            consoleStdinPipes[container.id] = pipe
+            consoleInput = pipe.fileHandleForReading
+        } else {
+            consoleInput = FileHandle(forReadingAtPath: "/dev/null") ?? FileHandle.standardInput
+        }
         let consoleDevice = VZVirtioConsoleDeviceConfiguration()
         let port0 = VZVirtioConsolePortConfiguration()
         port0.isConsole = true
         port0.attachment = VZFileHandleSerialPortAttachment(
-            fileHandleForReading: nullDev,
+            fileHandleForReading: consoleInput,
             fileHandleForWriting: stdoutPipe.fileHandleForWriting
         )
         consoleDevice.ports[0] = port0
@@ -984,6 +1090,10 @@ final class VMRuntime: NSObject {
         // volumes never registers a RunningVM, and leaving the flock held
         // would lock the user out of their own volume until cockerd restarts.
         releaseVolumeLocks(containerID: containerID)
+        if let pipe = consoleStdinPipes.removeValue(forKey: containerID) {
+            try? pipe.fileHandleForWriting.close()
+            try? pipe.fileHandleForReading.close()
+        }
         guard let running = runningVMs[containerID] else { return }
         // Finish live log streams before dropping the RunningVM. Consumers
         // receive a clean end-of-stream immediately instead of polling
@@ -1068,7 +1178,10 @@ final class VMRuntime: NSObject {
             privileged: container.privileged,
             capAdd: container.capAdd,
             capDrop: container.capDrop,
-            stopSignal: container.stopSignal
+            stopSignal: container.stopSignal,
+            tty: container.tty ?? false,
+            rows: container.ttyRows ?? 0,
+            cols: container.ttyCols ?? 0
         )
     }
 
@@ -1254,6 +1367,48 @@ final class VMRuntime: NSObject {
     /// Best-effort : a missing listener or closed connection is logged
     /// and ignored ; the outer stop() loop falls back to VZ's ACPI
     /// shutdown if the signal didn't trigger an exit within the timeout.
+    /// Tell a `-t` container its terminal changed size.
+    ///
+    /// The console's winsize is set once from the spec at start. Resizing the
+    /// host window afterwards left the container at the old size, so anything
+    /// that redraws wrapped at the wrong column for the rest of the session.
+    /// The console byte stream belongs to the application, so this rides the
+    /// same vsock the exec listener already serves.
+    func resizeTerminal(containerID: String, rows: Int, cols: Int) async {
+        guard rows > 0, cols > 0,
+              let running = runningVMs[containerID],
+              let socketDevice = running.vm.socketDevices.first as? VZVirtioSocketDevice
+        else { return }
+
+        let settled = ResumeOnceBox()
+        let connection: VZVirtioSocketConnection? = await withCheckedContinuation { cont in
+            Self.connectWithRetry(socketDevice, settled: settled) { result in
+                switch result {
+                case .success(let conn): cont.resume(returning: conn)
+                case .failure: cont.resume(returning: nil)
+                }
+            }
+        }
+        guard let connection else { return }
+        let holder = ConnectionHolder(connection)
+        defer { _ = holder.connection }
+
+        struct ResizeReq: Codable { let resize: Bool; let rows: Int; let cols: Int }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        guard let data = try? encoder.encode(ResizeReq(resize: true, rows: rows, cols: cols))
+        else { return }
+        let fd = connection.fileDescriptor
+        _ = data.withUnsafeBytes { buf -> Bool in
+            guard let base = buf.baseAddress else { return false }
+            return writeAllFD(fd, base, buf.count)
+        }
+        var nl: UInt8 = 0x0A
+        _ = writeAllFD(fd, &nl, 1)
+        // Best-effort : the guest replies with a one-line ack we don't need.
+        _ = Darwin.shutdown(fd, SHUT_WR)
+    }
+
     private func sendStopSignal(vm: VZVirtualMachine, containerID: String, signal: String) async {
         guard let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else {
             CockerLog.shared.debug("stopsig", "no vsock device for \(containerID)")
@@ -1311,8 +1466,60 @@ final class VMRuntime: NSObject {
     /// bounds the Virtualization.framework callback bug (see `exec`).
     nonisolated static let execConnectTimeout: TimeInterval = 15
 
+    /// Delay between vsock connect attempts, and how many to make. The
+    /// overall `execConnectTimeout` still bounds the whole thing.
+    nonisolated static let execConnectRetryDelay: TimeInterval = 0.25
+    nonisolated static let execConnectRetries = 40
+
+    /// Connect to the in-VM exec listener, retrying a refused connection.
+    ///
+    /// Measured on an M3 Max: for a window after a container starts — even
+    /// though the guest has already logged "exec-listener ready on vsock port
+    /// 9000" — every connect is refused with ECONNRESET. **20 consecutive
+    /// plain `cocker exec` calls failed**, then the next one seconds later
+    /// succeeded and everything passed from then on. The guest's listener and
+    /// the host's view of the vsock device do not become usable at the same
+    /// instant, and a single attempt loses that race.
+    ///
+    /// Docker clients exec in loops — CI steps, healthchecks, dev scripts, and
+    /// cocker's own `top` — so one shot was never enough.
+    ///
+    /// **Must stay MainActor-isolated.** `VZVirtioSocketDevice.connectToPort:`
+    /// asserts it is called on the VM's own dispatch queue — the main queue
+    /// here — and traps with `dispatch_assert_queue_fail` otherwise. Retrying
+    /// from `DispatchQueue.global()` crashed cockerd outright.
+    ///
+    /// Worth noting for whoever revisits `docs/APPLE-FEEDBACK-VSOCK-CALLBACK.md`:
+    /// the symptom recorded there — the callback misbehaving "when called
+    /// repeatedly from a background async context" — is the same shape as this
+    /// queue requirement, so that report may describe our own violation rather
+    /// than a framework bug.
+    @MainActor
+    static func connectWithRetry(
+        _ device: VZVirtioSocketDevice,
+        settled: ResumeOnceBox,
+        attemptsRemaining: Int? = nil,
+        completion: @escaping @Sendable (Result<VZVirtioSocketConnection, Error>) -> Void
+    ) {
+        let remaining = attemptsRemaining ?? execConnectRetries
+        device.connect(toPort: 9000) { result in
+            if case .failure = result, remaining > 0, !settled.isClaimed {
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: UInt64(execConnectRetryDelay * 1_000_000_000))
+                    guard !settled.isClaimed else { return }
+                    connectWithRetry(device, settled: settled,
+                                     attemptsRemaining: remaining - 1,
+                                     completion: completion)
+                }
+                return
+            }
+            completion(result)
+        }
+    }
+
     func exec(containerID: String, command: [String], env: [String: String], tty: Bool = false,
-              stdin: Data? = nil, workdir: String? = nil, user: String? = nil) async throws -> AsyncStream<StreamEvent> {
+              stdin: Data? = nil, workdir: String? = nil, user: String? = nil,
+              sessionID: String? = nil, rows: Int? = nil, cols: Int? = nil) async throws -> AsyncStream<StreamEvent> {
         guard let running = runningVMs[containerID] else {
             throw CockerError.containerNotRunning(containerID)
         }
@@ -1349,7 +1556,7 @@ final class VMRuntime: NSObject {
                     continuation.finish()
                 }
 
-            socketDevice.connect(toPort: 9000) { result in
+            Self.connectWithRetry(socketDevice, settled: settled) { result in
                 guard settled.tryClaim() else {
                     // The deadline already gave up and closed the stream.
                     if case .success(let late) = result {
@@ -1372,9 +1579,14 @@ final class VMRuntime: NSObject {
                         let tty: Bool
                         let workdir: String?
                         let user: String?
+                        /// Terminal geometry, so the guest's openpty starts at
+                        /// the caller's real size rather than 80x24.
+                        let rows: Int?
+                        let cols: Int?
                     }
                     let req = ExecReq(cmd: command, env: env, tty: tty,
-                                      workdir: workdir, user: user)
+                                      workdir: workdir, user: user,
+                                      rows: rows, cols: cols)
                     // `.sortedKeys` gives a deterministic wire order. The in-VM
                     // parser is now key-order independent either way, but a
                     // stable byte stream keeps logs and the exec-parser tests
@@ -1439,6 +1651,34 @@ final class VMRuntime: NSObject {
                         _ = Darwin.shutdown(fd, SHUT_WR)
                     }
 
+                    // Only now publish the fd to the side channel carrying
+                    // live stdin.
+                    //
+                    // This used to be dispatched right after `connect`
+                    // returned, i.e. *before* the JSON request above was
+                    // written. Registering flushes buffered stdin and may
+                    // apply a deferred `shutdown(SHUT_WR)`, so the hop
+                    // routinely won the race on real hardware: the guest read
+                    // stdin bytes — or an immediate EOF — where it expected
+                    // its request line, failed to parse, and closed. The host
+                    // saw ECONNRESET at connect and `exec -it` never worked.
+                    //
+                    // The request is fully on the wire by this point, so the
+                    // ordering is now safe whenever the hop lands.
+                    if let sessionID {
+                        Task { @MainActor in
+                            self.registerExecInput(session: sessionID, fd: fd)
+                            // Only now is it safe for the caller to stream
+                            // stdin. Starting the pump optimistically instead
+                            // meant a burst of `.execInput` frames hit the
+                            // daemon *before* this exec existed, and the vsock
+                            // connect then failed with ECONNRESET — proven on
+                            // hardware by toggling the pump off, which made
+                            // the identical command succeed.
+                            continuation.yield(StreamEvent(stream: .status, data: "exec-ready"))
+                        }
+                    }
+
                     // Capture `connection` strongly so ARC doesn't release it
                     // (and tear down the vsock fd) the moment the callback
                     // returns. Without this, the host side closes its end
@@ -1446,7 +1686,12 @@ final class VMRuntime: NSObject {
                     let retained = ConnectionHolder(connection)
                     DispatchQueue.global(qos: .userInitiated).async {
                         _ = retained.connection  // keep alive for the lifetime of the stream
-                        defer { lifetime.complete() }
+                        defer {
+                            lifetime.complete()
+                            if let sessionID {
+                                Task { @MainActor in self.unregisterExecInput(session: sessionID) }
+                            }
+                        }
                         var buffer = Data()
                         var chunk = [UInt8](repeating: 0, count: 4096)
                         let exitMarker = Data("__COCKER_EXIT__".utf8)
@@ -1576,6 +1821,13 @@ final class ResumeOnceBox: @unchecked Sendable {
         claimed = true
         return true
     }
+
+    /// Lets the retry loop stop once the deadline has already closed the
+    /// stream, instead of retrying behind a dead consumer.
+    var isClaimed: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return claimed
+    }
 }
 
 // Extensions to access Container config fields (optional stored in env)
@@ -1587,18 +1839,37 @@ private extension Container {
 /// Buffer thread-safe pour accumuler la sortie d'une VM ephémère.
 /// Le readabilityHandler de Pipe tourne sur une queue dédiée non-actor.
 final class OutputBuffer: @unchecked Sendable {
+    /// Keep at most this much, newest-last. A build VM's console is fed
+    /// straight into here for the whole build, and `append` had no cap at
+    /// all — one chatty `RUN` (npm, pip or apt with progress bars, or an
+    /// accidental `yes`) grew cockerd's resident memory without limit.
+    ///
+    /// 4 MiB is far more than any diagnostic needs and small enough that a
+    /// runaway command costs nothing. What matters on a failure is the tail,
+    /// so that is what survives.
+    static let capacity = 4 * 1024 * 1024
+
     private var data = Data()
+    private var dropped = 0
     private let lock = NSLock()
 
     func append(_ chunk: Data) {
         lock.lock()
         data.append(chunk)
+        if data.count > Self.capacity {
+            let excess = data.count - Self.capacity
+            data.removeFirst(excess)
+            dropped += excess
+        }
         lock.unlock()
     }
 
     func text() -> String {
         lock.lock()
         defer { lock.unlock() }
-        return String(data: data, encoding: .utf8) ?? ""
+        let body = String(data: data, encoding: .utf8) ?? ""
+        guard dropped > 0 else { return body }
+        // Say so rather than presenting a truncated head as the whole output.
+        return "[… \(dropped / 1024) KiB of earlier output dropped …]\n" + body
     }
 }

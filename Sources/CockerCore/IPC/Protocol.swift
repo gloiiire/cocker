@@ -9,8 +9,12 @@ public enum IPCRequestType: String, Codable, Sendable {
     case ps, inspect, logs, top
     // Block until a container exits, then report its code
     case wait
+    /// Tell a `-t` container its terminal changed size (SIGWINCH).
+    case resize
     // Exec
     case exec
+    /// Live stdin for an in-flight exec, on its own connection.
+    case execInput
     // Copy
     case cp
     // Rename
@@ -80,6 +84,16 @@ public struct IPCResponse: Codable, Sendable {
     public let success: Bool
     public let payload: Data
     public let error: String?
+    /// The failing `CockerError`'s exit code, so the CLI can keep the
+    /// taxonomy the charter documents.
+    ///
+    /// Only the message used to cross the socket, and the client re-wrapped
+    /// it as `CockerError.daemon(String)` — which has no kind, so every
+    /// daemon-side failure arrived as a plain 1. "No such container" and
+    /// "the daemon is wedged" were indistinguishable to a script, which is
+    /// precisely what the taxonomy exists to prevent. Optional: an older
+    /// daemon doesn't send it and the client falls back to 1.
+    public let errorCode: Int32?
     public let isStreaming: Bool
     public let isLast: Bool
 
@@ -93,15 +107,17 @@ public struct IPCResponse: Codable, Sendable {
         self.success = true
         self.payload = try JSONEncoder().encode(payload)
         self.error = nil
+        self.errorCode = nil
         self.isStreaming = isStreaming
         self.isLast = isLast
     }
 
-    public init(requestId: String, error: String) {
+    public init(requestId: String, error: String, errorCode: Int32? = nil) {
         self.requestId = requestId
         self.success = false
         self.payload = Data()
         self.error = error
+        self.errorCode = errorCode
         self.isStreaming = false
         self.isLast = true
     }
@@ -216,6 +232,16 @@ public enum ExitMarker {
     }
 }
 
+/// `.resize` — new terminal geometry for a `-t` container.
+public struct ResizeRequest: Codable, Sendable {
+    public let id: String
+    public let rows: Int
+    public let cols: Int
+    public init(id: String, rows: Int, cols: Int) {
+        self.id = id; self.rows = rows; self.cols = cols
+    }
+}
+
 /// Reply to `.wait` — the container's real exit code, readable even after
 /// `--rm` has removed the container.
 public struct WaitResponse: Codable, Sendable {
@@ -303,6 +329,26 @@ public struct VolumesResponse: Codable, Sendable {
     public init(volumes: [VolumeInfo]) { self.volumes = volumes }
 }
 
+/// A chunk of live stdin for an in-flight exec, or the EOF that ends it.
+public struct ExecInputRequest: Codable, Sendable {
+    /// Exec session id, or — when `isContainerStdin` is set — the container
+    /// whose *main* process should receive the bytes. `run -it` needs the
+    /// same side channel for the same reason exec did: the connection
+    /// streaming output can't read a second frame.
+    public let sessionID: String
+    /// Route to the container's console rather than to an exec session.
+    public let isContainerStdin: Bool?
+    public let data: Data?
+    /// The caller closed its stdin. The daemon half-closes the vsock so the
+    /// in-VM child sees EOF instead of blocking forever.
+    public let eof: Bool
+    public init(sessionID: String, data: Data? = nil, eof: Bool = false,
+                isContainerStdin: Bool = false) {
+        self.sessionID = sessionID; self.data = data; self.eof = eof
+        self.isContainerStdin = isContainerStdin
+    }
+}
+
 public struct ExecRequest: Codable, Sendable {
     public let config: ExecConfig
     public init(config: ExecConfig) { self.config = config }
@@ -367,12 +413,16 @@ public struct ComposeRequest: Codable, Sendable {
     /// `compose up/down --remove-orphans` : also remove containers labelled
     /// for this project that the compose file no longer declares.
     public let removeOrphans: Bool
+    /// Extra compose files to merge on top of `composePath`, in order —
+    /// repeated `-f`, plus the `docker-compose.override.yml` Docker loads
+    /// automatically. Optional so an older CLI's payload still decodes.
+    public let overrideFiles: [String]?
     public init(composePath: String, projectName: String? = nil, services: [String] = [],
                 detach: Bool = false, activeProfiles: [String]? = nil,
                 removeVolumes: Bool = false, follow: Bool = false, tail: Int = 50,
                 forceBuild: Bool = false, noCache: Bool = false,
                 command: [String]? = nil, removeAfterRun: Bool = false,
-                removeOrphans: Bool = false) {
+                removeOrphans: Bool = false, overrideFiles: [String]? = nil) {
         self.composePath = composePath; self.projectName = projectName
         self.services = services; self.detach = detach
         self.activeProfiles = activeProfiles
@@ -384,11 +434,12 @@ public struct ComposeRequest: Codable, Sendable {
         self.command = command
         self.removeAfterRun = removeAfterRun
         self.removeOrphans = removeOrphans
+        self.overrideFiles = overrideFiles
     }
 
     enum CodingKeys: String, CodingKey {
         case composePath, projectName, services, detach, activeProfiles, removeVolumes, follow, tail, forceBuild, noCache
-        case command, removeAfterRun, removeOrphans
+        case command, removeAfterRun, removeOrphans, overrideFiles
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -412,6 +463,7 @@ public struct ComposeRequest: Codable, Sendable {
         self.command        = try c.decodeIfPresent([String].self, forKey: .command)
         self.removeAfterRun = try c.decodeIfPresent(Bool.self, forKey: .removeAfterRun) ?? false
         self.removeOrphans  = try c.decodeIfPresent(Bool.self, forKey: .removeOrphans) ?? false
+        self.overrideFiles  = try c.decodeIfPresent([String].self, forKey: .overrideFiles)
     }
 }
 
@@ -631,8 +683,10 @@ public struct UpdateRequest: Codable, Sendable {
 // MARK: - Version
 
 public enum CockerVersion {
-    // Bumped manually with each tag. TODO : drive from a Version.generated.swift
-    // produced by the release workflow so this can't drift again.
+    // Both are rewritten by scripts/bump-version.sh, which release.yml then
+    // re-validates against the tag. `buildTime` used to be hand-maintained
+    // alongside an automated `version` and had already drifted: 0.7.13.26
+    // shipped claiming a build date seven weeks older than the release.
     public static let version = "0.7.13.26"
     public static let apiVersion = "1.0"
     public static let buildTime = "2026-06-13"

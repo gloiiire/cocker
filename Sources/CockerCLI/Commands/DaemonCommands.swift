@@ -351,12 +351,16 @@ struct DaemonResignCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         guard FileManager.default.isExecutableFile(atPath: cockerdPath) else {
-            fputs("Error: cockerd not found at \(cockerdPath)\n", stderr)
+            UX.Failure.emit(headline: "cockerd not found",
+                            reason: cockerdPath,
+                            hint: "reinstall with `brew reinstall cocker`")
             fputs("Pass --cockerd <path> if you installed it elsewhere.\n", stderr)
             throw ExitCode.failure
         }
         guard FileManager.default.fileExists(atPath: entitlementsPath) else {
-            fputs("Error: entitlements not found at \(entitlementsPath)\n", stderr)
+            UX.Failure.emit(headline: "Entitlements file not found",
+                            reason: entitlementsPath,
+                            hint: "run this from a source checkout, or reinstall cocker")
             throw ExitCode.failure
         }
 
@@ -367,7 +371,9 @@ struct DaemonResignCommand: AsyncParsableCommand {
         } else if let detected = try Self.detectIdentity() {
             cert = detected
         } else {
-            fputs("Error: no \"Apple Development\" or \"Developer ID Application\" cert in your keychain.\n", stderr)
+            UX.Failure.emit(headline: "No signing certificate in your keychain",
+                            reason: "need an \"Apple Development\" or \"Developer ID Application\" identity",
+                            hint: "create one in Xcode → Settings → Accounts → Manage Certificates")
             fputs("Generate one in Xcode → Settings → Accounts → Manage Certificates → +.\n", stderr)
             throw ExitCode.failure
         }
@@ -480,7 +486,9 @@ struct DaemonSetupCommand: AsyncParsableCommand {
         let prefix = sharePrefix ?? Self.detectSharePrefix()
         let srcInitrd = prefix + "/share/cocker/initrd.img"
         guard fm.fileExists(atPath: srcInitrd) else {
-            fputs("Error: initrd not found at \(srcInitrd)\n", stderr)
+            UX.Failure.emit(headline: "initrd not found",
+                            reason: "\(srcInitrd)",
+                            hint: "reinstall cocker, or build it with scripts/build-initrd.sh")
             fputs("Pass --share-prefix <prefix> if cocker was installed elsewhere.\n", stderr)
             throw ExitCode.failure
         }
@@ -784,7 +792,9 @@ struct DaemonClearLeasesCommand: AsyncParsableCommand {
         try proc.run()
         proc.waitUntilExit()
         guard proc.terminationStatus == 0 else {
-            fputs("Error: sudo failed (exit \(proc.terminationStatus))\n", stderr)
+            UX.Failure.emit(headline: "sudo failed",
+                            reason: "exit \(proc.terminationStatus)",
+                            hint: "this step needs administrator rights")
             throw ExitCode.failure
         }
         print("Leases cleared. New containers will get fresh IPs.")
@@ -861,7 +871,8 @@ struct DaemonHelperInstallCommand: AsyncParsableCommand {
         install.waitUntilExit()
         try? FileManager.default.removeItem(at: tmp)
         guard install.terminationStatus == 0 else {
-            fputs("Error: install failed (exit \(install.terminationStatus))\n", stderr)
+            UX.Failure.emit(headline: "Install failed",
+                            reason: "exit \(install.terminationStatus)")
             throw ExitCode.failure
         }
         print("✓ Helper installed and running.")
