@@ -61,6 +61,10 @@ public enum CockerError: Error, CustomStringConvertible {
     case permissionDenied(String)
     case diskFull
     case unsupportedPlatform(String)
+    /// A command cocker ships but does not implement. Reported instead of a
+    /// fabricated success, so a script can tell the difference. The payload
+    /// is the command name.
+    case notImplemented(String)
     case internalError(String)
     /// state.json was written by a NEWER cockerd (schemaVersion > what this
     /// binary understands). Loading it would violate invariants we don't
@@ -112,6 +116,9 @@ public enum CockerError: Error, CustomStringConvertible {
         case .permissionDenied(let op): return "Permission denied: \(op)"
         case .diskFull: return "No space left on device"
         case .unsupportedPlatform(let p): return "Unsupported platform: \(p)"
+        case .notImplemented(let what):
+            return "\(what) is not implemented — cocker targets a single Mac, "
+                 + "not a cluster. Use `apple/container` or Docker Desktop if you need it." 
         case .internalError(let msg): return "Internal error: \(msg)"
         case .stateSchemaTooNew(let found, let supported):
             return "state.json schemaVersion=\(found) exceeds this cockerd's max (\(supported)). Upgrade cockerd or roll back the file."
@@ -164,7 +171,7 @@ public enum CockerError: Error, CustomStringConvertible {
         case .containerNotFound, .imageNotFound, .networkNotFound, .volumeNotFound,
              .manifestNotFound, .dockerfileNotFound:
             return 127  // no such object
-        case .permissionDenied:
+        case .permissionDenied, .notImplemented:
             return 126  // found but not runnable
         case .daemonNotRunning, .connectionFailed, .responseDecodingFailed,
              .kernelNotFound, .initrdNotFound, .vmStartFailed, .vmStopFailed,
