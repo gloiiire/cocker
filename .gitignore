@@ -45,6 +45,7 @@ DerivedData/
 !docs/UX-CHARTER.md
 !docs/APPLE-FEEDBACK-VSOCK-CALLBACK.md
 !docs/ROADMAP-1.0.md
+!docs/DESIGN-network-without-vmnet.md
 # A 1.0 needs a changelog a user can read to decide whether to upgrade, and a
 # security file — cocker installs a root LaunchDaemon and stores registry
 # passwords in cleartext, and neither is discoverable from the README.
