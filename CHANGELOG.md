@@ -7,6 +7,29 @@ Notable changes per release. Versions are `MAJOR.MINOR.PATCH.BUILD` — see
 Entries describe what changed for *you*, not what moved in the code. A user
 should be able to read one line and know whether it affects them.
 
+## 1.0.1.0 — 2026-08-02
+
+### Fixed
+
+- **`cocker daemon helper-install` said the helper was running without ever
+  checking.** It printed "✓ Helper installed and running." whenever its shell
+  exited 0 — and `launchctl load` exits 0 even when it loads nothing. Writing
+  the config file is not the same as having a running service, and the command
+  couldn't tell the difference. Seen in the field: a helper installed in June,
+  never present in `launchctl list`, its log 0 bytes, and a user who had been
+  told it was fine.
+
+  This is the root of the lease-pool failures fixed in 1.0.0.0 rather than
+  another instance of them: every one of those checks trusted this claim, so
+  a saturated pool produced no diagnostics at all and containers failed to get
+  an IP in silence.
+
+  The command now proves it: it asks the helper for a clear and confirms the
+  trigger file gets consumed, which only a live helper does. It reports the
+  resulting lease count, or tells you the helper is installed but not
+  responding and how to inspect it. As a side effect it actually clears the
+  pool — which is why you ran it.
+
 ## 1.0.0.0 — 2026-08-02
 
 The 1.0 correctness pass. Almost everything here is a case where cocker either
