@@ -105,6 +105,8 @@ signing rules, its PID tracking and its SIGTERM lifecycle.
 
 ## Step 0 — the one-day spike, before anything else
 
+> Tracked as **#392**.
+
 **Hypothesis:** the pool fills because we *ask* for an address. What if we
 don't?
 
@@ -221,22 +223,22 @@ system service removed.
 
 Independent of the network work, each worth its own fix:
 
-1. **Duplicate fabric addresses after a daemon restart.**
+1. **#393 — duplicate fabric addresses after a daemon restart.**
    `NetworkManager.allocatedCockerIPs` / `cockerHostCounter` are in-memory
    and `init(store:)` never rehydrates them from existing containers, so a
    restarted daemon allocates from `10.42.0.2` again while surviving
    containers keep theirs. Read from code, not reproduced.
-2. **`cocker network create --subnet` is inert.** The subnet is stored and
-   never used: no address is drawn from it, no isolation is applied, and
-   DNS resolves globally across all networks
+2. **#394 — `cocker network create --subnet` is inert.** The subnet is
+   stored and never used: no address is drawn from it, no isolation is
+   applied, and DNS resolves globally across all networks
    (`DNSServer.swift:142`, `:329`). `configurePortForwarding`
    (`NetworkManager.swift:222-229`) is a `print()` with no caller.
-3. **`container.ipv6` is fabricated.** Allocated, stored and reported by
-   `inspect`; nothing ever configures it in a guest.
-4. **`/etc/hosts` gets the placeholder address** (172.17.0.x) because it
-   is written before boot, when the real address isn't known. Mitigated:
-   only written when absent.
-5. **`dhcp_min 2.c`** is a stray duplicate in the tree.
+3. **#395 — `container.ipv6` is fabricated.** Allocated, stored and
+   reported by `inspect`; nothing ever configures it in a guest.
+4. **#396 — `/etc/hosts` gets the placeholder address** (172.17.0.x)
+   because it is written before boot, when the real address isn't known.
+   Mitigated: only written when absent.
+5. **#397 — `dhcp_min 2.c`** is a stray duplicate in the tree.
 
 (2) and (3) are the same category as the fabricated `node ls` output fixed
 for 1.0: cocker reporting something that does not exist.
