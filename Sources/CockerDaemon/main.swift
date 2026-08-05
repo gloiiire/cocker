@@ -326,8 +326,17 @@ func main() async {
     // DNS over vsock — the in-VM proxy connects here for resolution because
     // macOS App Sandbox blocks UDP/TCP DNS data over vmnet to user-signed
     // daemons. vsock bypasses vmnet.
-    let dnsVsockListener = DNSVsockListener(dnsServer: dns)
+    // The listener needs to ask VMRuntime who owns a given vsock device, so
+    // DNS can be scoped to the querier's network. Weak so the closure does
+    // not keep the runtime alive.
+    let runtime = engine.vmRuntime
+    let dnsVsockListener = DNSVsockListener(dnsServer: dns) { [weak runtime] device in
+        runtime?.containerOwning(vsockDevice: device)
+    }
     engine.vmRuntime.dnsVsockListener = dnsVsockListener.makeListener()
+    // VZVirtioSocketListener holds its delegate weakly, so the delegate has
+    // to be retained here or DNS silently stops working once it deallocs.
+    engine.vmRuntime.dnsVsockDelegate = dnsVsockListener
 
     // Start all servers
     let server = DaemonServer(socketPath: socketPath, engine: engine)

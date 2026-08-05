@@ -9,7 +9,12 @@ protocol L2Switching: Sendable {
     /// Register a new switch port for `containerID` with `staticMAC` already
     /// learned. Returns the VM-side FileHandle of a socketpair (the caller
     /// hands this to VZFileHandleNetworkDeviceAttachment).
-    func addPort(containerID: String, staticMAC: String) async -> FileHandle?
+    ///
+    /// `network` is what the port is allowed to talk to. Frames are only
+    /// delivered between ports on the same network — without it, every
+    /// container on the host shares one flat segment no matter how many
+    /// networks the user created.
+    func addPort(containerID: String, staticMAC: String, network: String) async -> FileHandle?
 
     /// Tear down the port and remove its MAC from the learning table. Closes
     /// the switch-side fd so the read loop exits cleanly.
