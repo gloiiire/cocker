@@ -7,6 +7,26 @@ Notable changes per release. Versions are `MAJOR.MINOR.PATCH.BUILD` — see
 Entries describe what changed for *you*, not what moved in the code. A user
 should be able to read one line and know whether it affects them.
 
+## 1.1.0.1 — 2026-08-05
+
+### Fixed
+
+- **`cocker daemon restart` could leave two daemons running on the same
+  data directory.** Both printed "Daemon is running", both wrote the same
+  `state.json`, and which one answered a given command was a coin flip —
+  with a real risk of losing containers to concurrent writes.
+
+  It happened whenever cocker was started through `brew services`, which is
+  the documented way: macOS relaunches the daemon within a second of it
+  being stopped, and `restart` then started a second one because the check
+  guarding against that read a process id which is briefly stale during any
+  restart.
+
+  Starting a second daemon on a directory another one owns is now refused
+  outright, and says which process holds it. `cocker daemon restart` also
+  routes through `brew services` when that's what manages the daemon,
+  instead of working against it.
+
 ## 1.1.0.0 — 2026-08-05
 
 Networking. Three things cocker claimed and didn't do, and one ceiling it
