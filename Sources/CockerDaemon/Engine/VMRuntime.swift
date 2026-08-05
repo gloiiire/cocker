@@ -682,32 +682,20 @@ final class VMRuntime: NSObject {
     /// but it does not coordinate with other allocators. A shipping version
     /// needs a real one that reads the lease file and tracks its own
     /// assignments.
-    static func staticNATIP(for container: Container) -> String? {
-        guard ProcessInfo.processInfo.environment["COCKER_STATIC_ETH0"] == "1" else {
-            return nil
-        }
-        // Reuse the bridge cockerd already discovers for DNS, so we land in
-        // whichever /24 vmnet actually chose on this host.
-        return staticNATIP(containerID: container.id, gateway: DNSServer.hostIP())
-    }
-
-    /// Pure half of the above, so it can be tested without an environment
-    /// variable or a live vmnet bridge. `nonisolated` because it touches no
-    /// VM state — `VMRuntime` is `@MainActor` for Virtualization.framework's
-    /// queue affinity, which has nothing to do with deriving a string.
-    nonisolated static func staticNATIP(containerID: String, gateway: String) -> String? {
-        let octets = gateway.split(separator: ".")
-        guard octets.count == 4, octets.allSatisfy({ UInt8($0) != nil }) else { return nil }
-        // FNV-1a rather than `hashValue`: Swift seeds the latter per process,
-        // so a container would land on a different address after every daemon
-        // restart. That exact mistake already shipped once here, in IPv6
-        // allocation.
-        var hash: UInt32 = 2_166_136_261
-        for byte in containerID.utf8 {
-            hash = (hash ^ UInt32(byte)) &* 16_777_619
-        }
-        let host = 180 + Int(hash % 65)   // .180 … .244
-        return "\(octets[0]).\(octets[1]).\(octets[2]).\(host)"
+    /// Whatever `NetworkManager` allocated and `ContainerEngine` persisted
+    /// on the container.
+    ///
+    /// This used to derive the address right here, hashing the container id
+    /// into a 65-wide range. That was a spike, and it did its job — proving
+    /// vmnet accepts a self-assigned address — but it is not an allocator.
+    /// It consults nothing, so two containers whose ids collide land on the
+    /// same address (better than even odds past ten concurrent containers,
+    /// by the birthday bound), and it cannot see leases vmnet handed to
+    /// other VMs on the host. Allocation now happens in `NetworkManager`
+    /// against the set of addresses actually in use, and is persisted on the
+    /// container so it survives a daemon restart.
+    nonisolated static func staticNATIP(for container: Container) -> String? {
+        container.natIP
     }
 
     /// Resolve the host directory holding qemu-user-static binaries the

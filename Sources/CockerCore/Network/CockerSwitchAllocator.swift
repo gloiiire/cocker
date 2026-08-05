@@ -45,8 +45,25 @@ public enum CockerSwitchAllocator {
         return String(format: "02:42:0a:2a:%02x:%02x", octets[2], octets[3])
     }
 
+    /// Inverse of `ip(forHost:)` : "10.42.HI.LO" → the 16-bit host id, or
+    /// nil for anything that isn't an address on this subnet. Lets the
+    /// caller rebuild "which ids are taken" from persisted containers.
+    public static func host(forIP ip: String) -> UInt16? {
+        guard let o = AddressPool.octets(of: ip), o[0] == 10, o[1] == 42 else { return nil }
+        return (UInt16(o[2]) << 8) | UInt16(o[3])
+    }
+
     /// Advance the cursor : returns the host id we should give out and the
     /// new cursor to remember. Wraps to `firstHost` once we pass `lastHost`.
+    ///
+    /// - Warning: superseded by lowest-free allocation over the set of
+    ///   addresses actually in use (`AddressPool.lowestFree`). A cursor only
+    ///   holds while the process owning it lives: after a `cockerd` restart
+    ///   it resets to `firstHost` while surviving containers still hold
+    ///   their addresses, and it hands out duplicates. Kept because it is
+    ///   still covered by tests describing the old behaviour; do not use it
+    ///   for new allocation paths.
+    @available(*, deprecated, message: "Use AddressPool.lowestFree over the in-use set")
     public static func nextHost(from cursor: UInt16) -> (host: UInt16, nextCursor: UInt16) {
         let h = cursor
         let next: UInt16 = (cursor < lastHost) ? cursor + 1 : firstHost

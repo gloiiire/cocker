@@ -10,6 +10,9 @@ actor NetworkManager {
     private var allocatedIPs: [String: String] = [:]    // containerID -> IPv4
     private var allocatedIPv6s: [String: String] = [:]  // containerID -> IPv6
     private var allocatedCockerIPs: [String: String] = [:]  // containerID -> 10.42.x.x
+    private var allocatedNATIPs: [String: String] = [:]     // containerID -> 192.168.x.y
+    // Kept only so the legacy `nextHost` tests keep compiling; allocation
+    // no longer uses a cursor. See `cockerIPsInUse()`.
     private var cockerHostCounter: UInt16 = CockerSwitchAllocator.firstHost
 
     // Préfixe IPv6 pour les réseaux cocker : fd00:c0c4::/48
@@ -162,15 +165,89 @@ actor NetworkManager {
     //   MAC = 02:42:0A:2A:HI:LO
     // (locally-administered, similar to Docker's 02:42:* range)
 
-    func allocateCockerIPAndMAC(for containerID: String) -> (ip: String, mac: String) {
+    /// Addresses on the fabric that are spoken for, read from persisted
+    /// containers rather than from memory.
+    ///
+    /// The in-memory map this replaced was only correct while the daemon
+    /// stayed up: after a restart it was empty, allocation resumed from
+    /// `firstHost`, and containers that had survived the restart still held
+    /// those addresses. Two containers, one address, on a switch that
+    /// forwards by learned MAC — traffic silently reaching the wrong one.
+    private func cockerIPsInUse() async -> Set<UInt16> {
+        var used = Set<UInt16>()
+        for c in await store.allContainers(includeAll: true) {
+            if let ip = c.cockerIP, let host = CockerSwitchAllocator.host(forIP: ip) {
+                used.insert(host)
+            }
+        }
+        // In-flight allocations for containers not yet written to the store.
+        for ip in allocatedCockerIPs.values {
+            if let host = CockerSwitchAllocator.host(forIP: ip) { used.insert(host) }
+        }
+        return used
+    }
+
+    func allocateCockerIPAndMAC(for containerID: String) async throws -> (ip: String, mac: String) {
         if let ip = allocatedCockerIPs[containerID] {
             return (ip, CockerSwitchAllocator.mac(forIP: ip))
         }
-        let (host, next) = CockerSwitchAllocator.nextHost(from: cockerHostCounter)
-        cockerHostCounter = next
-        let ip = CockerSwitchAllocator.ip(forHost: host)
+        let used = await cockerIPsInUse()
+        guard let host = AddressPool.lowestFree(first: UInt32(CockerSwitchAllocator.firstHost),
+                                                last: UInt32(CockerSwitchAllocator.lastHost),
+                                                inUse: Set(used.map { UInt32($0) })) else {
+            throw CockerError.internalError(
+                "the container network (\(CockerSwitchAllocator.subnet)) has no free "
+                + "addresses left — \(used.count) in use. Remove some containers "
+                + "(`cocker rm`) or prune with `cocker container prune`.")
+        }
+        let ip = CockerSwitchAllocator.ip(forHost: UInt16(host))
         allocatedCockerIPs[containerID] = ip
         return (ip, CockerSwitchAllocator.mac(forIP: ip))
+    }
+
+    /// Address for `eth0` when cocker assigns it rather than asking vmnet's
+    /// DHCP server. See `docs/DESIGN-network-without-vmnet.md`.
+    ///
+    /// Two populations share the subnet: what vmnet has leased to anything
+    /// else on this host, and what cocker has given its own containers. Both
+    /// are consulted, because a duplicate here is silent — traffic simply
+    /// arrives at the wrong container.
+    func allocateNATIP(for containerID: String, gateway: String) async throws -> String {
+        if let ip = allocatedNATIPs[containerID] { return ip }
+        guard let prefix = NATAddressAllocator.subnetPrefix(ofGateway: gateway) else {
+            throw CockerError.internalError(
+                "cannot derive the vmnet subnet from gateway '\(gateway)'")
+        }
+
+        var assigned = Set(allocatedNATIPs.values)
+        for c in await store.allContainers(includeAll: true) {
+            if let ip = c.natIP { assigned.insert(ip) }
+        }
+
+        guard let ip = NATAddressAllocator.allocate(
+            prefix: prefix,
+            leased: LeasePoolMonitor.activeLeasedIPs(),
+            assigned: assigned) else {
+            throw CockerError.internalError(
+                "no free address left in \(prefix).0/24 for eth0 — the "
+                + "\(NATAddressAllocator.capacity)-address range is full between "
+                + "cocker's containers and other VMs on this host. Remove some "
+                + "containers, or clear stale DHCP leases with "
+                + "`cocker daemon clear-leases`.")
+        }
+        allocatedNATIPs[containerID] = ip
+        return ip
+    }
+
+    /// Drop a container's reservations. The persisted container is the
+    /// durable record, so this only clears the in-flight cache — but
+    /// without it a long-lived daemon leaks entries for containers that no
+    /// longer exist, and the pool shrinks for no reason.
+    func releaseAddresses(for containerID: String) {
+        allocatedCockerIPs.removeValue(forKey: containerID)
+        allocatedNATIPs.removeValue(forKey: containerID)
+        allocatedIPs.removeValue(forKey: containerID)
+        allocatedIPv6s.removeValue(forKey: containerID)
     }
 
     static let cockerSwitchSubnet = CockerSwitchAllocator.subnet
