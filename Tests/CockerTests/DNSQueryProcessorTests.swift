@@ -33,7 +33,7 @@ struct DNSQueryProcessorTests {
         return d
     }
 
-    private func container(name: String, cockerIP: String? = nil, ipv6: String? = nil) -> Container {
+    private func container(name: String, cockerIP: String? = nil) -> Container {
         var c = Container(
             id: "abc123def456",
             name: name,
@@ -42,7 +42,6 @@ struct DNSQueryProcessorTests {
             hostname: name
         )
         c.cockerIP = cockerIP
-        c.ipv6 = ipv6
         return c
     }
 
@@ -92,36 +91,93 @@ struct DNSQueryProcessorTests {
 
     // MARK: - AAAA records
 
-    @Test func resolvesAAAAToContainerIPv6() throws {
+    /// The fabricated answer, gone. cocker used to reply to any AAAA query
+    /// for a container name with `fd00:c0c4::<hash-of-id>` — an address it
+    /// invented, stored, and served, configured on no interface in any
+    /// guest. Containers have no IPv6, so these fall through like any other
+    /// name we cannot answer.
+    /// The fabricated answer, gone — and replaced by NODATA rather than by
+    /// silence. cocker used to reply to any AAAA query for a container name
+    /// with `fd00:c0c4::<hash-of-id>`, an address configured on no interface
+    /// in any guest.
+    ///
+    /// Answering nothing at all (falling through to upstream, hence NXDOMAIN
+    /// for a name we own) was tried and is worse: musl resolves A and AAAA in
+    /// parallel and fails the whole lookup when either returns NXDOMAIN, so
+    /// every Alpine container lost DNS by name. Measured as `wget: bad
+    /// address 'db:8080'`, e2e 03 and 05 red.
+    @Test func aaaaForAContainerIsAuthoritativeNodata() throws {
         let q = buildQuery(name: "srv-a", qtype: 28)  // AAAA
         let r = DNSQueryProcessor.process(
             query: q,
-            containers: [container(name: "srv-a", ipv6: "fd00:c0c4::5")]
+            containers: [container(name: "srv-a", cockerIP: "10.42.0.2")]
         )
         let result = try #require(r)
-        if case .authoritativeAAAA(_, let ipv6) = result.kind {
-            #expect(ipv6 == "fd00:c0c4::5")
-        } else {
-            Issue.record("expected authoritativeAAAA, got \(result.kind)")
+        if case .authoritativeAAAA = result.kind {
+            Issue.record("the fabricated IPv6 answer is back")
+        }
+        guard case .empty = result.kind else {
+            Issue.record("expected authoritative NODATA, got \(result.kind); NXDOMAIN here breaks musl's parallel A/AAAA lookup")
+            return
         }
     }
 
-    /// Before 0.5.13.16 we answered AAAA for a name-matching-container
-    /// with no IPv6 as "authoritative empty", which breaks happy-eyeballs
-    /// (RFC 8305) for tools like uv / pip / curl when the container's
-    /// hostname collides with a real public CDN (files.pythonhosted.org
-    /// hit this). The new contract : without an IPv6 we DO NOT short-
-    /// circuit ; the query falls through to upstream forwarding. When no
-    /// upstream forwarder is wired up (this test's case), `process`
-    /// returns `nil` so the caller can decide what to do.
-    @Test func aaaaWithoutIPv6FallsThroughToUpstream() throws {
-        let q = buildQuery(name: "srv-a", qtype: 28)
+    /// The same name must still resolve over IPv4 — that is the answer musl
+    /// ends up using.
+    @Test func theSameNameStillResolvesOverIPv4() throws {
+        let q = buildQuery(name: "srv-a", qtype: 1)  // A
         let r = DNSQueryProcessor.process(
             query: q,
-            containers: [container(name: "srv-a", cockerIP: "10.42.0.2")]  // no ipv6
+            containers: [container(name: "srv-a", cockerIP: "10.42.0.2")]
         )
         let result = try #require(r)
-        if case .nxdomain = result.kind { /* ok — no upstream + no v6 = NXDOMAIN */ }
+        if case .authoritativeA(_, let ip) = result.kind {
+            #expect(ip == "10.42.0.2")
+        } else {
+            Issue.record("expected authoritativeA, got \(result.kind)")
+        }
+    }
+
+    /// The other half of the rule: a name we do NOT own must keep going
+    /// upstream. Answering NODATA for those is the 0.5.13.16 regression that
+    /// broke PyPI installs.
+    @Test func aaaaForAForeignNameIsNotAnsweredAuthoritatively() throws {
+        let q = buildQuery(name: "files.pythonhosted.org", qtype: 28)
+        let r = DNSQueryProcessor.process(
+            query: q,
+            containers: [container(name: "srv-a", cockerIP: "10.42.0.2")]
+        )
+        let result = try #require(r)
+        if case .empty = result.kind {
+            Issue.record("authoritative NODATA leaked to a foreign name")
+        }
+    }
+
+    /// The 0.5.13.16 rule, narrowed rather than reverted.
+    ///
+    /// That fix stopped answering authoritative-empty for AAAA because
+    /// happy-eyeballs clients (RFC 8305 §3) read NOERROR-with-no-answers as
+    /// "no such host" and would not retry over IPv4 — which broke PyPI when a
+    /// container's name collided with the first label of a real CDN host.
+    /// It applied that to every AAAA query, container or not.
+    ///
+    /// Blanket fall-through turned out to be wrong for names we DO own: musl
+    /// resolves A and AAAA in parallel and fails the whole lookup when either
+    /// comes back NXDOMAIN, so Alpine containers lost DNS by name entirely
+    /// (`wget: bad address 'db:8080'`, e2e 03 and 05 red).
+    ///
+    /// So the rule is now split by ownership, and both halves are pinned:
+    /// ours → NODATA (above), foreign → upstream (here).
+    @Test func aaaaForAForeignNameFallsThroughToUpstream() throws {
+        let q = buildQuery(name: "cdn.example.org", qtype: 28)
+        let r = DNSQueryProcessor.process(
+            query: q,
+            containers: [container(name: "srv-a", cockerIP: "10.42.0.2")]
+        )
+        let result = try #require(r)
+        // No upstream forwarder wired up here, so falling through lands on
+        // NXDOMAIN — the point is that it is not answered authoritatively.
+        if case .nxdomain = result.kind { /* expected */ }
         else { Issue.record("expected nxdomain, got \(result.kind)") }
     }
 

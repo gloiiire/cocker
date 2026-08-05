@@ -36,7 +36,6 @@ public struct Container: Codable, Sendable, Identifiable {
     public var startedAt: Date?
     public var finishedAt: Date?
     public var exitCode: Int32?
-    public var ipv6: String?
     public var hostname: String
     public var restartPolicy: RestartPolicy
     public var healthStatus: HealthStatus
@@ -113,7 +112,6 @@ public struct Container: Codable, Sendable, Identifiable {
         self.networkMode = networkMode
         self.networkName = networkName
         self.ip = ip
-        self.ipv6 = nil
         self.cpuCount = cpuCount
         self.restartPolicy = restartPolicy
         self.memoryMB = memoryMB
@@ -168,7 +166,6 @@ public struct Container: Codable, Sendable, Identifiable {
         self.startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt)
         self.finishedAt = try c.decodeIfPresent(Date.self, forKey: .finishedAt)
         self.exitCode = try c.decodeIfPresent(Int32.self, forKey: .exitCode)
-        self.ipv6 = try c.decodeIfPresent(String.self, forKey: .ipv6)
         self.hostname = try c.decodeIfPresent(String.self, forKey: .hostname)
             ?? String(self.id.prefix(12))
         self.restartPolicy = try c.decodeIfPresent(RestartPolicy.self, forKey: .restartPolicy) ?? .no

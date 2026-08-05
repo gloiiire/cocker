@@ -732,7 +732,6 @@ public struct InspectResponse: Codable, Sendable {
     public let networkMode: NetworkMode
     public let networkName: String?
     public let ip: String?
-    public let ipv6: String?
     public let hostname: String
     public let restartPolicy: RestartPolicy
     public let restartCount: Int
@@ -758,7 +757,6 @@ public struct InspectResponse: Codable, Sendable {
         self.networkMode = container.networkMode
         self.networkName = container.networkName
         self.ip = container.ip
-        self.ipv6 = container.ipv6
         self.hostname = container.hostname
         self.restartPolicy = container.restartPolicy
         self.restartCount = container.restartCount

@@ -10,8 +10,7 @@ struct DNSNameResolverATests {
         hostname: String? = nil,
         labels: [String: String] = [:],
         ip: String? = nil,
-        cockerIP: String? = nil,
-        ipv6: String? = nil
+        cockerIP: String? = nil
     ) -> Container {
         var c = Container(
             id: id, name: name,
@@ -21,7 +20,6 @@ struct DNSNameResolverATests {
         )
         c.ip = ip
         c.cockerIP = cockerIP
-        c.ipv6 = ipv6
         return c
     }
 
@@ -108,33 +106,19 @@ struct DNSNameResolverATests {
     }
 }
 
-@Suite("DNS name resolver — AAAA records")
+/// AAAA resolution was removed rather than fixed. It answered every IPv6
+/// query for a container name with `fd00:c0c4::<hash>`, an address
+/// configured on no interface anywhere — cocker invented it, stored it and
+/// served it. Containers have no IPv6, so those queries now fall through to
+/// upstream forwarding; see the note in `DNSNameResolver` for why replying
+/// authoritative-NODATA would be a regression rather than an improvement.
+@Suite("DNS name resolver — no AAAA")
 struct DNSNameResolverAAAATests {
-    @Test func resolvesExactNameToIPv6() {
+    /// The A path must be untouched by the AAAA removal.
+    @Test func ipv4ResolutionIsUnaffected() {
         var c = Container(id: "x", name: "srv", image: "a", command: ["sh"])
-        c.ipv6 = "fd00::1"
-        #expect(DNSNameResolver.resolveAAAA(name: "srv", in: [c]) == "fd00::1")
-    }
-
-    @Test func skipsContainerWithoutIPv6() {
-        let c = Container(id: "x", name: "srv", image: "a", command: ["sh"])
-        #expect(DNSNameResolver.resolveAAAA(name: "srv", in: [c]) == nil)
-    }
-
-    @Test func resolvesByServiceLabel() {
-        var c = Container(
-            id: "x", name: "compose_db_1",
-            image: "a", command: ["sh"],
-            labels: ["com.cocker.service": "db"]
-        )
-        c.ipv6 = "fd00::2"
-        #expect(DNSNameResolver.resolveAAAA(name: "db", in: [c]) == "fd00::2")
-    }
-
-    @Test func resolvesByShortID() {
-        var c = Container(id: "abc123def456", name: "verbose", image: "a", command: ["sh"])
-        c.ipv6 = "fd00::3"
-        #expect(DNSNameResolver.resolveAAAA(name: "abc123def456", in: [c]) == "fd00::3")
+        c.cockerIP = "10.42.0.9"
+        #expect(DNSNameResolver.resolveA(name: "srv", in: [c]) == "10.42.0.9")
     }
 }
 

@@ -1222,11 +1222,20 @@ final class VMRuntime: NSObject {
 
     private func writeResolvConf(to rootfsPath: URL, container: Container) throws {
         try RootfsBootstrap.writeResolvConf(to: rootfsPath, dnsIP: DNSServer.hostIP())
+        // `cockerIP`, not `ip`. This runs before boot, and at that point
+        // `container.ip` is still the placeholder `NetworkManager` hands out
+        // at create time (172.17.0.x) — the real vmnet address is only
+        // discovered after the guest comes up. So the file was being written
+        // with an address belonging to nothing.
+        //
+        // `cockerIP` is the right value on both counts: it is known before
+        // boot, and it is the address peers actually reach the container on,
+        // which is what a hosts entry is for.
         try RootfsBootstrap.writeHostsIfAbsent(
             to: rootfsPath,
             containerName: container.name,
             hostname: container.hostname,
-            ip: container.ip
+            ip: container.cockerIP
         )
     }
 

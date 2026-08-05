@@ -1544,8 +1544,21 @@ final class DockerAPIServer {
                 Ports: portBindings.mapValues { Optional($0) },
                 SandboxKey: "/var/run/netns/\(c.id)",
                 Networks: [:],
-                IPAddress: c.ip ?? "172.17.0.2",
-                IPPrefixLen: 16, Gateway: "172.17.0.1", MacAddress: ""
+                // Report what the container actually has, not a Docker-shaped
+                // guess. These were `172.17.0.2` / `/16` / `172.17.0.1`,
+                // which describe Docker's default bridge and nothing cocker
+                // ever creates: containers sit on the vmnet /24 and on the
+                // 10.42.0.0/16 fabric. A client reading Gateway and dialling
+                // it got an address no one answers on.
+                //
+                // Prefer the fabric address, same as DNS does — it is the one
+                // reachable from other containers. Empty rather than invented
+                // when there is none, which is what Docker reports for a
+                // container with no network.
+                IPAddress: c.cockerIP ?? c.ip ?? "",
+                IPPrefixLen: c.cockerIP != nil ? 16 : 24,
+                Gateway: c.cockerIP != nil ? NetworkManager.cockerSwitchGateway : "",
+                MacAddress: c.cockerMAC ?? ""
             ),
             Mounts: mounts,
             Config: DockerContainerConfig(
