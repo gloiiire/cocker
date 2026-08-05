@@ -659,8 +659,55 @@ final class VMRuntime: NSObject {
             volumeSpecs: volumeSpecs,
             rootDevice: overlayDev,
             buildOverlay: overlayDev != nil,
-            outboxTag: outboxTag
+            outboxTag: outboxTag,
+            staticNATIP: Self.staticNATIP(for: container)
         ))
+    }
+
+    /// Address to configure on `eth0` instead of requesting a DHCP lease,
+    /// or nil to keep the historical DHCP path.
+    ///
+    /// **Experimental, opt-in via `COCKER_STATIC_ETH0=1`.** See
+    /// `docs/DESIGN-network-without-vmnet.md` — this is the cheap half of
+    /// that plan: vmnet's lease pool is host-wide, capped at ~256, never
+    /// reclaimed and `root:wheel`, so a machine that has started 256
+    /// containers stops working until somebody with root truncates a file.
+    /// Not asking for a lease sidesteps all of it.
+    ///
+    /// The address is derived from the container id inside the /24 vmnet
+    /// already owns, in `.180`–`.244` — a range bootpd allocates from last,
+    /// which keeps a self-assigned address clear of leases handed out to
+    /// anything else on the host. That is deliberately a spike-grade
+    /// allocator: it is deterministic and collision-free for a given id,
+    /// but it does not coordinate with other allocators. A shipping version
+    /// needs a real one that reads the lease file and tracks its own
+    /// assignments.
+    static func staticNATIP(for container: Container) -> String? {
+        guard ProcessInfo.processInfo.environment["COCKER_STATIC_ETH0"] == "1" else {
+            return nil
+        }
+        // Reuse the bridge cockerd already discovers for DNS, so we land in
+        // whichever /24 vmnet actually chose on this host.
+        return staticNATIP(containerID: container.id, gateway: DNSServer.hostIP())
+    }
+
+    /// Pure half of the above, so it can be tested without an environment
+    /// variable or a live vmnet bridge. `nonisolated` because it touches no
+    /// VM state — `VMRuntime` is `@MainActor` for Virtualization.framework's
+    /// queue affinity, which has nothing to do with deriving a string.
+    nonisolated static func staticNATIP(containerID: String, gateway: String) -> String? {
+        let octets = gateway.split(separator: ".")
+        guard octets.count == 4, octets.allSatisfy({ UInt8($0) != nil }) else { return nil }
+        // FNV-1a rather than `hashValue`: Swift seeds the latter per process,
+        // so a container would land on a different address after every daemon
+        // restart. That exact mistake already shipped once here, in IPv6
+        // allocation.
+        var hash: UInt32 = 2_166_136_261
+        for byte in containerID.utf8 {
+            hash = (hash ^ UInt32(byte)) &* 16_777_619
+        }
+        let host = 180 + Int(hash % 65)   // .180 … .244
+        return "\(octets[0]).\(octets[1]).\(octets[2]).\(host)"
     }
 
     /// Resolve the host directory holding qemu-user-static binaries the

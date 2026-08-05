@@ -502,7 +502,20 @@ jobs:
           echo "COCKER_CI_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "COCKER_HOST=unix://$ROOT/cocker.sock" >> "$GITHUB_ENV"
           echo "COCKER_DNS_PORT=5399" >> "$GITHUB_ENV"
-          nohup env COCKER_DNS_PORT=5399 \
+          # Static eth0 instead of a DHCP lease.
+          #
+          # The lease pool is host-wide, capped at ~256, never reclaimed and
+          # root-owned. One e2e run costs ~25 leases, so from an empty pool
+          # this job could manage two or three passes before every container
+          # on the machine stopped getting an address — and only a human with
+          # root could unblock it. That is exactly what happened on
+          # 2026-08-05, at 317/256.
+          #
+          # A self-hosted runner is somebody's actual Mac. CI must not be able
+          # to render it unusable, and must not depend on someone noticing and
+          # running sudo. Not asking for a lease removes both.
+          echo "COCKER_STATIC_ETH0=1" >> "$GITHUB_ENV"
+          nohup env COCKER_DNS_PORT=5399 COCKER_STATIC_ETH0=1 \
             ./.build/release/cockerd --root "$ROOT" --socket "$ROOT/cocker.sock" \
             > "$RUNNER_TEMP/cockerd.log" 2>&1 &
           for _ in $(seq 1 30); do

@@ -1560,7 +1560,16 @@ final class ContainerEngine {
     /// shims so existing call sites (and tests) don't need to change.
     /// New code should call `LeasePoolMonitor` directly.
 
+    /// True when containers configure `eth0` themselves instead of asking
+    /// vmnet's bootpd for a lease — in which case the host lease pool is
+    /// irrelevant and must not gate anything. See
+    /// `docs/DESIGN-network-without-vmnet.md`.
+    static var staticNATEnabled: Bool {
+        ProcessInfo.processInfo.environment["COCKER_STATIC_ETH0"] == "1"
+    }
+
     static func maybeTriggerLeasePoolClear() {
+        guard !staticNATEnabled else { return }
         LeasePoolMonitor.maybeTriggerClear()
     }
 
@@ -1573,6 +1582,9 @@ final class ContainerEngine {
     }
 
     static func preflightLeasePoolOrThrow() throws {
+        // Refusing a run because a lease pool is full makes no sense when
+        // the container is not going to ask for a lease.
+        guard !staticNATEnabled else { return }
         try LeasePoolMonitor.preflightOrThrow()
     }
 

@@ -139,7 +139,42 @@ static void report_eth0_ip(void) {
     }
 }
 
-void net_setup_eth0_dhcp(void) {
+/* Configure eth0 from `cocker.eth0_ip` without talking to any DHCP server.
+ *
+ * Gateway and netmask are derived rather than passed: vmnet's bridge always
+ * owns `.1` of the /24 it hands out, so one cmdline parameter carries
+ * everything. Returns 0 when the interface was configured. */
+static int setup_eth0_static(const char *cmdline) {
+    char *ip_str = cmdline_get(cmdline, "eth0_ip");
+    if (!ip_str) return -1;
+
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip_str, &addr) != 1) {
+        info("eth0 static: '%s' is not an IPv4 address, falling back to DHCP", ip_str);
+        free(ip_str);
+        return -1;
+    }
+
+    uint32_t ip      = addr.s_addr;                       /* network order */
+    uint32_t netmask = htonl(0xFFFFFF00);                 /* /24 */
+    uint32_t gateway = (ip & netmask) | htonl(1);         /* x.y.z.1 */
+
+    if (configure_iface(ip, netmask, gateway) != 0) {
+        info("eth0 static: configure_iface failed: %s", strerror(errno));
+        free(ip_str);
+        return -1;
+    }
+
+    struct in_addr gw_addr = { .s_addr = gateway };
+    char gw_str[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &gw_addr, gw_str, sizeof(gw_str));
+    info("eth0 static IP=%s/24 gw=%s (no DHCP lease consumed)", ip_str, gw_str);
+
+    free(ip_str);
+    return 0;
+}
+
+void net_setup_eth0(const char *cmdline) {
     /* The rootfs we boot from is a clonefile of the image's rootfs, so a
      * stale /cocker-ip from a previous build VM or container persists into
      * fresh containers. cockerd polls that file every 100 ms ; if it reads
@@ -154,7 +189,12 @@ void net_setup_eth0_dhcp(void) {
         if (ifup(s, "eth0") != 0) info("ifup eth0: %s", strerror(errno));
         close(s);
     }
-    run_dhcp_client();
+
+    /* Static first : it costs nothing and cannot fail on a saturated pool.
+     * DHCP stays the fallback so an unconfigured host behaves as before. */
+    if (setup_eth0_static(cmdline) != 0) {
+        run_dhcp_client();
+    }
     report_eth0_ip();
 }
 
