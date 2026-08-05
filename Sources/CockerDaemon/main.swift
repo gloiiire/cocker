@@ -205,6 +205,17 @@ func main() async {
     Task {
         let helperPath = "/Library/LaunchDaemons/com.cocker.leases-helper.plist"
         let triggerPath = "/var/run/cocker-clear-leases"
+        // Nothing to watch when containers assign their own eth0 address:
+        // they never ask for a lease, so the pool's depth says nothing about
+        // whether the next `cocker run` will work. Warning about it anyway
+        // would be telling the user to fix something that is not their
+        // problem, which is how warnings get ignored.
+        if ContainerEngine.staticNATEnabled {
+            log.info("vmnet",
+                "eth0 addresses are assigned by cocker (COCKER_STATIC_ETH0=1) — "
+                + "the macOS DHCP lease pool is not used and not monitored")
+            return
+        }
         if !FileManager.default.fileExists(atPath: helperPath) {
             log.info("vmnet",
                 "lease-pool helper not installed — run `cocker daemon helper-install` " +

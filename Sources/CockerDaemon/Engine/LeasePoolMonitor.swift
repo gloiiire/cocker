@@ -143,6 +143,65 @@ public enum LeasePoolMonitor {
         )
     }
 
+    /// IPv4 addresses vmnet has handed out **and whose lease has not
+    /// expired** — i.e. addresses something else on this host may actually
+    /// be using right now.
+    ///
+    /// This is what keeps a self-assigned address off one already given to
+    /// another VM, a second cocker install or `container`. None of them
+    /// announce themselves; the lease file is the only shared record.
+    ///
+    /// The expiry filter is not a refinement, it is the difference between
+    /// working and not. macOS never removes entries from this file, so on
+    /// any machine that has run containers for a while every address in the
+    /// subnet appears "taken" forever. Measured on the machine this was
+    /// written on: 317 entries, **all 317 expired**, 127 of them inside the
+    /// range we allocate from — which made the allocator refuse every
+    /// request. An expired lease is a dead reservation, not a live host.
+    ///
+    /// An unreadable file yields an empty set. That is the safe direction on
+    /// purpose: the allocator also excludes cocker's own persisted addresses
+    /// and stays in the high end of the range bootpd reaches last, so losing
+    /// this input narrows the margin rather than producing a known-bad
+    /// address.
+    ///
+    /// - Parameter now: Unix time to compare expiries against. Injectable so
+    ///   the parser can be tested without depending on the wall clock.
+    public static func activeLeasedIPs(leasesAt: String = leasesPath,
+                                       now: Date = Date()) -> Set<String> {
+        guard let text = try? String(contentsOfFile: leasesAt, encoding: .utf8) else {
+            return []
+        }
+        let nowSeconds = UInt64(max(0, now.timeIntervalSince1970))
+        var out = Set<String>()
+        var currentIP: String?
+        var currentExpiry: UInt64?
+
+        func flush() {
+            defer { currentIP = nil; currentExpiry = nil }
+            guard let ip = currentIP else { return }
+            // No `lease=` at all: treat as live. Better to skip an address we
+            // could have used than to hand out one somebody holds.
+            guard let expiry = currentExpiry else { out.insert(ip); return }
+            if expiry > nowSeconds { out.insert(ip) }
+        }
+
+        for line in text.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed == "}" {
+                flush()
+            } else if trimmed.hasPrefix("ip_address=") {
+                currentIP = String(trimmed.dropFirst("ip_address=".count))
+            } else if trimmed.hasPrefix("lease=") {
+                let raw = trimmed.dropFirst("lease=".count)
+                let hex = raw.hasPrefix("0x") ? String(raw.dropFirst(2)) : String(raw)
+                currentExpiry = UInt64(hex, radix: 16)
+            }
+        }
+        flush()   // tolerate a final entry with no closing brace
+        return out
+    }
+
     /// Look up `mac` in macOS's vmnet bootp lease file. Returns the most
     /// recent IPv4 address handed out to that MAC, or nil if no entry
     /// matches. Used as a fallback when `/cocker-ip` polling times out
