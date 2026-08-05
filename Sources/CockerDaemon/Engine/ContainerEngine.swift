@@ -1575,10 +1575,25 @@ final class ContainerEngine {
 
     /// True when containers configure `eth0` themselves instead of asking
     /// vmnet's bootpd for a lease — in which case the host lease pool is
-    /// irrelevant and must not gate anything. See
-    /// `docs/DESIGN-network-without-vmnet.md`.
+    /// irrelevant and must not gate anything.
+    ///
+    /// **On by default.** macOS's lease pool is host-wide, capped at ~256
+    /// entries, never reclaimed and `root:wheel`, so a machine that has
+    /// started 256 containers stops working until somebody with root
+    /// truncates a file. Leaving DHCP as the default meant shipping that
+    /// ceiling, and shipping a daemon that needs root to recover from it.
+    ///
+    /// Set `COCKER_STATIC_ETH0=0` to go back to DHCP. That path is intact
+    /// and still the fallback inside the guest when no address is supplied —
+    /// worth keeping for a host where something else owns the subnet and
+    /// self-assignment would collide.
+    ///
+    /// See `docs/DESIGN-network-without-vmnet.md` for the measurements.
     static var staticNATEnabled: Bool {
-        ProcessInfo.processInfo.environment["COCKER_STATIC_ETH0"] == "1"
+        switch ProcessInfo.processInfo.environment["COCKER_STATIC_ETH0"]?.lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
     }
 
     static func maybeTriggerLeasePoolClear() {
