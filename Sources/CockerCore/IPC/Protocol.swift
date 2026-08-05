@@ -687,9 +687,9 @@ public enum CockerVersion {
     // re-validates against the tag. `buildTime` used to be hand-maintained
     // alongside an automated `version` and had already drifted: 0.7.13.26
     // shipped claiming a build date seven weeks older than the release.
-    public static let version = "1.0.1.0"
+    public static let version = "1.1.0.0"
     public static let apiVersion = "1.0"
-    public static let buildTime = "2026-08-02"
+    public static let buildTime = "2026-08-05"
     public static let minAPIVersion = "1.0"
 
     /// **A10 — IPC protocol version**. v1 = post-audit shape (the
