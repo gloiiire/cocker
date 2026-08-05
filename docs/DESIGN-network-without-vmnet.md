@@ -137,7 +137,9 @@ answers on a published port. Yes → stop here. No → below.
 ### Result, 2026-08-05 — it works
 
 Run against a pool **already saturated at 317/256**, where every container
-should have failed to boot. Opt-in behind `COCKER_STATIC_ETH0=1`.
+should have failed to boot. Shipped opt-in behind `COCKER_STATIC_ETH0=1`;
+**it has since become the default** (opt out with `COCKER_STATIC_ETH0=0`),
+once the spike allocator was replaced by a real one.
 
 | | |
 |---|---|

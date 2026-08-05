@@ -65,7 +65,9 @@ public struct KernelCommandLineParams: Sendable {
     /// lease sidesteps the whole problem. See
     /// `docs/DESIGN-network-without-vmnet.md`.
     ///
-    /// nil keeps the DHCP path, which is still the default.
+    /// nil keeps the DHCP path. That is no longer the default — `cockerd`
+    /// assigns these addresses unless `COCKER_STATIC_ETH0=0` — but the guest
+    /// still branches on this parameter's presence, so nil must keep working.
     public let staticNATIP: String?
 
     public init(container: Container,

@@ -682,24 +682,6 @@ final class VMRuntime: NSObject {
         ))
     }
 
-    /// Address to configure on `eth0` instead of requesting a DHCP lease,
-    /// or nil to keep the historical DHCP path.
-    ///
-    /// **Experimental, opt-in via `COCKER_STATIC_ETH0=1`.** See
-    /// `docs/DESIGN-network-without-vmnet.md` — this is the cheap half of
-    /// that plan: vmnet's lease pool is host-wide, capped at ~256, never
-    /// reclaimed and `root:wheel`, so a machine that has started 256
-    /// containers stops working until somebody with root truncates a file.
-    /// Not asking for a lease sidesteps all of it.
-    ///
-    /// The address is derived from the container id inside the /24 vmnet
-    /// already owns, in `.180`–`.244` — a range bootpd allocates from last,
-    /// which keeps a self-assigned address clear of leases handed out to
-    /// anything else on the host. That is deliberately a spike-grade
-    /// allocator: it is deterministic and collision-free for a given id,
-    /// but it does not coordinate with other allocators. A shipping version
-    /// needs a real one that reads the lease file and tracks its own
-    /// assignments.
     /// Whatever `NetworkManager` allocated and `ContainerEngine` persisted
     /// on the container.
     ///

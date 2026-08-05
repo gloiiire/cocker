@@ -66,9 +66,10 @@ struct StaticNATAddressTests {
         #expect(line.contains("cocker.eth0_ip=192.168.64.200"))
     }
 
-    /// DHCP stays the default. An unconfigured host must behave exactly as
-    /// before, which means emitting nothing — the guest branches on the
-    /// parameter's presence.
+    /// Self-assignment is the default now, but the *parameter* is still
+    /// optional: `cockerd` omits it for a container with no network, and the
+    /// DHCP opt-out produces no address either. The guest branches on the
+    /// parameter's presence, so emitting nothing must stay meaningful.
     @Test func cmdlineOmitsTheAddressByDefault() {
         let line = KernelCommandLine.build(KernelCommandLineParams(
             container: container(),
