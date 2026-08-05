@@ -100,3 +100,50 @@ struct StaticNATAddressTests {
         #expect(VMRuntime.staticNATIP(for: container()) == nil)
     }
 }
+
+/// Self-assigned `eth0` addresses are the default as of this change.
+///
+/// The DHCP path shipped a ceiling: macOS's lease pool is host-wide, capped
+/// at ~256, never reclaimed and `root:wheel`, so a machine that had started
+/// 256 containers stopped working until somebody with root truncated a file.
+/// Keeping that as the default meant shipping a daemon that needs root to
+/// recover from its own normal use.
+@Suite("Static eth0 is the default")
+struct StaticNATDefaultTests {
+
+    /// `unsetenv` then read, so this describes what a normal daemon does
+    /// rather than what this test process happens to inherit.
+    @MainActor
+    private func enabled(with value: String?) -> Bool {
+        let key = "COCKER_STATIC_ETH0"
+        let previous = ProcessInfo.processInfo.environment[key]
+        defer {
+            if let previous { setenv(key, previous, 1) } else { unsetenv(key) }
+        }
+        if let value { setenv(key, value, 1) } else { unsetenv(key) }
+        return ContainerEngine.staticNATEnabled
+    }
+
+    @MainActor
+    @Test func onWhenUnset() {
+        #expect(enabled(with: nil))
+    }
+
+    /// The escape hatch has to work, and has to be obvious — a host where
+    /// something else owns the subnet needs a way back to DHCP.
+    @MainActor
+    @Test func offOnlyWhenExplicitlyDisabled() {
+        for off in ["0", "false", "no", "off", "OFF", "False"] {
+            #expect(enabled(with: off) == false, "'\(off)' should disable it")
+        }
+    }
+
+    /// Anything else means on. A typo must not silently reinstate the
+    /// ~256-container ceiling.
+    @MainActor
+    @Test func anUnrecognisedValueDoesNotSilentlyDisableIt() {
+        for on in ["1", "true", "yes", "", "wat"] {
+            #expect(enabled(with: on), "'\(on)' should leave it enabled")
+        }
+    }
+}
