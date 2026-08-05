@@ -146,13 +146,31 @@ func main() async {
     log.info("startup", "cockerd \(CockerVersion.version) root=\(rootDir)")
 
     // PID file at ~/.cocker/cockerd.pid — consumed by `cocker daemon stop/
-    // status`. Refuses to start if another cockerd is already alive on it.
+    // status`, and the run lock that keeps one daemon per root.
+    //
+    // This used to read the pid out of the file and check whether that
+    // process was alive. That samples a value which is briefly wrong during
+    // any restart, and two daemons ended up sharing one root because of it:
+    // Homebrew's LaunchAgent has KeepAlive, so killing the daemon makes
+    // launchd respawn it within a second, and `cocker daemon restart` then
+    // started a second one — the file still named the process it had just
+    // killed, so the check passed. Both printed "Ready", both wrote the same
+    // state.json.
+    //
+    // `flock` has no such window: it is held by a live descriptor and
+    // released by the kernel on exit, SIGKILL included. `lockFD` is
+    // intentionally kept for the process lifetime — closing it would drop
+    // the lock.
     let pidFile = rootURL.appendingPathComponent("cockerd.pid")
-    if let existing = PIDFile.liveFromFile(pidFile) {
-        log.error("startup", "another cockerd is already running (pid=\(existing)) — use `cocker daemon stop` first")
+    guard let lockFD = PIDFile.acquire(pidFile) else {
+        let who = PIDFile.read(pidFile).map { " (pid=\($0))" } ?? ""
+        log.error("startup",
+            "another cockerd already holds \(pidFile.path)\(who) — " +
+            "stop it first with `cocker daemon stop`, or `brew services stop cocker` " +
+            "if it is service-managed")
         exit(1)
     }
-    try? PIDFile.writeSelf(to: pidFile)
+    _ = lockFD  // held for the lifetime of the process; see above
 
     // Rotate cockerd.log if it's grown past 10 MiB. Best-effort : a missing
     // file or a permission error is silently ignored — losing one rotation
