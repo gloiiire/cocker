@@ -42,6 +42,10 @@ actor L2Switch: L2Switching {
         let containerID: String
         let switchFD: Int32    // our end of the socketpair
         let staticMAC: UInt64  // MAC we assigned at VM-creation time
+        /// The user-defined network this port belongs to. Frames never cross
+        /// between different values — that is the whole of the isolation
+        /// `cocker network create` has always claimed and never had.
+        let network: String
     }
 
     private var ports: [String: Port] = [:]
@@ -59,7 +63,7 @@ actor L2Switch: L2Switching {
     /// Create a socketpair, register one end as a port, return the other end
     /// wrapped in a FileHandle so the caller can hand it to VZFileHandle…
     /// attachment. Pre-seeds the MAC learning table with `staticMAC`.
-    func addPort(containerID: String, staticMAC: String) -> FileHandle? {
+    func addPort(containerID: String, staticMAC: String, network: String) -> FileHandle? {
         guard let macInt = Self.parseMAC(staticMAC) else {
             log("addPort: invalid MAC \(staticMAC) for \(containerID)")
             return nil
@@ -87,11 +91,12 @@ actor L2Switch: L2Switching {
         let switchFD = fds[0]
         let vzFD = fds[1]
 
-        let port = Port(containerID: containerID, switchFD: switchFD, staticMAC: macInt)
+        let port = Port(containerID: containerID, switchFD: switchFD,
+                        staticMAC: macInt, network: network)
         ports[containerID] = port
         macTable[macInt] = containerID
 
-        log("addPort: \(containerID) MAC=\(staticMAC) switchFD=\(switchFD) vzFD=\(vzFD)")
+        log("addPort: \(containerID) MAC=\(staticMAC) net=\(network) switchFD=\(switchFD) vzFD=\(vzFD)")
 
         // DispatchSourceRead drains frames as they arrive without parking a
         // pool thread on a blocking read(). On EOF / error / port removal,
@@ -167,12 +172,26 @@ actor L2Switch: L2Switching {
         let isMulticast = (frame[0] & 0x01) != 0  // low bit of first MAC byte = multicast/broadcast
 
         if isBroadcast || isMulticast {
-            flood(frame: frame, except: sourceContainerID, reason: isBroadcast ? "bcast" : "mcast")
+            flood(frame: frame, except: sourceContainerID,
+                  onNetwork: sourcePort.network,
+                  reason: isBroadcast ? "bcast" : "mcast")
             return
         }
 
         if let targetID = macTable[dstMAC], targetID != sourceContainerID,
            let targetPort = ports[targetID] {
+            // Network isolation. `cocker network create` has always accepted
+            // a name and a subnet, stored them, and enforced nothing: every
+            // container shared one flat segment, so two "separate" networks
+            // could reach each other. A user who splits two stacks apart for
+            // isolation got none, and was told nothing.
+            guard targetPort.network == sourcePort.network else {
+                if verboseLogging {
+                    log("drop \(sourceContainerID)[\(sourcePort.network)] → "
+                        + "\(targetID)[\(targetPort.network)]: different networks")
+                }
+                return
+            }
             sendFrame(frame, to: targetPort.switchFD)
             if verboseLogging {
                 log("\(sourceContainerID) → \(targetID) (\(frame.count) B)")
@@ -180,12 +199,18 @@ actor L2Switch: L2Switching {
             return
         }
 
-        // Unknown unicast : flood (standard learning switch behavior).
-        flood(frame: frame, except: sourceContainerID, reason: "unknown-dst")
+        // Unknown unicast : flood (standard learning switch behavior), but
+        // only within the sender's own network.
+        flood(frame: frame, except: sourceContainerID,
+              onNetwork: sourcePort.network, reason: "unknown-dst")
     }
 
-    private func flood(frame: Data, except sourceID: String, reason: String) {
-        for (id, port) in ports where id != sourceID {
+    private func flood(frame: Data, except sourceID: String,
+                       onNetwork network: String, reason: String) {
+        // Broadcast and unknown-unicast flooding are how ARP finds a peer, so
+        // scoping them is what actually stops one network discovering another
+        // — a MAC that never floods across is never learned across.
+        for (id, port) in ports where id != sourceID && port.network == network {
             sendFrame(frame, to: port.switchFD)
         }
         if verboseLogging {

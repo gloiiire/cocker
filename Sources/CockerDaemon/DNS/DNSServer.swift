@@ -135,11 +135,40 @@ actor DNSServer {
     /// in true parallel ; the only shared state we touch is `state.
     /// allContainers` which is itself an actor and handles concurrent
     /// reads cleanly.
-    nonisolated func handleStreamedDNSQuery(fd: Int32) async {
+
+    /// The containers `asker` is allowed to see: the ones sharing a network
+    /// with it, plus itself.
+    ///
+    /// Resolution used to be global — every container resolved every other
+    /// one regardless of network. Combined with a switch that also forwarded
+    /// across networks, `cocker network create` was pure bookkeeping. The
+    /// switch now drops cross-network frames, so leaving DNS global would
+    /// answer with an address the caller provably cannot reach; that is a
+    /// worse failure than a clean NXDOMAIN, because it looks like a hang.
+    nonisolated static func visibleContainers(to asker: String?,
+                                              from all: [Container]) -> [Container] {
+        guard let asker, let me = all.first(where: { $0.id == asker }) else {
+            // Unknown asker (host-side query, or a VM we could not identify):
+            // keep the previous behaviour rather than silently resolving
+            // nothing, which would break DNS outright on any wiring mistake.
+            return all
+        }
+        let myNetwork = me.networkName ?? "bridge"
+        return all.filter { ($0.networkName ?? "bridge") == myNetwork }
+    }
+
+    /// - Parameter askedBy: id of the container the query came from, when
+    ///   known. Used to scope resolution to the networks that container is
+    ///   actually on — a container must not resolve names it cannot reach,
+    ///   which is what made `cocker network create` look like it isolated
+    ///   things. nil (host-side queries, or a VM we failed to identify)
+    ///   keeps the old global view.
+    nonisolated func handleStreamedDNSQuery(fd: Int32, askedBy: String? = nil) async {
         defer { close(fd) }
         guard let query = await Self.readStreamedQuery(fd: fd) else { return }
 
-        let containers = await state.allContainers(includeAll: false)
+        let containers = Self.visibleContainers(
+            to: askedBy, from: await state.allContainers(includeAll: false))
         guard let result = await Self.resolve(query: query, containers: containers) else { return }
 
         Self.logResult(result.kind)

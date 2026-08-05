@@ -84,21 +84,22 @@ same intended content — a bottle refresh, a packaging fix — with no behaviou
 | **Plugins** | ❌ | ✅ | no extension system |
 | **Swarm / Stack / Service** | 🟡 single-node | ✅ | wrappers around compose |
 
-**Known macOS gotcha — DHCP lease pool** : macOS's `vmnet` ships a built-in
-`bootpd` that hands out IPs to each container VM from a pool capped at ~256
-entries in `/var/db/dhcpd_leases`. Sustained churn (CI, big test suites)
-saturates it in minutes and then `cocker run` silently produces a container
-with no IP (port-forwarding lands on `127.0.0.1`, which doesn't work).
+**macOS's DHCP lease pool, and why cocker no longer uses it** : macOS's
+`vmnet` ships a built-in `bootpd` that hands IPs to VMs from a pool capped at
+~256 entries in `/var/db/dhcpd_leases`. That file is host-wide, **never
+reclaimed**, and owned by root — so the cap was cumulative rather than
+concurrent, and once reached, only someone with root could clear it.
+Sustained churn (CI, big test suites) hit it in an afternoon.
 
-**The recommended fix** : run **once**, ever, on a new machine —
-```
-cocker daemon helper-install   # one sudo prompt, installs a tiny LaunchDaemon
-```
-After that, cockerd auto-triggers the helper at >200 leases and the issue
-disappears for good. `cocker daemon status` shows the live count and helper
-state. If you prefer not to install the helper, the one-shot escape hatch is
-`cocker daemon clear-leases` (also prompts for sudo each call). The hard limit
-is a `vmnet` design choice, not a cocker bug.
+cocker assigns each container's `eth0` address itself and asks for no lease,
+so none of that applies. Set `COCKER_STATIC_ETH0=0` to go back to DHCP if
+something else on your machine owns that subnet.
+
+If you do switch back to DHCP and hit the ceiling, `cocker daemon
+helper-install` installs a small root LaunchDaemon that truncates the pool
+automatically (one sudo prompt, once per machine), and `cocker daemon
+clear-leases` is the one-shot equivalent. `cocker daemon status` shows the
+live count. Neither is needed on the default path.
 
 ## Requirements
 

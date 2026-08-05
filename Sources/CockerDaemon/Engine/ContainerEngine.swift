@@ -288,13 +288,21 @@ final class ContainerEngine {
         // Allocate IP
         container.ip = await networks.allocateIP(for: id)
         CockerLog.shared.debug("eng", "ipv4=\(container.ip ?? "?")")
-        container.ipv6 = await networks.allocateIPv6(for: id)
-        CockerLog.shared.debug("eng", "ipv6=\(container.ipv6 ?? "?")")
         // Allocate IP+MAC on the cocker L2 switch (inter-container fabric)
-        let (cIP, cMAC) = await networks.allocateCockerIPAndMAC(for: id)
+        let (cIP, cMAC) = try await networks.allocateCockerIPAndMAC(for: id)
         container.cockerIP = cIP
         container.cockerMAC = cMAC
         CockerLog.shared.debug("eng", "cocker switch ip=\(cIP) mac=\(cMAC)")
+
+        // eth0 address, when we assign it ourselves rather than asking
+        // vmnet's DHCP server. Allocated here — before the VM exists — so it
+        // lands in persisted state, which is what the allocator reads to
+        // know what is taken. See docs/DESIGN-network-without-vmnet.md.
+        if Self.staticNATEnabled, container.networkMode != .none {
+            let gateway = DNSServer.hostIP()
+            container.natIP = try await networks.allocateNATIP(for: id, gateway: gateway)
+            CockerLog.shared.debug("eng", "eth0 static ip=\(container.natIP ?? "?")")
+        }
         // eth0 MAC is filled in after VM start (VZ picks it during config).
         // We use it later to look up the matching lease in
         // /var/db/dhcpd_leases when /cocker-ip polling times out.
@@ -1023,6 +1031,11 @@ final class ContainerEngine {
         // disque pris par les modifications post-clonefile).
         try? await images.removeContainerRootfs(containerID: container.id)
         try await state.removeContainer(id: container.id)
+        // Free the addresses. The persisted container is the durable record,
+        // so removing it is what actually returns them to the pool — this
+        // clears the in-flight cache, which would otherwise keep shrinking
+        // the usable range for the lifetime of the daemon.
+        await networks.releaseAddresses(for: container.id)
         // `rm -v` : drop the volumes cocker invented for this container. The
         // flag was parsed and never acted on, so anonymous volumes accumulated
         // on disk forever with no way to reclaim them by name.
@@ -1560,7 +1573,31 @@ final class ContainerEngine {
     /// shims so existing call sites (and tests) don't need to change.
     /// New code should call `LeasePoolMonitor` directly.
 
+    /// True when containers configure `eth0` themselves instead of asking
+    /// vmnet's bootpd for a lease — in which case the host lease pool is
+    /// irrelevant and must not gate anything.
+    ///
+    /// **On by default.** macOS's lease pool is host-wide, capped at ~256
+    /// entries, never reclaimed and `root:wheel`, so a machine that has
+    /// started 256 containers stops working until somebody with root
+    /// truncates a file. Leaving DHCP as the default meant shipping that
+    /// ceiling, and shipping a daemon that needs root to recover from it.
+    ///
+    /// Set `COCKER_STATIC_ETH0=0` to go back to DHCP. That path is intact
+    /// and still the fallback inside the guest when no address is supplied —
+    /// worth keeping for a host where something else owns the subnet and
+    /// self-assignment would collide.
+    ///
+    /// See `docs/DESIGN-network-without-vmnet.md` for the measurements.
+    static var staticNATEnabled: Bool {
+        switch ProcessInfo.processInfo.environment["COCKER_STATIC_ETH0"]?.lowercased() {
+        case "0", "false", "no", "off": return false
+        default: return true
+        }
+    }
+
     static func maybeTriggerLeasePoolClear() {
+        guard !staticNATEnabled else { return }
         LeasePoolMonitor.maybeTriggerClear()
     }
 
@@ -1573,6 +1610,9 @@ final class ContainerEngine {
     }
 
     static func preflightLeasePoolOrThrow() throws {
+        // Refusing a run because a lease pool is full makes no sense when
+        // the container is not going to ask for a lease.
+        guard !staticNATEnabled else { return }
         try LeasePoolMonitor.preflightOrThrow()
     }
 

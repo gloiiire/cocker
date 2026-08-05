@@ -93,38 +93,11 @@ struct IPAllocationTests {
         for i in 0..<50 { seen.insert(await net.allocateIP(for: "c\(i)")) }
         #expect(seen.count == 50)
     }
-
-    /// `hashValue` is seeded per process, so a container's IPv6 changed on
-    /// every daemon restart while `container.ipv6` in state.json kept the old
-    /// value — and unlike `ip`, nothing later corrects it.
-    /// Pinned to an exact address, computed independently from the FNV-1a
-    /// definition. Two managers in one process would agree even with the old
-    /// `hashValue` (same seed), so only a fixed expected value actually
-    /// catches a regression to a per-process hash.
-    @Test func ipv6IsDerivedFromAStableHash() async throws {
-        let net = try await manager()
-        #expect(await net.allocateIPv6(for: "container-xyz") == "fd00:c0c4::2fda")
-    }
-
-    @Test func ipv6AgreesAcrossManagers() async throws {
-        let first = try await manager()
-        let second = try await manager()
-        let a = await first.allocateIPv6(for: "container-xyz")
-        let b = await second.allocateIPv6(for: "container-xyz")
-        #expect(a == b)
-    }
-
-    @Test func ipv6IsDistinctPerContainer() async throws {
-        let net = try await manager()
-        var seen: Set<String> = []
-        for i in 0..<50 { seen.insert(await net.allocateIPv6(for: "c\(i)")) }
-        #expect(seen.count == 50, "collided: \(seen.count)/50 unique")
-    }
-
-    @Test func ipv6IsStablePerContainer() async throws {
-        let net = try await manager()
-        #expect(await net.allocateIPv6(for: "abc") == (await net.allocateIPv6(for: "abc")))
-    }
+    // The IPv6 allocation tests are gone with the feature. cocker derived
+    // an `fd00:c0c4::…` address for every container, stored it and reported
+    // it, and never configured it on any interface in any guest — the DNS
+    // resolver even served it for AAAA queries. Testing that a fabricated
+    // value is fabricated consistently is not coverage worth keeping.
 }
 
 /// `Container` has an explicit `init(from:)`, so a new stored property is

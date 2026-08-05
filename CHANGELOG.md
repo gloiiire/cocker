@@ -7,6 +7,61 @@ Notable changes per release. Versions are `MAJOR.MINOR.PATCH.BUILD` — see
 Entries describe what changed for *you*, not what moved in the code. A user
 should be able to read one line and know whether it affects them.
 
+## 1.1.0.0 — 2026-08-05
+
+Networking. Three things cocker claimed and didn't do, and one ceiling it
+shouldn't have had.
+
+### Added
+
+- **Networks actually isolate.** `cocker network create` accepted a name, a
+  driver, a subnet and a gateway, stored all of it, and enforced none of it:
+  every container sat on one flat segment and DNS resolved globally, so two
+  "separate" networks reached each other and resolved each other by name. If
+  you split two stacks apart for isolation, you got none, and nothing said
+  so. Traffic between networks is now dropped by the switch — **including
+  when the container already knows the address** — and DNS only resolves
+  names on your own network.
+
+- **No more ~256-container ceiling.** macOS hands each container VM an IP
+  from a lease pool that is host-wide, capped at roughly 256 entries, never
+  reclaimed, and owned by root. The limit was therefore cumulative rather
+  than concurrent: after 256 containers over the machine's lifetime, every
+  `cocker run` failed to get an address and only someone with root could
+  clear it. Containers now assign their own address and ask for no lease.
+  `COCKER_STATIC_ETH0=0` goes back to DHCP if something else on your machine
+  owns that subnet.
+
+### Fixed
+
+- **`cocker inspect` and the Docker API reported an IPv6 address that
+  existed nowhere.** cocker computed `fd00:c0c4::…` for every container,
+  stored it, and — worse than the display — **answered DNS with it**. Any
+  client trying IPv6 first got a confident answer pointing at an interface
+  that does not exist. Removed.
+
+- **The Docker API reported Docker's default bridge, not cocker's network.**
+  `IPAddress: 172.17.0.2`, `Gateway: 172.17.0.1` — addresses cocker never
+  creates. A client reading `Gateway` and dialling it reached nothing.
+
+- **`/etc/hosts` carried a placeholder address** on images that don't ship
+  their own, because it was written before the real address was known.
+
+- **Two containers could end up with the same IP** after a daemon restart.
+  Allocation was a counter held in memory: restart cockerd and it began
+  again from the start of the range while surviving containers still held
+  those addresses. It now allocates from what is actually in use, read from
+  persisted state, and refuses when the range is full rather than wrapping
+  around onto somebody else's address.
+
+### Changed — may break a script
+
+- **`cocker network create --subnet` / `--gateway` now fail** (exit 126)
+  instead of being accepted and ignored. Containers always drew from one
+  shared address range regardless of what you asked for. Networks isolate
+  now but still share that range, so honouring a custom subnet needs an
+  allocator that doesn't exist yet. Drop the flag to create the network.
+
 ## 1.0.1.0 — 2026-08-02
 
 ### Fixed

@@ -56,6 +56,20 @@ public struct KernelCommandLineParams: Sendable {
     /// nil outside the build-overlay path.
     public let outboxTag: String?
 
+    /// Static address for `eth0` (Apple's vmnet NIC), in place of asking
+    /// vmnet's bootpd for a DHCP lease.
+    ///
+    /// The lease pool is host-wide, capped at ~256 entries, never reclaimed
+    /// and `root:wheel` — so a machine that has started 256 containers stops
+    /// working until somebody with root truncates a file. Not asking for a
+    /// lease sidesteps the whole problem. See
+    /// `docs/DESIGN-network-without-vmnet.md`.
+    ///
+    /// nil keeps the DHCP path. That is no longer the default — `cockerd`
+    /// assigns these addresses unless `COCKER_STATIC_ETH0=0` — but the guest
+    /// still branches on this parameter's presence, so nil must keep working.
+    public let staticNATIP: String?
+
     public init(container: Container,
                 dnsIP: String,
                 dnsPort: UInt16,
@@ -66,7 +80,9 @@ public struct KernelCommandLineParams: Sendable {
                 volumeSpecs: [String] = [],
                 rootDevice: String? = nil,
                 buildOverlay: Bool = false,
-                outboxTag: String? = nil) {
+                outboxTag: String? = nil,
+                staticNATIP: String? = nil) {
+        self.staticNATIP = staticNATIP
         self.container = container
         self.dnsIP = dnsIP
         self.dnsPort = dnsPort
@@ -122,6 +138,13 @@ public enum KernelCommandLine {
             parts.append("cocker.cnet_ip=\(cIP)/16")
             parts.append("cocker.cnet_gw=\(params.cockerSwitchGateway)")
             parts.append("cocker.cnet_mac=\(cMAC)")
+        }
+
+        // eth0 (Apple vmnet) configured statically instead of via DHCP.
+        // cocker-init derives the gateway and netmask as the /24 this
+        // address sits in, so one parameter is enough. Absent → DHCP.
+        if let natIP = params.staticNATIP {
+            parts.append("cocker.eth0_ip=\(natIP)")
         }
 
         // The container's command and env vars are written into /cocker-spec

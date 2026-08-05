@@ -205,6 +205,18 @@ func main() async {
     Task {
         let helperPath = "/Library/LaunchDaemons/com.cocker.leases-helper.plist"
         let triggerPath = "/var/run/cocker-clear-leases"
+        // Nothing to watch when containers assign their own eth0 address:
+        // they never ask for a lease, so the pool's depth says nothing about
+        // whether the next `cocker run` will work. Warning about it anyway
+        // would be telling the user to fix something that is not their
+        // problem, which is how warnings get ignored.
+        if ContainerEngine.staticNATEnabled {
+            log.info("vmnet",
+                "eth0 addresses are assigned by cocker — the macOS DHCP lease "
+                + "pool is not used and not monitored (COCKER_STATIC_ETH0=0 "
+                + "restores the DHCP path)")
+            return
+        }
         if !FileManager.default.fileExists(atPath: helperPath) {
             log.info("vmnet",
                 "lease-pool helper not installed — run `cocker daemon helper-install` " +
@@ -315,8 +327,17 @@ func main() async {
     // DNS over vsock — the in-VM proxy connects here for resolution because
     // macOS App Sandbox blocks UDP/TCP DNS data over vmnet to user-signed
     // daemons. vsock bypasses vmnet.
-    let dnsVsockListener = DNSVsockListener(dnsServer: dns)
+    // The listener needs to ask VMRuntime who owns a given vsock device, so
+    // DNS can be scoped to the querier's network. Weak so the closure does
+    // not keep the runtime alive.
+    let runtime = engine.vmRuntime
+    let dnsVsockListener = DNSVsockListener(dnsServer: dns) { [weak runtime] device in
+        runtime?.containerOwning(vsockDevice: device)
+    }
     engine.vmRuntime.dnsVsockListener = dnsVsockListener.makeListener()
+    // VZVirtioSocketListener holds its delegate weakly, so the delegate has
+    // to be retained here or DNS silently stops working once it deallocs.
+    engine.vmRuntime.dnsVsockDelegate = dnsVsockListener
 
     // Start all servers
     let server = DaemonServer(socketPath: socketPath, engine: engine)

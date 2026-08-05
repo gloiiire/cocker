@@ -9,6 +9,10 @@ import Foundation
 
 public enum DNSQueryAnswerKind: Sendable {
     case authoritativeA(name: String, ip: String)
+    /// No longer produced. Containers have no IPv6, and the address this
+    /// used to carry was invented — see the note in `process`. Kept so a
+    /// reintroduction is a compile-time-visible change rather than a silent
+    /// one, and so the test asserting it never appears can name it.
     case authoritativeAAAA(name: String, ipv6: String)
     case empty(name: String)
     case upstream(name: String)
@@ -72,11 +76,34 @@ public enum DNSQueryProcessor {
         // (RFC 8305 §3). With our authoritative-empty AAAA they treated
         // CDN hostnames like files.pythonhosted.org as "no such host"
         // and refused to retry over IPv4, breaking every PyPI sync.
+        // AAAA for one of our own names → authoritative NODATA: the name
+        // exists, that record type does not. Containers have no IPv6.
+        //
+        // This slot has now held all three possible answers, and two of them
+        // shipped broken, so the reasoning is worth keeping:
+        //
+        //  1. **A fabricated address** (`fd00:c0c4::<hash-of-id>`) — what was
+        //     here until this change. Configured on no interface in any
+        //     guest; every container had one, so every AAAA query for a
+        //     container name got a confident answer pointing nowhere.
+        //  2. **Falling through to upstream**, giving NXDOMAIN for a name we
+        //     own. Looks conservative; breaks Alpine. musl resolves A and
+        //     AAAA in parallel and fails the whole lookup when either comes
+        //     back NXDOMAIN, even with a perfectly good A answer in hand.
+        //     Measured: `wget: bad address 'db:8080'`, e2e 03 and 05 red.
+        //  3. **NODATA**, below. musl accepts NOERROR-with-no-answers and
+        //     uses the A record.
+        //
+        // The container check must stay ahead of the upstream path, and must
+        // not be widened to non-container names: an authoritative empty for
+        // *those* is the 0.5.13.16 regression, where happy-eyeballs clients
+        // (RFC 8305 §3) read NOERROR-no-answers as "no such host" for real
+        // CDN names and refused to retry over IPv4.
         if question.isAAAA,
-           let ipv6 = DNSNameResolver.resolveAAAA(name: question.name, in: containers) {
+           DNSNameResolver.matchesContainer(name: question.name, in: containers) {
             return DNSQueryResult(
-                response: buildAAAAResponse(header: header, question: question, ipv6: ipv6),
-                kind: .authoritativeAAAA(name: question.name, ipv6: ipv6)
+                response: buildEmptyResponse(header: header, question: question),
+                kind: .empty(name: question.name)
             )
         }
         // AAAA queries for non-container names + non-AAAA queries

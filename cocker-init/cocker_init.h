@@ -17,6 +17,7 @@
 #define COCKER_INIT_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -48,9 +49,20 @@ char *cmdline_get(const char *cmdline, const char *key);
 /* Bring loopback up (so the DNS proxy on 127.0.0.1:53 is reachable). */
 void net_bring_up_loopback(void);
 
-/* Bring eth0 up and run udhcpc / dhclient. Writes the obtained IPv4 into
- * /cocker-ip so cockerd can pick it up via virtiofs. */
-void net_setup_eth0_dhcp(void);
+/* Bring eth0 up and give it an address, then write that address into
+ * /cocker-ip so cockerd can pick it up via virtiofs.
+ *
+ * Two paths. With `cocker.eth0_ip` on the cmdline the address is set
+ * statically and no DHCP request is ever sent — vmnet's lease pool is
+ * host-wide, capped at ~256, never reclaimed and root-owned, so a machine
+ * that has started 256 containers stops working until somebody with root
+ * truncates a file. Without it, the historical udhcpc / dhclient path. */
+void net_setup_eth0(const char *cmdline);
+
+/* Set address, netmask and default route on eth0. Lives in dhcp_min.c
+ * because the DHCP path needs it too; exposed so the static path can
+ * reuse it rather than duplicate three ioctls. */
+int configure_iface(uint32_t ip, uint32_t netmask, uint32_t gateway);
 
 /* Configure eth1 statically from cmdline parameters (cocker.cnet_ip,
  * cocker.cnet_mac). No-op if cocker.cnet_ip is absent. */

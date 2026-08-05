@@ -296,6 +296,23 @@ final class VMRuntime: NSObject {
     // can reach cockerd over vsock instead of UDP/TCP via vmnet (which the
     // App Sandbox blocks for user-signed daemons).
     var dnsVsockListener: VZVirtioSocketListener?
+    /// Strong reference to the listener's delegate — `VZVirtioSocketListener`
+    /// keeps its delegate weakly, so without this DNS stops working the
+    /// moment ARC collects it.
+    var dnsVsockDelegate: AnyObject?
+
+    /// Which container owns each VM's vsock device.
+    ///
+    /// A single DNS listener is shared across every VM, so its delegate has
+    /// no other way to tell who is asking — and it needs to know, to scope
+    /// resolution to the querier's network. Keyed by object identity because
+    /// `VZVirtioSocketDevice` is neither Hashable nor Equatable.
+    private(set) var vsockDeviceOwners: [ObjectIdentifier: String] = [:]
+
+    /// Container that owns `device`, for the DNS listener's use.
+    func containerOwning(vsockDevice device: VZVirtioSocketDevice) -> String? {
+        vsockDeviceOwners[ObjectIdentifier(device)]
+    }
 
     init(rootDir: URL, l2Switch: any L2Switching) throws {
         self.rootDir = rootDir
@@ -595,7 +612,8 @@ final class VMRuntime: NSObject {
         // cocker switch IP/MAC allocated (it always does for normal runs).
         if container.networkMode != .none,
            let macStr = container.cockerMAC,
-           let fh = await l2Switch.addPort(containerID: container.id, staticMAC: macStr) {
+           let fh = await l2Switch.addPort(containerID: container.id, staticMAC: macStr,
+                                           network: container.networkName ?? "bridge") {
             let switchDev = VZVirtioNetworkDeviceConfiguration()
             let attach = VZFileHandleNetworkDeviceAttachment(fileHandle: fh)
             attach.maximumTransmissionUnit = L2Switch.mtu
@@ -659,8 +677,25 @@ final class VMRuntime: NSObject {
             volumeSpecs: volumeSpecs,
             rootDevice: overlayDev,
             buildOverlay: overlayDev != nil,
-            outboxTag: outboxTag
+            outboxTag: outboxTag,
+            staticNATIP: Self.staticNATIP(for: container)
         ))
+    }
+
+    /// Whatever `NetworkManager` allocated and `ContainerEngine` persisted
+    /// on the container.
+    ///
+    /// This used to derive the address right here, hashing the container id
+    /// into a 65-wide range. That was a spike, and it did its job — proving
+    /// vmnet accepts a self-assigned address — but it is not an allocator.
+    /// It consults nothing, so two containers whose ids collide land on the
+    /// same address (better than even odds past ten concurrent containers,
+    /// by the birthday bound), and it cannot see leases vmnet handed to
+    /// other VMs on the host. Allocation now happens in `NetworkManager`
+    /// against the set of addresses actually in use, and is persisted on the
+    /// container so it survives a daemon restart.
+    nonisolated static func staticNATIP(for container: Container) -> String? {
+        container.natIP
     }
 
     /// Resolve the host directory holding qemu-user-static binaries the
@@ -977,6 +1012,10 @@ final class VMRuntime: NSObject {
         // instance is shared across all VMs.
         if let listener = dnsVsockListener,
            let socketDev = vm.socketDevices.first as? VZVirtioSocketDevice {
+            // Record the owner before attaching: the first query can arrive
+            // as soon as the listener is live, and an unidentified asker
+            // falls back to the unscoped container list.
+            vsockDeviceOwners[ObjectIdentifier(socketDev)] = container.id
             socketDev.setSocketListener(listener, forPort: 5353)
             CockerLog.shared.debug("vm", "DNS vsock listener attached on port 5353")
         }
@@ -1187,11 +1226,20 @@ final class VMRuntime: NSObject {
 
     private func writeResolvConf(to rootfsPath: URL, container: Container) throws {
         try RootfsBootstrap.writeResolvConf(to: rootfsPath, dnsIP: DNSServer.hostIP())
+        // `cockerIP`, not `ip`. This runs before boot, and at that point
+        // `container.ip` is still the placeholder `NetworkManager` hands out
+        // at create time (172.17.0.x) — the real vmnet address is only
+        // discovered after the guest comes up. So the file was being written
+        // with an address belonging to nothing.
+        //
+        // `cockerIP` is the right value on both counts: it is known before
+        // boot, and it is the address peers actually reach the container on,
+        // which is what a hosts entry is for.
         try RootfsBootstrap.writeHostsIfAbsent(
             to: rootfsPath,
             containerName: container.name,
             hostname: container.hostname,
-            ip: container.ip
+            ip: container.cockerIP
         )
     }
 

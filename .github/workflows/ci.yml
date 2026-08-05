@@ -502,6 +502,13 @@ jobs:
           echo "COCKER_CI_ROOT=$ROOT" >> "$GITHUB_ENV"
           echo "COCKER_HOST=unix://$ROOT/cocker.sock" >> "$GITHUB_ENV"
           echo "COCKER_DNS_PORT=5399" >> "$GITHUB_ENV"
+          # No COCKER_STATIC_ETH0 here any more: self-assigned eth0
+          # addresses are the default, so this job exercises what users get.
+          # It also means CI can no longer exhaust the runner's DHCP lease
+          # pool — one e2e run used to cost ~25 of ~256 host-wide leases that
+          # are never reclaimed, so two or three passes could render somebody's
+          # actual Mac unusable until a human ran sudo. That happened on
+          # 2026-08-05, at 317/256.
           nohup env COCKER_DNS_PORT=5399 \
             ./.build/release/cockerd --root "$ROOT" --socket "$ROOT/cocker.sock" \
             > "$RUNNER_TEMP/cockerd.log" 2>&1 &

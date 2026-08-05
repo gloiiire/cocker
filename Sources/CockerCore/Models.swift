@@ -24,13 +24,18 @@ public struct Container: Codable, Sendable, Identifiable {
     /// `/var/db/dhcpd_leases` when the in-VM `/cocker-ip` write loses the
     /// DHCP race.
     public var natMAC: String?
+    /// Address configured on eth0 when cocker assigns it itself instead of
+    /// requesting a DHCP lease. This is what makes the assignment durable:
+    /// the persisted container list *is* the allocator's registry, so a
+    /// restarted daemon sees what is already taken instead of handing out
+    /// duplicates. nil on the DHCP path.
+    public var natIP: String?
     public var cpuCount: Int
     public var memoryMB: UInt64
     public var createdAt: Date
     public var startedAt: Date?
     public var finishedAt: Date?
     public var exitCode: Int32?
-    public var ipv6: String?
     public var hostname: String
     public var restartPolicy: RestartPolicy
     public var healthStatus: HealthStatus
@@ -107,7 +112,6 @@ public struct Container: Codable, Sendable, Identifiable {
         self.networkMode = networkMode
         self.networkName = networkName
         self.ip = ip
-        self.ipv6 = nil
         self.cpuCount = cpuCount
         self.restartPolicy = restartPolicy
         self.memoryMB = memoryMB
@@ -149,13 +153,19 @@ public struct Container: Codable, Sendable, Identifiable {
         self.cockerIP = try c.decodeIfPresent(String.self, forKey: .cockerIP)
         self.cockerMAC = try c.decodeIfPresent(String.self, forKey: .cockerMAC)
         self.natMAC = try c.decodeIfPresent(String.self, forKey: .natMAC)
+        // Every stored property has to be listed here or it silently reads
+        // back as nil — this hand-written decoder has already swallowed
+        // `tty` and `shmSizeMB` that way. For natIP the loss would be worse
+        // than a missing flag: the allocator reads persisted addresses to
+        // know what is taken, so dropping them means handing out duplicates
+        // after every daemon restart.
+        self.natIP = try c.decodeIfPresent(String.self, forKey: .natIP)
         self.cpuCount = try c.decodeIfPresent(Int.self, forKey: .cpuCount) ?? 2
         self.memoryMB = try c.decodeIfPresent(UInt64.self, forKey: .memoryMB) ?? 512
         self.createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         self.startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt)
         self.finishedAt = try c.decodeIfPresent(Date.self, forKey: .finishedAt)
         self.exitCode = try c.decodeIfPresent(Int32.self, forKey: .exitCode)
-        self.ipv6 = try c.decodeIfPresent(String.self, forKey: .ipv6)
         self.hostname = try c.decodeIfPresent(String.self, forKey: .hostname)
             ?? String(self.id.prefix(12))
         self.restartPolicy = try c.decodeIfPresent(RestartPolicy.self, forKey: .restartPolicy) ?? .no

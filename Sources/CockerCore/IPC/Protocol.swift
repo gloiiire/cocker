@@ -687,9 +687,9 @@ public enum CockerVersion {
     // re-validates against the tag. `buildTime` used to be hand-maintained
     // alongside an automated `version` and had already drifted: 0.7.13.26
     // shipped claiming a build date seven weeks older than the release.
-    public static let version = "1.0.1.0"
+    public static let version = "1.1.0.0"
     public static let apiVersion = "1.0"
-    public static let buildTime = "2026-08-02"
+    public static let buildTime = "2026-08-05"
     public static let minAPIVersion = "1.0"
 
     /// **A10 — IPC protocol version**. v1 = post-audit shape (the
@@ -732,7 +732,6 @@ public struct InspectResponse: Codable, Sendable {
     public let networkMode: NetworkMode
     public let networkName: String?
     public let ip: String?
-    public let ipv6: String?
     public let hostname: String
     public let restartPolicy: RestartPolicy
     public let restartCount: Int
@@ -758,7 +757,6 @@ public struct InspectResponse: Codable, Sendable {
         self.networkMode = container.networkMode
         self.networkName = container.networkName
         self.ip = container.ip
-        self.ipv6 = container.ipv6
         self.hostname = container.hostname
         self.restartPolicy = container.restartPolicy
         self.restartCount = container.restartCount

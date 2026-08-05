@@ -181,7 +181,7 @@ static int open_dhcp_sock(void) {
 }
 
 /* Apply IP + netmask to eth0, set default route via gateway. */
-static int configure_iface(uint32_t ip, uint32_t netmask, uint32_t gateway) {
+int configure_iface(uint32_t ip, uint32_t netmask, uint32_t gateway) {
     int s = socket(AF_INET, SOCK_DGRAM, 0);
     if (s < 0) return -1;
 

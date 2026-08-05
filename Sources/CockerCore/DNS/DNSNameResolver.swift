@@ -32,14 +32,22 @@ public enum DNSNameResolver {
         return nil
     }
 
-    /// Resolve an AAAA (IPv6) record.
-    public static func resolveAAAA(name: String, in containers: [Container]) -> String? {
+    /// Whether `name` belongs to one of these containers, whatever addresses
+    /// it happens to have.
+    ///
+    /// This replaced `resolveAAAA`, which answered every IPv6 query for a
+    /// container name with `fd00:c0c4::<hash-of-container-id>` — an address
+    /// cocker computed, stored and served, and configured on no interface in
+    /// any guest.
+    ///
+    /// The caller needs "is this one of ours?" separately from "what is its
+    /// address?", because the honest AAAA answer for a container is NODATA:
+    /// the name exists, that record type does not. Getting that distinction
+    /// wrong is not theoretical — see `DNSQueryProcessor.process`, where both
+    /// of the obvious alternatives break a real client.
+    public static func matchesContainer(name: String, in containers: [Container]) -> Bool {
         let candidates = normalizedNames(from: name)
-        for container in containers {
-            guard let ipv6 = container.ipv6 else { continue }
-            if matches(container, candidates: candidates) { return ipv6 }
-        }
-        return nil
+        return containers.contains { matches($0, candidates: candidates) }
     }
 
     /// All the equivalent forms of a queried name we'll accept.

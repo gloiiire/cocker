@@ -126,8 +126,12 @@ These are real and documented rather than fixed:
   `VZVirtioSocketDevice.connect()` doesn't reliably fire its callback when
   called repeatedly from a background context. Report and reproducer in
   `docs/APPLE-FEEDBACK-VSOCK-CALLBACK.md`.
-- **~256 concurrent containers.** macOS `bootpd` stops handing out leases past
-  a ceiling Apple doesn't expose.
+- ~~**~256 concurrent containers.**~~ Lifted. macOS `bootpd` stops handing
+  out leases past a ceiling Apple doesn't expose, and its lease file is
+  host-wide, never reclaimed and root-owned — so the limit was cumulative,
+  not concurrent, and only root could reset it. Containers now assign their
+  own `eth0` address and ask for no lease. See
+  `docs/DESIGN-network-without-vmnet.md`.
 - **100 MiB request-body cap**, which bounds build contexts sent over the
   Docker socket. Lifting it needs streaming-to-disk in the HTTP parser.
 - **`COPY --chown` / `--chmod`, `ONBUILD` and `SHELL` are not applied.** They
