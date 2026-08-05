@@ -1021,6 +1021,28 @@ private func homebrewPlistPath() -> URL {
         .appendingPathComponent("Library/LaunchAgents/homebrew.mxcl.cocker.plist")
 }
 
+/// Is `label` actually loaded in the user's launchd domain?
+///
+/// Deliberately not "does the plist file exist". That inference is what made
+/// `cocker daemon helper-install` claim a helper was running for two months
+/// while `launchctl` had never loaded it — a plist on disk says what someone
+/// intended, `launchctl list` says what is true.
+private func isLoadedInLaunchd(label: String) -> Bool {
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    proc.arguments = ["list", label]
+    proc.standardOutput = Pipe()
+    proc.standardError = Pipe()
+    guard (try? proc.run()) != nil else { return false }
+    proc.waitUntilExit()
+    return proc.terminationStatus == 0
+}
+
+/// True when Homebrew's `brew services` currently owns cockerd.
+private func isHomebrewServiceManaged() -> Bool {
+    isLoadedInLaunchd(label: "homebrew.mxcl.cocker")
+}
+
 /// Drives `brew services <action> cocker`. Splits out as a helper so the
 /// three -s subcommands (start/stop/restart) share one shell-out point.
 /// Returns true on success ; false (with a printed reason) when brew is
@@ -1410,6 +1432,19 @@ struct DaemonRestartCommand: AsyncParsableCommand {
     var service = false
 
     mutating func run() async throws {
+        // When launchd owns cockerd, restarting it by hand is a race we lose.
+        // Homebrew's LaunchAgent has KeepAlive: SIGTERM the daemon and
+        // launchd respawns it within a second, so the spawn below started a
+        // *second* daemon on the same root — both printed "Ready", both wrote
+        // the same state.json. The pid-file lock now refuses the second one,
+        // which is correct but reads as "already running" in answer to a
+        // restart. Asking the service manager to do it is the honest fix.
+        if !service, isHomebrewServiceManaged() {
+            print("cockerd is managed by `brew services` — restarting through it.")
+            guard runBrewServices("restart") else { throw ExitCode.failure }
+            return
+        }
+
         // ArgumentParser only initializes @Option/@Flag values during parse().
         // Direct `Type()` instantiation leaves them unset and crashes the run.
         var stop = try DaemonStopCommand.parse([])

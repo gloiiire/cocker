@@ -46,8 +46,50 @@ public enum PIDFile {
     /// Convenience : read + check. Returns the live PID, or nil if the file
     /// is missing OR points to a dead process (in which case the caller
     /// usually wants to clear() the stale file).
+    ///
+    /// - Warning: fine for *reporting* (`daemon status`, "which pid do I
+    ///   signal"), useless as an admission gate. It samples a value that is
+    ///   briefly wrong during any restart: between one daemon exiting and
+    ///   its successor writing the file, this reads a dead pid and says
+    ///   "nobody is running". Two daemons started a second apart both passed
+    ///   this check and both ran on the same root. Use `acquire` to gate.
     public static func liveFromFile(_ url: URL) -> pid_t? {
         guard let pid = read(url), isAlive(pid) else { return nil }
         return pid
+    }
+
+    /// Exclusive run-lock on the pid file. Returns the held descriptor, or
+    /// nil when another process already owns it.
+    ///
+    /// The lock is what makes this safe, not the number in the file. `flock`
+    /// is owned by a live file descriptor and released by the kernel when
+    /// that process dies — there is no window where a stale value reads as
+    /// "free", which is exactly how two daemons ended up sharing one root:
+    /// Homebrew's LaunchAgent has `KeepAlive`, so killing the daemon makes
+    /// launchd respawn it within a second, and `cocker daemon restart` then
+    /// started a second one because the file still named the process it had
+    /// just killed.
+    ///
+    /// **The caller must keep the returned descriptor for the process
+    /// lifetime.** Closing it drops the lock. It is deliberately never
+    /// closed on the success path — the kernel reclaims it at exit, which
+    /// also covers `SIGKILL`, where no cleanup code of ours would run.
+    ///
+    /// The pid is still written, for humans and for `daemon stop`.
+    public static func acquire(_ url: URL) -> Int32? {
+        let fd = open(url.path, O_RDWR | O_CREAT, 0o644)
+        guard fd >= 0 else { return nil }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            return nil
+        }
+        // Truncate + rewrite rather than atomically replacing the file: an
+        // atomic write swaps in a new inode, and the lock lives on the inode
+        // we are holding. The replacement would be unlocked.
+        ftruncate(fd, 0)
+        lseek(fd, 0, SEEK_SET)
+        let line = "\(getpid())\n"
+        _ = line.withCString { Darwin.write(fd, $0, strlen($0)) }
+        return fd
     }
 }
