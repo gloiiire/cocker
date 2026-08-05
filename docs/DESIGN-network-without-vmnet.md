@@ -105,7 +105,9 @@ signing rules, its PID tracking and its SIGTERM lifecycle.
 
 ## Step 0 — the one-day spike, before anything else
 
-> Tracked as **#392**.
+> Tracked as **#392**. **Run 2026-08-05: it works.** Everything below the
+> spike section is therefore very likely unnecessary — see the results
+> before building any of it.
 
 **Hypothesis:** the pool fills because we *ask* for an address. What if we
 don't?
@@ -131,6 +133,39 @@ would have to own a range and check what is taken — it already parses
 
 **Pass/fail:** a container with a static `eth0` reaches the internet *and*
 answers on a published port. Yes → stop here. No → below.
+
+### Result, 2026-08-05 — it works
+
+Run against a pool **already saturated at 317/256**, where every container
+should have failed to boot. Opt-in behind `COCKER_STATIC_ETH0=1`.
+
+| | |
+|---|---|
+| Container boots | yes — `inet 192.168.64.192/24 eth0`, `default via 192.168.64.1` |
+| Fabric unaffected | yes — `10.42.0.0/16 dev eth1 src 10.42.0.2` |
+| Outbound by IP | HTTP 200, `ping` 2/2, 6.7 ms |
+| Outbound by name | full HTTPS fetch of `example.com` — DNS + TLS |
+| Published port | `-p 18097:80` answered from the host |
+| **Full e2e suite** | **13/13 passed** |
+| **Leases consumed** | **0** — 317 before, 317 after, including across the entire e2e run |
+
+An e2e run normally costs ~25 leases. This one cost none, on a pool that
+was already past the ceiling.
+
+So the ~256 ceiling is not a constraint we have to live with, and the
+userspace network stack below is not the price of removing it.
+
+**What this does not yet settle:**
+
+- The allocator is spike-grade: `.180`–`.244` derived from the container
+  id (FNV-1a, so it survives a daemon restart — `hashValue` is seeded per
+  process). It is deterministic and collision-free per id, but it does not
+  coordinate with anything else on the host. A shipping version must read
+  the lease file and track its own assignments.
+- It is opt-in. Making it the default is the next decision, and it wants a
+  release of its own.
+- Long-lived hosts sharing a /24 with other VMs still need the collision
+  question answered properly.
 
 ## If the spike fails: give `eth1` a way out
 

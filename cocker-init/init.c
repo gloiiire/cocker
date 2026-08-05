@@ -584,7 +584,7 @@ int main(int argc, char **argv) {
 
     /* Networking. */
     net_bring_up_loopback();
-    net_setup_eth0_dhcp();
+    net_setup_eth0(cmdline);
 
     /* DNS proxy first (so resolv.conf pin makes sense). */
     {
