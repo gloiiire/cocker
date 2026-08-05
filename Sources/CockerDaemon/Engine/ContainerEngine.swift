@@ -288,8 +288,6 @@ final class ContainerEngine {
         // Allocate IP
         container.ip = await networks.allocateIP(for: id)
         CockerLog.shared.debug("eng", "ipv4=\(container.ip ?? "?")")
-        container.ipv6 = await networks.allocateIPv6(for: id)
-        CockerLog.shared.debug("eng", "ipv6=\(container.ipv6 ?? "?")")
         // Allocate IP+MAC on the cocker L2 switch (inter-container fabric)
         let (cIP, cMAC) = try await networks.allocateCockerIPAndMAC(for: id)
         container.cockerIP = cIP

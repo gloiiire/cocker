@@ -8,15 +8,11 @@ import Network
 actor NetworkManager {
     private let store: StateStore
     private var allocatedIPs: [String: String] = [:]    // containerID -> IPv4
-    private var allocatedIPv6s: [String: String] = [:]  // containerID -> IPv6
     private var allocatedCockerIPs: [String: String] = [:]  // containerID -> 10.42.x.x
     private var allocatedNATIPs: [String: String] = [:]     // containerID -> 192.168.x.y
     // Kept only so the legacy `nextHost` tests keep compiling; allocation
     // no longer uses a cursor. See `cockerIPsInUse()`.
     private var cockerHostCounter: UInt16 = CockerSwitchAllocator.firstHost
-
-    // Préfixe IPv6 pour les réseaux cocker : fd00:c0c4::/48
-    private static let ipv6Prefix = "fd00:c0c4::"
 
     // Default networks
     private static let defaultNetworks: [NetworkInfo] = [
@@ -152,7 +148,6 @@ actor NetworkManager {
 
     func releaseIP(for containerID: String) {
         allocatedIPs.removeValue(forKey: containerID)
-        allocatedIPv6s.removeValue(forKey: containerID)
         allocatedCockerIPs.removeValue(forKey: containerID)
     }
 
@@ -247,49 +242,10 @@ actor NetworkManager {
         allocatedCockerIPs.removeValue(forKey: containerID)
         allocatedNATIPs.removeValue(forKey: containerID)
         allocatedIPs.removeValue(forKey: containerID)
-        allocatedIPv6s.removeValue(forKey: containerID)
     }
 
     static let cockerSwitchSubnet = CockerSwitchAllocator.subnet
     static let cockerSwitchGateway = CockerSwitchAllocator.gateway
-
-    func allocateIPv6(for containerID: String, networkName: String = "bridge") -> String {
-        if let existing = allocatedIPv6s[containerID] { return existing }
-
-        // Derive the suffix from a *stable* hash of the container id.
-        //
-        // This used to use `containerID.hashValue`, which Swift seeds per
-        // process — so a container's IPv6 changed every time cockerd
-        // restarted, while `container.ipv6` in state.json kept the old value.
-        // Unlike `container.ip`, nothing later corrects it, so `inspect`
-        // reported an address the container did not have.
-        //
-        // FNV-1a: tiny, dependency-free, and identical across runs.
-        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-        for byte in containerID.utf8 {
-            hash ^= UInt64(byte)
-            hash &*= 0x0000_0100_0000_01B3
-        }
-
-        // Probe for a free suffix instead of trusting a 16-bit hash to be
-        // unique — birthday collisions start around 300 containers, and a
-        // collision here means two containers share an address.
-        let taken = Set(allocatedIPv6s.values)
-        var suffix = UInt16(truncatingIfNeeded: hash)
-        for _ in 0..<UInt16.max {
-            if suffix == 0 { suffix = 1 }  // ::0 is the subnet itself
-            let candidate = "\(Self.ipv6Prefix)\(String(format: "%x", suffix))"
-            if !taken.contains(candidate) {
-                allocatedIPv6s[containerID] = candidate
-                return candidate
-            }
-            suffix = suffix &+ 1
-        }
-        // 65k containers on one host is not a case worth handling gracefully.
-        let fallback = "\(Self.ipv6Prefix)\(String(format: "%x", suffix))"
-        allocatedIPv6s[containerID] = fallback
-        return fallback
-    }
 
     // MARK: - Port forwarding
     // vmnet.framework handles NAT; port forwarding configured at VM boot via kernel cmdline
