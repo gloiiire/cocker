@@ -1,7 +1,14 @@
 # Getting off Apple's vmnet DHCP pool
 
-Status: **proposed**, nothing implemented. Written 2026-08-02 after a
-production incident on the maintainer's machine.
+Status: **done — and the expensive half was never needed.** Written
+2026-08-02 after a production incident, resolved 2026-08-05 by the one-day
+spike in "Step 0", which worked. Containers now assign their own `eth0`
+address by default (#398, #399, #402); the userspace network stack designed
+further down was not built and, on this evidence, should not be.
+
+Kept in full rather than trimmed to the outcome: the fallback design and the
+reasoning behind it are what you would need if the cheap answer ever stops
+holding.
 
 ## The problem, measured
 
@@ -157,15 +164,20 @@ was already past the ceiling.
 So the ~256 ceiling is not a constraint we have to live with, and the
 userspace network stack below is not the price of removing it.
 
-**What this does not yet settle:**
+**What it did not settle at the time, and how that went:**
 
-- The allocator is spike-grade: `.180`–`.244` derived from the container
-  id (FNV-1a, so it survives a daemon restart — `hashValue` is seeded per
-  process). It is deterministic and collision-free per id, but it does not
-  coordinate with anything else on the host. A shipping version must read
-  the lease file and track its own assignments.
-- It is opt-in. Making it the default is the next decision, and it wants a
-  release of its own.
+- *"The allocator is spike-grade — `.180`–`.244` derived from the container
+  id. Deterministic and collision-free per id, but it coordinates with
+  nothing else on the host. A shipping version must read the lease file and
+  track its own assignments."* Built in #399. Lowest-free allocation over
+  the addresses actually in use, drawn from persisted containers so a daemon
+  restart cannot hand out duplicates. It also surfaced something no unit
+  test could: macOS never expires entries in the lease file, so treating it
+  as a list of live hosts made the allocator refuse every request — 317
+  entries, all 317 expired.
+- *"It is opt-in. Making it the default is the next decision."* Done in
+  #402, once the real allocator existed. Opt out with
+  `COCKER_STATIC_ETH0=0`.
 - Long-lived hosts sharing a /24 with other VMs still need the collision
   question answered properly.
 
