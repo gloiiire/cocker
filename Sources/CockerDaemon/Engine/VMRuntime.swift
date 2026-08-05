@@ -296,6 +296,23 @@ final class VMRuntime: NSObject {
     // can reach cockerd over vsock instead of UDP/TCP via vmnet (which the
     // App Sandbox blocks for user-signed daemons).
     var dnsVsockListener: VZVirtioSocketListener?
+    /// Strong reference to the listener's delegate — `VZVirtioSocketListener`
+    /// keeps its delegate weakly, so without this DNS stops working the
+    /// moment ARC collects it.
+    var dnsVsockDelegate: AnyObject?
+
+    /// Which container owns each VM's vsock device.
+    ///
+    /// A single DNS listener is shared across every VM, so its delegate has
+    /// no other way to tell who is asking — and it needs to know, to scope
+    /// resolution to the querier's network. Keyed by object identity because
+    /// `VZVirtioSocketDevice` is neither Hashable nor Equatable.
+    private(set) var vsockDeviceOwners: [ObjectIdentifier: String] = [:]
+
+    /// Container that owns `device`, for the DNS listener's use.
+    func containerOwning(vsockDevice device: VZVirtioSocketDevice) -> String? {
+        vsockDeviceOwners[ObjectIdentifier(device)]
+    }
 
     init(rootDir: URL, l2Switch: any L2Switching) throws {
         self.rootDir = rootDir
@@ -595,7 +612,8 @@ final class VMRuntime: NSObject {
         // cocker switch IP/MAC allocated (it always does for normal runs).
         if container.networkMode != .none,
            let macStr = container.cockerMAC,
-           let fh = await l2Switch.addPort(containerID: container.id, staticMAC: macStr) {
+           let fh = await l2Switch.addPort(containerID: container.id, staticMAC: macStr,
+                                           network: container.networkName ?? "bridge") {
             let switchDev = VZVirtioNetworkDeviceConfiguration()
             let attach = VZFileHandleNetworkDeviceAttachment(fileHandle: fh)
             attach.maximumTransmissionUnit = L2Switch.mtu
@@ -1012,6 +1030,10 @@ final class VMRuntime: NSObject {
         // instance is shared across all VMs.
         if let listener = dnsVsockListener,
            let socketDev = vm.socketDevices.first as? VZVirtioSocketDevice {
+            // Record the owner before attaching: the first query can arrive
+            // as soon as the listener is live, and an unidentified asker
+            // falls back to the unscoped container list.
+            vsockDeviceOwners[ObjectIdentifier(socketDev)] = container.id
             socketDev.setSocketListener(listener, forPort: 5353)
             CockerLog.shared.debug("vm", "DNS vsock listener attached on port 5353")
         }

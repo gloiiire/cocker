@@ -24,8 +24,23 @@ final class DNSVsockListener: NSObject, VZVirtioSocketListenerDelegate {
 
     private let dnsServer: DNSServer
 
-    init(dnsServer: DNSServer) {
+    /// Which container a vsock connection came from.
+    ///
+    /// One listener instance is shared across every VM, so this callback is
+    /// the only place the asker can be identified — and it is handed the
+    /// `VZVirtioSocketDevice`, which belongs to exactly one VM. `VMRuntime`
+    /// registers the owner when it attaches the listener.
+    ///
+    /// This exists so DNS can be scoped to the querier's network. Without
+    /// it every container resolves every other container's name, including
+    /// ones it cannot reach — which is how `cocker network create` managed
+    /// to look like it isolated things while isolating nothing.
+    private let ownerOfDevice: @MainActor @Sendable (VZVirtioSocketDevice) -> String?
+
+    init(dnsServer: DNSServer,
+         ownerOfDevice: @escaping @MainActor @Sendable (VZVirtioSocketDevice) -> String?) {
         self.dnsServer = dnsServer
+        self.ownerOfDevice = ownerOfDevice
         super.init()
     }
 
@@ -55,8 +70,10 @@ final class DNSVsockListener: NSObject, VZVirtioSocketListenerDelegate {
         // Forward the fd to the DNS server's existing TCP-style handler.
         // The DNS wire is exactly the same on vsock as it is on TCP.
         let server = dnsServer
+        let resolveOwner = ownerOfDevice
         Task.detached(priority: .userInitiated) {
-            await server.handleStreamedDNSQuery(fd: fd)
+            let asker = await MainActor.run { resolveOwner(socketDevice) }
+            await server.handleStreamedDNSQuery(fd: fd, askedBy: asker)
         }
         return true
     }

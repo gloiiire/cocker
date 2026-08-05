@@ -101,6 +101,26 @@ struct NetworkCreateCommand: AsyncParsableCommand {
             )
             throw ExitCode.failure
         }
+        // `--subnet` / `--gateway` were parsed, stored on the network, and
+        // never used: addresses always came from the single 10.42.0.0/16
+        // fabric no matter what the user asked for. Networks isolate now, but
+        // they still share one address space, so honouring these would take a
+        // per-network allocator that does not exist yet.
+        //
+        // Refusing beats recording a number that decides nothing — a user who
+        // pins a subnet is usually matching something external, and silently
+        // getting a different one is the kind of failure that surfaces hours
+        // later as "why can't these two talk".
+        if let unsupported = subnet != nil ? "--subnet" : (gateway != nil ? "--gateway" : nil) {
+            UX.Failure.emit(
+                headline: "Cannot create network \(name)",
+                reason: "\(unsupported) is not implemented",
+                hint: "containers always draw from the shared \(CockerSwitchAllocator.subnet) "
+                    + "fabric. Networks do isolate traffic — they just don't take a "
+                    + "custom range yet. Drop the flag to create the network."
+            )
+            throw ExitCode(rawValue: 126)
+        }
         let payload = NetworkCreateRequest(name: name, driver: driver, subnet: subnet, gateway: gateway,
                                            labels: Self.parseLabels(labels))
         let client = IPCClient()
