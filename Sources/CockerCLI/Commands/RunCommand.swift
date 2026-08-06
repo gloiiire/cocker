@@ -23,7 +23,8 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customLong("name"), help: "Assign a name to the container")
     var name: String?
 
-    @Option(name: [.short, .customLong("publish")], help: "Publish ports (host:container)")
+    @Option(name: [.short, .customLong("publish")],
+            help: "Publish ports (host:container). TCP only — /udp mappings are not forwarded")
     var portSpecs: [String] = []
 
     @Option(name: [.short, .customLong("volume")], help: "Bind mount a volume (src:dst[:ro])")
@@ -166,6 +167,17 @@ struct RunCommand: AsyncParsableCommand {
         }
         config.rm = rm
         config.ports = try portSpecs.map { try PortMapping.parse($0) }
+        // cocker's forwarder relays TCP through /usr/bin/nc; there is no UDP
+        // relay. The mapping was accepted, shown by `ps` and `cocker port`,
+        // and silently dropped by PortForwarder with only a `debug` log —
+        // so a DNS container looked published and answered nobody.
+        let udp = config.ports.filter { $0.proto == .udp }
+        if !udp.isEmpty {
+            let list = udp.map { "\($0.hostPort):\($0.containerPort)/udp" }
+                          .joined(separator: ", ")
+            UX.IgnoredFlag.warn("-p \(list)",
+                "cocker forwards TCP only; nothing will listen on the host for these")
+        }
         config.volumes = try volumeSpecs.map { try VolumeMount.parse($0) }
         config.env = try parseEnv(env)
         config.labels = try parseKV(labels)
