@@ -20,6 +20,9 @@ struct Args {
     var listenPort: UInt16 = 0
     var targetIP: String = ""
     var targetPort: UInt16 = 0
+    /// `--udp` relays datagrams instead of streams. TCP stays the default so
+    /// nothing that already spawns this binary changes shape.
+    var udp: Bool = false
 
     static func parse() -> Args? {
         var args = Args()
@@ -42,6 +45,8 @@ struct Args {
                 guard parts.count == 2 else { return nil }
                 args.targetIP = String(parts[0])
                 args.targetPort = UInt16(parts[1]) ?? 0
+            case "--udp":
+                args.udp = true
             case "--help", "-h":
                 printUsage(); exit(0)
             default:
@@ -98,6 +103,180 @@ func forward(clientFD: Int32, targetIP: String, targetPort: UInt16) {
         log("spawn /usr/bin/nc failed: \(error)")
     }
     close(clientFD)
+}
+
+// MARK: - UDP relay
+
+/// Forward UDP datagrams host → container, and the replies back.
+///
+/// UDP mappings used to be accepted, shown by `ps` and never forwarded: the
+/// TCP path pipes through /usr/bin/nc and there was no datagram path at all,
+/// so a DNS container published on `-p 53:53/udp` answered nobody.
+///
+/// There is no connection to hang a session's lifetime on, so the mapping is
+/// keyed by client address with an idle timeout. Without expiry the table —
+/// and the descriptor count — would grow for as long as the container runs,
+/// which for a public DNS port is a slow leak with a hostile trigger.
+func runUDPRelay(addr: String, port: UInt16, targetIP: String, targetPort: UInt16) -> Never {
+    let listenFD = socket(AF_INET, SOCK_DGRAM, 0)
+    guard listenFD >= 0 else { log("socket() failed: \(errStr())"); exit(1) }
+
+    var yes: Int32 = 1
+    setsockopt(listenFD, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+
+    var bindAddr = sockaddr_in()
+    bindAddr.sin_family = sa_family_t(AF_INET)
+    bindAddr.sin_port = port.bigEndian
+    if addr == "0.0.0.0" || addr.isEmpty {
+        bindAddr.sin_addr.s_addr = INADDR_ANY
+    } else {
+        inet_pton(AF_INET, addr, &bindAddr.sin_addr)
+    }
+    let bound = withUnsafePointer(to: &bindAddr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+            Darwin.bind(listenFD, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    guard bound == 0 else {
+        log("bind \(addr):\(port)/udp failed: \(errStr())"); exit(1)
+    }
+
+    var target = sockaddr_in()
+    target.sin_family = sa_family_t(AF_INET)
+    target.sin_port = targetPort.bigEndian
+    inet_pton(AF_INET, targetIP, &target.sin_addr)
+
+    log("listening on \(addr):\(port)/udp → \(targetIP):\(targetPort)")
+
+    /// One upstream socket per client address. `connect()`ing it means the
+    /// kernel filters replies to this peer for us, and recv() needs no
+    /// source check of our own.
+    struct Session {
+        let fd: Int32
+        var lastSeen: time_t
+    }
+    var sessions: [String: Session] = [:]
+    let idleTimeout: time_t = 60
+    // Each session costs a descriptor. Past this the oldest is reaped rather
+    // than refusing new clients outright.
+    let maxSessions = 128
+
+    func key(_ sa: sockaddr_in) -> String {
+        var a = sa
+        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        inet_ntop(AF_INET, &a.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
+        return "\(String(cString: buf)):\(UInt16(bigEndian: a.sin_port))"
+    }
+
+    var buf = [UInt8](repeating: 0, count: 65535)
+
+    while true {
+        var readSet = fd_set()
+        fdZero(&readSet)
+        fdSet(listenFD, &readSet)
+        var maxFD = listenFD
+        for (_, s) in sessions {
+            fdSet(s.fd, &readSet)
+            if s.fd > maxFD { maxFD = s.fd }
+        }
+        var tv = timeval(tv_sec: 10, tv_usec: 0)
+        let ready = select(maxFD + 1, &readSet, nil, nil, &tv)
+        let now = time(nil)
+
+        if ready > 0 {
+            // Host → container.
+            if fdIsSet(listenFD, &readSet) {
+                var from = sockaddr_in()
+                var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let n = withUnsafeMutablePointer(to: &from) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        recvfrom(listenFD, &buf, buf.count, 0, sa, &fromLen)
+                    }
+                }
+                if n > 0 {
+                    let k = key(from)
+                    if sessions[k] == nil {
+                        if sessions.count >= maxSessions,
+                           let oldest = sessions.min(by: { $0.value.lastSeen < $1.value.lastSeen }) {
+                            close(oldest.value.fd)
+                            sessions.removeValue(forKey: oldest.key)
+                        }
+                        let up = socket(AF_INET, SOCK_DGRAM, 0)
+                        if up >= 0 {
+                            let ok = withUnsafePointer(to: &target) { ptr in
+                                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                                    connect(up, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                                }
+                            }
+                            if ok == 0 {
+                                sessions[k] = Session(fd: up, lastSeen: now)
+                            } else {
+                                close(up)
+                            }
+                        }
+                    }
+                    if var s = sessions[k] {
+                        _ = send(s.fd, buf, n, 0)
+                        s.lastSeen = now
+                        sessions[k] = s
+                    }
+                }
+            }
+
+            // Container → host. The reply goes back to the client whose
+            // datagram opened this session, which is the whole reason the
+            // table is keyed that way.
+            for (k, s) in sessions where fdIsSet(s.fd, &readSet) {
+                let n = recv(s.fd, &buf, buf.count, 0)
+                if n > 0 {
+                    var to = parseClientKey(k)
+                    _ = withUnsafePointer(to: &to) { ptr in
+                        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                            sendto(listenFD, buf, n, 0, sa,
+                                   socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                    var updated = s
+                    updated.lastSeen = now
+                    sessions[k] = updated
+                }
+            }
+        }
+
+        // Reap idle sessions. UDP gives no close, so this is the only thing
+        // that bounds the table.
+        for (k, s) in sessions where now - s.lastSeen > idleTimeout {
+            close(s.fd)
+            sessions.removeValue(forKey: k)
+        }
+    }
+}
+
+/// "1.2.3.4:5678" back into a sockaddr_in.
+private func parseClientKey(_ k: String) -> sockaddr_in {
+    var sa = sockaddr_in()
+    sa.sin_family = sa_family_t(AF_INET)
+    guard let colon = k.lastIndex(of: ":") else { return sa }
+    let host = String(k[k.startIndex..<colon])
+    let port = UInt16(k[k.index(after: colon)...]) ?? 0
+    sa.sin_port = port.bigEndian
+    inet_pton(AF_INET, host, &sa.sin_addr)
+    return sa
+}
+
+// Swift doesn't surface the FD_* macros.
+private func fdZero(_ set: inout fd_set) { bzero(&set, MemoryLayout<fd_set>.size) }
+private func fdSet(_ fd: Int32, _ set: inout fd_set) {
+    withUnsafeMutableBytes(of: &set.fds_bits) { raw in
+        let words = raw.bindMemory(to: Int32.self)
+        words[Int(fd) / 32] |= Int32(1 << (Int(fd) % 32))
+    }
+}
+private func fdIsSet(_ fd: Int32, _ set: inout fd_set) -> Bool {
+    withUnsafeMutableBytes(of: &set.fds_bits) { raw in
+        let words = raw.bindMemory(to: Int32.self)
+        return words[Int(fd) / 32] & Int32(1 << (Int(fd) % 32)) != 0
+    }
 }
 
 // MARK: - Listener
@@ -168,5 +347,9 @@ guard let args = Args.parse() else {
     exit(2)
 }
 
+if args.udp {
+    runUDPRelay(addr: args.listenAddr, port: args.listenPort,
+                targetIP: args.targetIP, targetPort: args.targetPort)
+}
 runListener(addr: args.listenAddr, port: args.listenPort,
             targetIP: args.targetIP, targetPort: args.targetPort)
