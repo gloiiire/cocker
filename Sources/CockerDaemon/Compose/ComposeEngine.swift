@@ -1123,7 +1123,11 @@ actor ComposeEngine {
         config.labels["com.cocker.project"] = projectName
         config.labels["com.cocker.service"] = serviceName
 
-        config.restartPolicy = RestartPolicy(rawValue: service.restart ?? "no") ?? .no
+        // Same trap as the CLI: `restart: on-failure:5` is valid compose,
+        // has no rawValue, and became `.no` — the service never restarted.
+        let restartSpec = try RestartPolicy.parse(service.restart ?? "no")
+        config.restartPolicy = restartSpec.policy
+        config.restartMaxRetries = restartSpec.maxRetries
 
         // Network
         if let netSpec = service.networks {

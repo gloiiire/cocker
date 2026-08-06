@@ -115,11 +115,26 @@ struct PluginRmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         var plugins = loadPlugins()
+        // `removeAll` on a non-match is a no-op, and the result line printed
+        // anyway — so `cocker plugin rm typo` reported "✓ plugin typo
+        // removed" and exited 0. The sibling commands in this file
+        // (enable / disable / inspect) all handle not-found correctly; this
+        // was an inconsistency, not a decision.
+        let failures = UX.FailFlag()
         for name in names {
+            let before = plugins.count
             plugins.removeAll { $0.name == name }
+            guard plugins.count != before else {
+                failures.trip()
+                UX.Failure.emit(headline: "No such plugin: \(name)")
+                continue
+            }
             UX.printResult(.plugin, name, verb: .remove)
         }
         savePlugins(plugins)
+        // 127 — the charter's "no such object", same as `rm` on a missing
+        // container.
+        if failures.tripped { throw ExitCode(127) }
     }
 }
 
