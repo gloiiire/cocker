@@ -283,6 +283,9 @@ final class ContainerEngine {
         container.addHosts = config.addHosts.isEmpty ? nil : config.addHosts
         container.dnsServers = config.dnsServers.isEmpty ? nil : config.dnsServers
         container.dnsSearch = config.dnsSearch.isEmpty ? nil : config.dnsSearch
+        // Persisted so the retry ceiling survives a daemon restart — the
+        // watcher reads it from the container, not from the request.
+        container.restartMaxRetries = config.restartMaxRetries
         // `run -it` : remembered on the container so the spec written at
         // start time asks init for a controlling terminal, and so a restart
         // keeps it.
@@ -1440,7 +1443,7 @@ final class ContainerEngine {
         // (the user opted in). Exponential backoff starts at 100 ms and
         // doubles to a 30 s ceiling, also matching Docker.
         var restartAttempts = 0
-        let maxFailureRetries = 10
+        let defaultFailureRetries = 10
         let baseBackoff: TimeInterval = 0.1
         let maxBackoff: TimeInterval = 30
 
@@ -1486,7 +1489,10 @@ final class ContainerEngine {
                     shouldRestart = container.status != .stopped
                 case .onFailure:
                     // Only restart on non-zero exit, and respect the retry cap.
-                    shouldRestart = exitCode != 0 && restartAttempts < maxFailureRetries
+                    // `--restart on-failure:<max>` sets it per container; the
+                    // default stands for anyone who didn't say.
+                    let cap = container.restartMaxRetries ?? defaultFailureRetries
+                    shouldRestart = exitCode != 0 && restartAttempts < cap
                 case .no:
                     shouldRestart = false
                 }

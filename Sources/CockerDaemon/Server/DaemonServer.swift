@@ -538,7 +538,16 @@ final class DaemonServer {
             case .update:
                 let req = try JSONDecoder().decode(UpdateRequest.self, from: request.payload)
                 try await engine.updateResources(req)
-                try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
+                // Return the container rather than an empty payload: the CLI
+                // needs its status to say whether the new limits are live or
+                // waiting for a restart, and a response that carries what
+                // changed is more use to any client than one that carries
+                // nothing. Older CLIs discarded this payload anyway.
+                if let updated = await engine.state.container(id: req.containerID) {
+                    try sendResponse(requestId: request.id, payload: updated, to: fd)
+                } else {
+                    try sendResponse(requestId: request.id, payload: EmptyPayload(), to: fd)
+                }
 
             case .setup:
                 try await performSetup(requestId: request.id, to: fd)
