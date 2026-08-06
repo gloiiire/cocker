@@ -400,8 +400,7 @@ final class DockerAPIServer {
             response = await handleContainerPrune()
 
         case ("POST", "images") where segments.count == 2 && segments[1] == "prune":
-            response = HTTPResponse(status: 200, headers: ["Content-Type": "application/json"],
-                                    body: Data(#"{"ImagesDeleted":[],"SpaceReclaimed":0}"#.utf8))
+            response = await handleImagePrune(req: req)
 
         // ── Image history ────────────────────────────────────────
         // Returns one history entry per layer for `docker history <img>` /
@@ -906,11 +905,74 @@ final class DockerAPIServer {
             }
             struct MemoryStats: Encodable { let usage: Int64; let limit: Int64 }
         }
-        return .json(StatsResponse(
-            id: id, read: ISO8601DateFormatter().string(from: Date()),
-            cpu_stats: .init(cpu_usage: .init(total_usage: 0, percpu_usage: [0]), system_cpu_usage: 0),
-            memory_stats: .init(usage: 0, limit: Int64(ProcessInfo.processInfo.physicalMemory))
-        ))
+        // This used to answer hardcoded zeros with a 200 OK: total_usage 0,
+        // system_cpu_usage 0, memory usage 0, limit = the *host's* physical
+        // memory. Any Docker-API client — Portainer, the JetBrains plugin,
+        // `docker stats -H unix://…` — showed every container at 0% CPU and
+        // 0 B forever. Same fabrication `top` was carrying, fixed the same
+        // way: ask the container.
+        //
+        // Docker's contract here is cumulative counters, not a percentage:
+        // clients take the delta between two calls themselves. /proc/stat is
+        // in jiffies (USER_HZ = 100 on Linux), so ×10ms gives nanoseconds.
+        let limitBytes: Int64 = await {
+            guard let c = await engine.state.container(id: id) else {
+                return Int64(ProcessInfo.processInfo.physicalMemory)
+            }
+            return Int64(c.memoryMB) * 1024 * 1024
+        }()
+
+        do {
+            var config = ExecConfig(containerID: id,
+                                    command: ["sh", "-c", "cat /proc/stat; cat /proc/meminfo"])
+            config.tty = false
+            var out = ""
+            for await event in try await engine.exec(config: config)
+            where event.stream == .stdout { out += event.data }
+
+            var perCPU: [Int64] = []
+            var busyJiffies: Int64 = 0
+            var totalJiffies: Int64 = 0
+            var memTotalKB: Int64 = 0
+            var memAvailKB: Int64 = 0
+
+            for line in out.split(separator: "\n") {
+                if line.hasPrefix("cpu") {
+                    let fields = line.split(separator: " ").dropFirst().compactMap { Int64($0) }
+                    guard fields.count >= 5 else { continue }
+                    let total = fields.reduce(0, &+)
+                    let idle = fields[3] &+ fields[4]     // idle + iowait
+                    let busy = total >= idle ? total - idle : 0
+                    if line.hasPrefix("cpu ") {
+                        busyJiffies = busy
+                        totalJiffies = total
+                    } else {
+                        perCPU.append(busy &* 10_000_000)
+                    }
+                } else if line.hasPrefix("MemTotal:") {
+                    memTotalKB = Int64(line.split(separator: " ").dropFirst().first ?? "") ?? 0
+                } else if line.hasPrefix("MemAvailable:") {
+                    memAvailKB = Int64(line.split(separator: " ").dropFirst().first ?? "") ?? 0
+                }
+            }
+            guard totalJiffies > 0 else {
+                return .error("could not read /proc/stat in container \(id)", status: 409)
+            }
+            let usedKB = memTotalKB > memAvailKB ? memTotalKB - memAvailKB : 0
+
+            return .json(StatsResponse(
+                id: id, read: ISO8601DateFormatter().string(from: Date()),
+                cpu_stats: .init(
+                    cpu_usage: .init(total_usage: busyJiffies &* 10_000_000,
+                                     percpu_usage: perCPU.isEmpty ? [busyJiffies &* 10_000_000] : perCPU),
+                    system_cpu_usage: totalJiffies &* 10_000_000),
+                memory_stats: .init(usage: usedKB &* 1024, limit: limitBytes)
+            ))
+        } catch let error as CockerError {
+            return .error(error.description, status: 409)
+        } catch {
+            return .error("\(error)", status: 500)
+        }
     }
 
     private func handleContainerWait(id: String) async -> HTTPResponse {
@@ -940,6 +1002,34 @@ final class DockerAPIServer {
             ContainersDeleted: result?.containersDeleted ?? [],
             SpaceReclaimed: Int64(result?.spaceReclaimed ?? 0)
         ))
+    }
+
+    /// `POST /images/prune` → really remove the unreferenced images.
+    ///
+    /// This used to answer a canned `{"ImagesDeleted":[],"SpaceReclaimed":0}`
+    /// with 200 OK, so `docker image prune` against cocker printed "Total
+    /// reclaimed space: 0B" and removed nothing. The implementation existed
+    /// and went unused — containers, networks and volumes prune all call the
+    /// engine; images was the one route that didn't.
+    private func handleImagePrune(req: HTTPRequest) async -> HTTPResponse {
+        struct ImagePruneResponse: Encodable {
+            struct Deleted: Encodable { let Deleted: String }
+            let ImagesDeleted: [Deleted]
+            let SpaceReclaimed: Int64
+        }
+        // docker sends `filters={"dangling":{"false":true}}` for `-a`.
+        let all = (req.query["filters"] ?? "").contains("\"false\"")
+        do {
+            let result = try await engine.imagePrune(all: all)
+            return .json(ImagePruneResponse(
+                ImagesDeleted: result.imagesDeleted.map { .init(Deleted: $0) },
+                SpaceReclaimed: Int64(result.spaceReclaimed)
+            ))
+        } catch let error as CockerError {
+            return .error(error.description, status: 409)
+        } catch {
+            return .error("\(error)", status: 500)
+        }
     }
 
     // MARK: - Archive handlers

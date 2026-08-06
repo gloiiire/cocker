@@ -180,6 +180,12 @@ const completion: Fig.Spec = {
       ],
     },
     {
+      name: "wait",
+      description: "Block until one or more containers stop, then print their exit codes",
+      args: { name: "container", isVariadic: true, generators: containerGenerator },
+      options: [helpOption],
+    },
+    {
       name: "stop",
       description: "Stop one or more running containers",
       args: { name: "container", isVariadic: true, generators: runningContainerGenerator },
@@ -497,8 +503,8 @@ const completion: Fig.Spec = {
           args: { name: "name" },
           options: [
             { name: ["-d"], description: "Driver (bridge|host|none|overlay)", args: { name: "driver", suggestions: ["bridge", "host", "none", "overlay"] } },
-            { name: "--subnet", description: "Subnet in CIDR notation", args: { name: "cidr" } },
-            { name: "--gateway", description: "Gateway IP", args: { name: "ip" } },
+            { name: "--subnet", description: "Not implemented: refused (exit 126)", args: { name: "cidr" } },
+            { name: "--gateway", description: "Not implemented: refused (exit 126)", args: { name: "ip" } },
             { name: "--label", description: "Metadata label", args: { name: "KEY=VALUE" }, isRepeatable: true },
             helpOption,
           ],

@@ -875,10 +875,18 @@ struct ComposeConfigCommand: AsyncParsableCommand {
     @Option(name: [.short, .customLong("file")], help: "Compose file path")
     var file: String = "cocker-compose.yml"
 
-    @Option(name: [.short, .customLong("project-name")], help: "Project name")
+    /// Never read: `config` resolves the file, substitutes ${VAR} and
+    /// prints. Every other compose subcommand feeds this into
+    /// `ProjectName.normalize`.
+    @Option(name: [.short, .customLong("project-name")],
+            help: "Not honoured: `config` only renders the file")
     var projectName: String?
 
     mutating func run() async throws {
+        if projectName != nil {
+            UX.IgnoredFlag.warn("--project-name",
+                "`config` renders the file as written; no project name is applied")
+        }
         let composePath = resolvePath(file)
         guard FileManager.default.fileExists(atPath: composePath) else {
             UX.Failure.emit(

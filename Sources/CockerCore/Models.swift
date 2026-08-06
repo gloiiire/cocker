@@ -287,6 +287,19 @@ public enum ContainerStatus: String, Codable, Sendable {
     case dead
 
     public var description: String { rawValue }
+
+    /// A VM exists for this container and its L2 switch port is already
+    /// wired. The port is keyed from `networkName` when the VM boots and is
+    /// never re-keyed, so anything that changes which network the container
+    /// is on has to wait for the next start.
+    ///
+    /// `.created` is not live: the record exists, the VM does not.
+    public var isLive: Bool {
+        switch self {
+        case .running, .paused, .restarting: return true
+        case .created, .stopped, .dead:      return false
+        }
+    }
 }
 
 public struct PortMapping: Codable, Sendable, Equatable, CustomStringConvertible {
