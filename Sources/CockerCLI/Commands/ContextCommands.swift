@@ -135,6 +135,7 @@ struct ContextRmCommand: AsyncParsableCommand {
     mutating func run() async throws {
         var store = ContextStore.load()
         var failed = false
+        var notFound = false
         for name in names {
             guard name != "default" else {
                 failed = true
@@ -145,12 +146,24 @@ struct ContextRmCommand: AsyncParsableCommand {
                 )
                 continue
             }
+            // Same shape as plugin rm: removeAll on a non-match is a no-op
+            // and the success line printed regardless, so removing a typo'd
+            // context reported success and exited 0.
+            let before = store.contexts.count
             store.contexts.removeAll { $0.name == name }
+            guard store.contexts.count != before else {
+                failed = true; notFound = true
+                UX.Failure.emit(headline: "No such context: \(name)")
+                continue
+            }
             if store.current == name { store.current = "default" }
             UX.printResult(.context, name, verb: .remove)
         }
         try store.save()
-        if failed { throw ExitCode.failure }
+        // `default` is a refusal to act (1); a name that isn't there is the
+        // charter's "no such object" (127). Both are failures, and the
+        // batch reports the first kind it hit — same rule as elsewhere.
+        if failed { throw ExitCode(notFound ? 127 : 1) }
     }
 }
 

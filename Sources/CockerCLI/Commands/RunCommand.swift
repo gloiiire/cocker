@@ -24,7 +24,7 @@ struct RunCommand: AsyncParsableCommand {
     var name: String?
 
     @Option(name: [.short, .customLong("publish")],
-            help: "Publish ports (host:container). TCP only — /udp mappings are not forwarded")
+            help: "Publish ports (host:container[/tcp|/udp])")
     var portSpecs: [String] = []
 
     @Option(name: [.short, .customLong("volume")], help: "Bind mount a volume (src:dst[:ro])")
@@ -62,7 +62,8 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customShort("u"), help: "Username or UID")
     var user: String?
 
-    @Option(name: .customLong("restart"), help: "Restart policy (no|always|on-failure|unless-stopped)")
+    @Option(name: .customLong("restart"),
+            help: "Restart policy (no|always|on-failure[:max]|unless-stopped)")
     var restart: String = "no"
 
     @Option(name: .customLong("cap-add"), help: "Add Linux capabilities")
@@ -144,17 +145,6 @@ struct RunCommand: AsyncParsableCommand {
         }
         config.rm = rm
         config.ports = try portSpecs.map { try PortMapping.parse($0) }
-        // cocker's forwarder relays TCP through /usr/bin/nc; there is no UDP
-        // relay. The mapping was accepted, shown by `ps` and `cocker port`,
-        // and silently dropped by PortForwarder with only a `debug` log —
-        // so a DNS container looked published and answered nobody.
-        let udp = config.ports.filter { $0.proto == .udp }
-        if !udp.isEmpty {
-            let list = udp.map { "\($0.hostPort):\($0.containerPort)/udp" }
-                          .joined(separator: ", ")
-            UX.IgnoredFlag.warn("-p \(list)",
-                "cocker forwards TCP only; nothing will listen on the host for these")
-        }
         config.volumes = try volumeSpecs.map { try VolumeMount.parse($0) }
         config.env = try parseEnv(env)
         config.labels = try parseKV(labels)
@@ -166,7 +156,12 @@ struct RunCommand: AsyncParsableCommand {
         config.hostname = hostname
         config.workdir = workdir
         config.user = user
-        config.restartPolicy = RestartPolicy(rawValue: restart) ?? .no
+        // `?? .no` used to swallow every value it didn't recognise —
+        // including the valid `on-failure:5` — so the container silently
+        // never restarted.
+        let restartSpec = try RestartPolicy.parse(restart)
+        config.restartPolicy = restartSpec.policy
+        config.restartMaxRetries = restartSpec.maxRetries
         config.capAdd = capAdd
         config.capDrop = capDrop
         config.privileged = privileged

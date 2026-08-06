@@ -64,6 +64,9 @@ public struct Container: Codable, Sendable, Identifiable {
     /// `--read-only`: remount the container root read-only just before the
     /// user command execs, once cocker-init has finished writing to it.
     public var readOnlyRootfs: Bool?
+    /// Retry ceiling from `--restart on-failure:<max>`. nil means the
+    /// engine's default. Optional so containers written before it decode.
+    public var restartMaxRetries: Int?
     public var privileged: Bool
     public var capAdd: [String]
     public var capDrop: [String]
@@ -193,6 +196,7 @@ public struct Container: Codable, Sendable, Identifiable {
         self.dnsSearch = try c.decodeIfPresent([String].self, forKey: .dnsSearch)
         self.tmpfsMounts = try c.decodeIfPresent([String].self, forKey: .tmpfsMounts)
         self.readOnlyRootfs = try c.decodeIfPresent(Bool.self, forKey: .readOnlyRootfs)
+        self.restartMaxRetries = try c.decodeIfPresent(Int.self, forKey: .restartMaxRetries)
         self.privileged = try c.decodeIfPresent(Bool.self, forKey: .privileged) ?? false
         self.capAdd = try c.decodeIfPresent([String].self, forKey: .capAdd) ?? []
         self.capDrop = try c.decodeIfPresent([String].self, forKey: .capDrop) ?? []
@@ -648,6 +652,8 @@ public struct RunConfig: Codable, Sendable {
     public var workdir: String?
     public var user: String?
     public var restartPolicy: RestartPolicy
+    /// Retry ceiling from `on-failure:<max>`; nil = engine default.
+    public var restartMaxRetries: Int?
     public var capAdd: [String]
     public var capDrop: [String]
     public var privileged: Bool
@@ -727,6 +733,39 @@ public enum RestartPolicy: String, Codable, Sendable {
     case always = "always"
     case onFailure = "on-failure"
     case unlessStopped = "unless-stopped"
+
+    /// Parse a `--restart` / compose `restart:` value, including docker's
+    /// `on-failure:<max>` form.
+    ///
+    /// Every call site used to be `RestartPolicy(rawValue: raw) ?? .no`.
+    /// `on-failure:5` is valid compose and valid docker, and there is no
+    /// such rawValue — so it became `.no` and the service never restarted,
+    /// silently. So did `--restart alwyas`. A policy that quietly becomes
+    /// "never restart" is the failure mode you find out about during an
+    /// outage.
+    ///
+    /// - Returns: the policy, and the retry ceiling if one was given.
+    /// - Throws: `invalidRestartPolicy` on anything unrecognised, rather
+    ///   than downgrading it.
+    public static func parse(_ raw: String) throws -> (policy: RestartPolicy, maxRetries: Int?) {
+        let value = raw.trimmingCharacters(in: .whitespaces)
+        if value.isEmpty { return (.no, nil) }
+
+        if let colon = value.firstIndex(of: ":") {
+            let head = String(value[value.startIndex..<colon])
+            let tail = String(value[value.index(after: colon)...])
+            // Only on-failure takes a count; `always:3` is not a thing.
+            guard head == RestartPolicy.onFailure.rawValue,
+                  let max = Int(tail), max >= 0 else {
+                throw CockerError.invalidRestartPolicy(raw)
+            }
+            return (.onFailure, max)
+        }
+        guard let policy = RestartPolicy(rawValue: value) else {
+            throw CockerError.invalidRestartPolicy(raw)
+        }
+        return (policy, nil)
+    }
 }
 
 // MARK: - Build Config
