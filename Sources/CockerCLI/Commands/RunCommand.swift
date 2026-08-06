@@ -23,7 +23,8 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customLong("name"), help: "Assign a name to the container")
     var name: String?
 
-    @Option(name: [.short, .customLong("publish")], help: "Publish ports (host:container)")
+    @Option(name: [.short, .customLong("publish")],
+            help: "Publish ports (host:container). TCP only — /udp mappings are not forwarded")
     var portSpecs: [String] = []
 
     @Option(name: [.short, .customLong("volume")], help: "Bind mount a volume (src:dst[:ro])")
@@ -76,22 +77,22 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customLong("env-file"), help: "Read environment variables from a file")
     var envFile: [String] = []
 
-    @Option(name: .customLong("add-host"), help: "Add an entry to /etc/hosts (host:ip)")
+    @Option(name: .customLong("add-host"), help: "Not honoured: /etc/hosts is written by cocker-init and this entry is not added")
     var addHosts: [String] = []
 
-    @Option(name: .customLong("dns"), help: "Custom DNS server")
+    @Option(name: .customLong("dns"), help: "Not honoured: resolv.conf is pinned to cocker's DNS proxy")
     var dns: [String] = []
 
-    @Option(name: .customLong("dns-search"), help: "Custom DNS search domain")
+    @Option(name: .customLong("dns-search"), help: "Not honoured: the search domain is always `cocker`")
     var dnsSearch: [String] = []
 
     @Option(name: .customLong("volumes-from"), help: "Mount volumes from another container")
     var volumesFrom: [String] = []
 
-    @Option(name: .customLong("tmpfs"), help: "Mount a tmpfs directory (e.g. /run:size=64m)")
+    @Option(name: .customLong("tmpfs"), help: "Not honoured: no tmpfs is mounted beyond the fixed /tmp and /etc overlays")
     var tmpfs: [String] = []
 
-    @Flag(name: .customLong("read-only"), help: "Mount root filesystem as read-only")
+    @Flag(name: .customLong("read-only"), help: "Not honoured: the root filesystem stays writable")
     var readOnly = false
 
     @Option(name: .customLong("health-cmd"), help: "Command to run to check health (CLI override)")
@@ -124,6 +125,29 @@ struct RunCommand: AsyncParsableCommand {
     var command: [String] = []
 
     mutating func run() async throws {
+        // Flags that reach RunConfig and are then read by nobody. Warned here
+        // rather than dropped in silence: `--read-only` in particular is a
+        // hardening flag, and a user who believes the root filesystem is
+        // unwritable makes different decisions than one who knows it is not.
+        if readOnly {
+            UX.IgnoredFlag.warn("--read-only", "the root filesystem stays writable")
+        }
+        if !dns.isEmpty {
+            UX.IgnoredFlag.warn("--dns",
+                "resolv.conf is pinned to cocker's DNS proxy on 127.0.0.1")
+        }
+        if !dnsSearch.isEmpty {
+            UX.IgnoredFlag.warn("--dns-search", "the search domain is always `cocker`")
+        }
+        if !addHosts.isEmpty {
+            UX.IgnoredFlag.warn("--add-host",
+                "/etc/hosts is written by cocker-init and gains no extra entry")
+        }
+        if !tmpfs.isEmpty {
+            UX.IgnoredFlag.warn("--tmpfs",
+                "no tmpfs is mounted beyond the fixed /tmp and /etc overlays")
+        }
+
         // `cocker run alpine -- sh -c '...'` : the POSIX terminator is a
         // separator, not argv[0]. Left in place it reached the guest and
         // cocker-init exited 127 with `execvp --`.
@@ -143,6 +167,17 @@ struct RunCommand: AsyncParsableCommand {
         }
         config.rm = rm
         config.ports = try portSpecs.map { try PortMapping.parse($0) }
+        // cocker's forwarder relays TCP through /usr/bin/nc; there is no UDP
+        // relay. The mapping was accepted, shown by `ps` and `cocker port`,
+        // and silently dropped by PortForwarder with only a `debug` log —
+        // so a DNS container looked published and answered nobody.
+        let udp = config.ports.filter { $0.proto == .udp }
+        if !udp.isEmpty {
+            let list = udp.map { "\($0.hostPort):\($0.containerPort)/udp" }
+                          .joined(separator: ", ")
+            UX.IgnoredFlag.warn("-p \(list)",
+                "cocker forwards TCP only; nothing will listen on the host for these")
+        }
         config.volumes = try volumeSpecs.map { try VolumeMount.parse($0) }
         config.env = try parseEnv(env)
         config.labels = try parseKV(labels)
@@ -206,7 +241,12 @@ struct RunCommand: AsyncParsableCommand {
             let name = config.name ?? String(result.containerID.prefix(12))
             var header = [" " + UX.TTY.paint("→ Running", .progress) + " " + UX.TTY.paint(name, .accent)]
             for p in config.ports {
-                header.append("   " + UX.TTY.paint("http://localhost:\(p.hostPort)", .accent))
+                // `localhost` is only where it actually answers when the bind
+                // is every-interface or loopback. Printing it for a mapping
+                // pinned to one LAN address sends the user to a closed port.
+                let host = (p.hostIP == "0.0.0.0" || p.hostIP == "127.0.0.1")
+                    ? "localhost" : p.hostIP
+                header.append("   " + UX.TTY.paint("http://\(host):\(p.hostPort)", .accent))
             }
             let cid = result.containerID
             // `-it` hands the terminal to the container, so the footer must

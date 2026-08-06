@@ -34,19 +34,27 @@ public actor PortForwarder {
         await stop(containerID: containerID)
         var procs: [Process] = []
         for port in mappings {
+            // No UDP relay exists — the forwarder pipes TCP through
+            // /usr/bin/nc. This was a `debug` line, invisible at the default
+            // level, while `ps` went on advertising `0.0.0.0:53->53/udp`.
+            // `warn` so an operator reading the log finds out why their DNS
+            // container answers nobody.
             guard port.proto == .tcp else {
-                CockerLog.shared.debug("portfwd", "skip \(port.hostPort)/\(port.proto.rawValue) (TCP only)")
+                CockerLog.shared.warn("portfwd",
+                    "host port \(port.hostPort)/\(port.proto.rawValue) is NOT forwarded — "
+                    + "cocker forwards TCP only")
                 continue
             }
             do {
                 let proc = try spawnForwarder(
+                    hostIP: port.hostIP,
                     hostPort: port.hostPort,
                     containerIP: containerIP,
                     containerPort: port.containerPort
                 )
                 procs.append(proc)
                 CockerLog.shared.info("portfwd",
-                    "0.0.0.0:\(port.hostPort) → \(containerIP):\(port.containerPort) " +
+                    "\(port.hostIP):\(port.hostPort) → \(containerIP):\(port.containerPort) " +
                     "(pid \(proc.processIdentifier), container \(String(containerID.prefix(12))))")
             } catch {
                 CockerLog.shared.error("portfwd", "error spawning forwarder for \(port.hostPort): \(error)")
@@ -87,9 +95,63 @@ public actor PortForwarder {
         processes.removeAll()
     }
 
+    // MARK: - Preflight
+
+    /// Refuse a mapping we cannot actually take, *before* the VM boots.
+    ///
+    /// `spawnForwarder` only proves the child process started. The `bind`
+    /// happens inside it, and failing there is an `exit(1)` nobody waits on —
+    /// so a host port already in use produced a running container whose
+    /// published port existed only in `ps`, `cocker port` and `inspect`, all
+    /// of which read back the requested config rather than an observed
+    /// listener. `run` exited 0. Docker refuses the run instead.
+    ///
+    /// Binds with the same `SO_REUSEADDR` the forwarder uses, so this accepts
+    /// exactly what the forwarder would accept — a stricter probe would
+    /// refuse ports sitting in `TIME_WAIT` that are genuinely usable.
+    ///
+    /// Not a lock: something can still take the port between this check and
+    /// the forwarder's own bind. It closes the window that actually bites —
+    /// a port held by a long-running process — and never widens it.
+    ///
+    /// UDP is skipped: those mappings are not forwarded at all today, which
+    /// is a separate lie with its own fix.
+    public nonisolated static func preflight(mappings: [PortMapping]) throws {
+        for m in mappings where m.proto == .tcp {
+            let sock = socket(AF_INET, SOCK_STREAM, 0)
+            // Out of descriptors is not evidence the port is taken. Let the
+            // run proceed rather than invent a reason to refuse it.
+            guard sock >= 0 else { continue }
+            defer { close(sock) }
+
+            var yes: Int32 = 1
+            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes,
+                       socklen_t(MemoryLayout<Int32>.size))
+
+            var addr = sockaddr_in()
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = m.hostPort.bigEndian
+            if m.hostIP == "0.0.0.0" || m.hostIP.isEmpty {
+                addr.sin_addr.s_addr = INADDR_ANY
+            } else {
+                inet_pton(AF_INET, m.hostIP, &addr.sin_addr)
+            }
+
+            let rc = withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    Darwin.bind(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard rc == 0 else {
+                throw CockerError.portAlreadyAllocated("\(m.hostIP):\(m.hostPort)")
+            }
+        }
+    }
+
     // MARK: - Spawn helper
 
     private func spawnForwarder(
+        hostIP: String,
         hostPort: UInt16,
         containerIP: String,
         containerPort: UInt16
@@ -101,7 +163,7 @@ public actor PortForwarder {
         let proc = Process()
         proc.executableURL = portFwdBinary
         proc.arguments = [
-            "--listen", "0.0.0.0:\(hostPort)",
+            "--listen", "\(hostIP):\(hostPort)",
             "--target", "\(containerIP):\(containerPort)",
         ]
         // Pipe stderr du forwarder dans celui du daemon (logs centralisés)

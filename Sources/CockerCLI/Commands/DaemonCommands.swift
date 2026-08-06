@@ -771,7 +771,27 @@ extension DaemonSetupCommand {
 struct DaemonClearLeasesCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "clear-leases",
-        abstract: "Truncate /var/db/dhcpd_leases (frees macOS vmnet's DHCP pool)"
+        abstract: "Truncate /var/db/dhcpd_leases (frees addresses held by other VMs)",
+        discussion: """
+        macOS records every address vmnet's bootpd hands out in
+        /var/db/dhcpd_leases and never expires the entries. The file is
+        root-owned, so clearing it needs sudo (or the LaunchDaemon helper).
+
+        This is NOT the remedy for a container that fails to boot. Since
+        1.1.0.0 containers assign their own eth0 address and take no lease,
+        so the pool's depth does not gate `cocker run`.
+
+        What it does still fix: cocker excludes leased addresses when it
+        picks one for a container, to avoid handing out an address some
+        other VM on this host already answers to. If that subnet fills up,
+        `cocker run` reports it has no free address left — and truncating
+        the file returns the ones held by VMs that no longer exist.
+
+        Be deliberate: the file cannot distinguish a dead VM's entry from a
+        live one, so clearing it while other VMs are running drops their
+        reservations too, and cocker may then pick an address already in
+        use. Stop them first, or remove some containers instead.
+        """
     )
 
     mutating func run() async throws {
@@ -850,22 +870,31 @@ struct DaemonClearLeasesCommand: AsyncParsableCommand {
 struct DaemonHelperInstallCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "helper-install",
-        abstract: "Install the lease-clearing LaunchDaemon (one sudo prompt)",
+        abstract: "Install the lease-clearing LaunchDaemon (DHCP path only, one sudo prompt)",
         discussion: """
-        macOS's vmnet bootpd caps `/var/db/dhcpd_leases` at ~256 entries.
-        Past that, new containers can't get an IP and `cocker run` produces
-        a half-broken container (port-forwarding stuck on 127.0.0.1).
+        NOT NEEDED ON THE DEFAULT PATH. Since 1.1.0.0 containers assign
+        their own eth0 address and never ask vmnet's bootpd for a lease,
+        so the ~256-entry cap on /var/db/dhcpd_leases gates nothing and
+        cockerd does not watch the pool. Installing this helper on a
+        default install grants a root job permanent residence to solve a
+        problem you do not have.
+
+        It still matters if you set `COCKER_STATIC_ETH0=0` in cockerd's
+        environment to go back to DHCP. On that path macOS's bootpd
+        refuses new leases past ~256 entries, containers can't get an IP,
+        and `cocker run` produces a half-broken container.
 
         This command installs a tiny LaunchDaemon at
         /Library/LaunchDaemons/com.cocker.leases-helper.plist that runs
-        as root and watches /var/run/cocker-clear-leases. Whenever cockerd
-        sees the lease count climb above 200, it touches the trigger file
-        and the helper truncates the lease pool — no sudo prompt, no
-        manual intervention. The helper persists across reboots and
-        cockerd restarts.
+        as root and watches /var/run/cocker-clear-leases. On the DHCP
+        path, whenever cockerd sees the lease count climb above 200 it
+        touches the trigger file and the helper truncates the pool — no
+        sudo prompt, no manual intervention. The helper persists across
+        reboots and cockerd restarts.
 
-        You only need to run this command ONCE per machine. After that,
-        the issue is solved permanently.
+        Remove it with:
+          sudo launchctl bootout system/com.cocker.leases-helper
+          sudo rm /Library/LaunchDaemons/com.cocker.leases-helper.plist
 
         The one-shot alternative if you don't want to install the helper :
         `cocker daemon clear-leases` (prompts for sudo each call).
@@ -877,6 +906,17 @@ struct DaemonHelperInstallCommand: AsyncParsableCommand {
     )
 
     mutating func run() async throws {
+        // Say it before asking for sudo, not after. On the default path this
+        // helper solves nothing, and a root job that outlives every cocker
+        // process is not something to grant on a stale recommendation — the
+        // old `daemon status` line sent people here for exactly that reason.
+        if CockerEnv.staticETH0Enabled {
+            print(UX.TTY.paint(
+                "Note: containers assign their own eth0 address, so no DHCP lease "
+                + "pool is in use and this helper is not needed. It only applies "
+                + "with COCKER_STATIC_ETH0=0 in cockerd's environment. Installing "
+                + "anyway.", .warn))
+        }
         let plistPath = "/Library/LaunchDaemons/com.cocker.leases-helper.plist"
         let plist = """
         <?xml version="1.0" encoding="UTF-8"?>
@@ -1205,13 +1245,15 @@ struct DaemonStartCommand: AsyncParsableCommand {
         TLS handshakes complete in milliseconds for the life of the
         process.
 
-        LEASE-POOL HELPER HINT
+        DHCP LEASE POOL
 
-        On a fresh machine the daemon logs an INFO once at startup
-        reminding you to run `cocker daemon helper-install` for
-        automatic recovery from macOS's 256-IP DHCP cap (see
-        `cocker daemon helper-install --help`). One sudo prompt, then
-        the daemon never asks again.
+        Not used on the default path. Containers assign their own
+        eth0 address since 1.1.0.0, so macOS's 256-IP cap gates
+        nothing and the daemon does not watch the pool — it logs
+        that once at startup instead. `cocker daemon helper-install`
+        and `cocker daemon clear-leases` only matter if you set
+        `COCKER_STATIC_ETH0=0` in cockerd's environment to go back
+        to DHCP.
 
         Use `cocker daemon stop` to terminate, `cocker daemon status`
         to inspect state, `cocker daemon logs -f` to tail the log.
@@ -1542,6 +1584,23 @@ struct DaemonStatusCommand: AsyncParsableCommand {
 
         // Lease pool + helper status (vmnet bootpd caps at ~256). Operator
         // spots saturation without having to tail the daemon log.
+        //
+        // Only when containers actually draw from that pool. Since 1.1.0.0
+        // they assign their own eth0 address, cockerd stops watching the pool
+        // (main.swift logs exactly that at boot), and every lease-based gate
+        // in the engine returns early — so the count measures other software's
+        // VMs, not cocker's headroom. Printing it here anyway claimed a
+        // capacity limit that does not exist, and the helper line advertised
+        // an auto-clear that provably never fires. At >240 it would have gone
+        // red and sent the operator to install a root LaunchDaemon to fix a
+        // problem they do not have.
+        guard !CockerEnv.staticETH0Enabled else {
+            print("   " + UX.TTY.paint("eth0    :", .dim) + " "
+                  + UX.TTY.paint("assigned by cocker", .success)
+                  + " — the macOS DHCP lease pool is unused")
+            return
+        }
+
         let leaseFile = "/var/db/dhcpd_leases"
         if let leases = try? String(contentsOfFile: leaseFile, encoding: .utf8) {
             let count = leases.components(separatedBy: "ip_address=").count - 1
