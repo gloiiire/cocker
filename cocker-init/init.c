@@ -731,20 +731,36 @@ int main(int argc, char **argv) {
     mount_qemu_share();
     qemu_register_binfmt(cmdline);
 
-    /* Spawn the in-VM vsock listener that serves `cocker exec` requests.
-     * Runs in a separate subprocess so it survives independently of the
-     * main container command. */
-    exec_listener_spawn();
-
     /* Load the container spec (argv + env + workdir + user + caps). MUST
-     * happen before health_poll_spawn — the worker forks off this process
+     * happen before BOTH workers are spawned — each forks off this process
      * and inherits a copy of the user_spec / cap arrays. Inverting the
      * order leaves the worker with empty defaults and Dockerfile USER
-     * silently goes ignored for healthchecks. */
+     * silently goes ignored for healthchecks.
+     *
+     * exec_listener_spawn() used to sit one line ABOVE this, which is
+     * exactly the trap this comment describes: every `cocker exec` session
+     * inherited empty cap arrays, so --privileged and --cap-drop were
+     * invisible to it. */
     char *child_argv[128];
     int argc_count = spec_load(child_argv, 128);
     if (argc_count == 0 || child_argv[0] == NULL)
         die("empty command in /cocker-spec");
+
+    /* Spawn the in-VM vsock listener that serves `cocker exec` requests.
+     * Runs in a separate subprocess so it survives independently of the
+     * main container command.
+     *
+     * Immediately after spec_load, and no later. After, so the worker
+     * inherits the cap arrays — that is what makes --privileged and
+     * --cap-drop visible to `cocker exec`. No later, because every syscall
+     * between boot and this line widens the window in which `cocker exec`
+     * gets connection-refused: putting the filesystem setup below in front
+     * of it took 12-exec-after-start from green to 0/20.
+     *
+     * Ordering against that setup doesn't matter for correctness anyway —
+     * workers are forked per request, so they see whatever the filesystem
+     * looks like when the request arrives, not when the listener started. */
+    exec_listener_spawn();
 
     /* The v7 spec trailers land here, after spec_load — which is the
      * first moment they exist. resolv.conf was pinned earlier in boot,

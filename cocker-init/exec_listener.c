@@ -483,6 +483,28 @@ static void handle_one(int client_fd) {
              * read had drained the request line. Adding STDIN_FILENO
              * here lets the child block on more input until the host
              * shutdown(SHUT_WR)'s the socket. */
+            /* Capability policy BEFORE the dup2 below.
+             *
+             * Same policy as the container's main process — this was
+             * missing, so `cocker exec` handed out the FULL kernel bounding
+             * set while the main process ran with docker's restricted
+             * default (a80425fb vs 1ffffffffff, measured on one container).
+             *
+             * Before the dup2 because caps_apply logs, and once client_fd is
+             * stdout that log lands in the caller's stream: `cocker exec c
+             * echo ping` returned "[cocker-init] caps: bounded set narrowed
+             * (…)ping" instead of "ping" — a broken contract for every
+             * script that parses exec output, and caught only by merging
+             * this branch with the others and running 12-exec-after-start.
+             *
+             * Still before setgid/setuid, as init.c orders it: with
+             * SECBIT_NOROOT off root keeps its capabilities across a uid
+             * change, so narrowing the bounding set first is what bounds
+             * whatever survives. */
+            caps_apply(privileged_spec,
+                       cap_add_spec, cap_add_spec_len,
+                       cap_drop_spec, cap_drop_spec_len);
+
             dup2(client_fd, STDIN_FILENO);
             dup2(client_fd, STDOUT_FILENO);
             dup2(client_fd, STDERR_FILENO);
@@ -495,6 +517,7 @@ static void handle_one(int client_fd) {
             fprintf(stderr, "[cocker-init] chdir %s: %s\n", workdir, strerror(errno));
             _exit(126);
         }
+
         if (user[0]) {
             unsigned int uid = 0, gid = 0;
             if (spec_resolve_user(user, &uid, &gid) != 0
