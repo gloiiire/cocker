@@ -235,7 +235,9 @@ struct NetworkConnectCommand: AsyncParsableCommand {
 struct NetworkDisconnectCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "disconnect", abstract: "Disconnect a container from a network")
 
-    @Flag(name: [.short, .customLong("force")], help: "Force disconnect")
+    /// The payload has no force field; this only picks a hint string.
+    @Flag(name: [.short, .customLong("force")],
+          help: "Not honoured: the disconnect is the same either way")
     var force = false
 
     @Argument(help: "Network name")
