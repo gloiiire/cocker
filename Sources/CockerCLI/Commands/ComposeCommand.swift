@@ -822,12 +822,23 @@ struct ComposePauseCommand: AsyncParsableCommand {
             (svcNames == nil || svcNames!.contains(c.labels["com.cocker.service"] ?? ""))
         }
 
+        let failures = FailureCode()
         for c in toProcess {
             let payload = ContainerIDRequest(id: c.id)
             let req = try IPCRequest(type: .pause, payload: payload)
-            _ = try? await client.send(req)
-            print(c.name)
+            // Printing the name is docker-compose's success
+            // convention, and `try?` made a container that failed to
+            // pause print exactly like one that succeeded, exit 0.
+            do {
+                _ = try await client.send(req)
+                print(c.name)
+            } catch let error as CockerError {
+                failures.record(error)
+                UX.Failure.emit(headline: "Cannot pause \(c.name)",
+                                reason: error.description)
+            }
         }
+        try failures.throwIfFailed()
     }
 }
 
@@ -860,12 +871,23 @@ struct ComposeUnpauseCommand: AsyncParsableCommand {
             (svcNames == nil || svcNames!.contains(c.labels["com.cocker.service"] ?? ""))
         }
 
+        let failures = FailureCode()
         for c in toProcess {
             let payload = ContainerIDRequest(id: c.id)
             let req = try IPCRequest(type: .unpause, payload: payload)
-            _ = try? await client.send(req)
-            print(c.name)
+            // Printing the name is docker-compose's success
+            // convention, and `try?` made a container that failed to
+            // unpause print exactly like one that succeeded, exit 0.
+            do {
+                _ = try await client.send(req)
+                print(c.name)
+            } catch let error as CockerError {
+                failures.record(error)
+                UX.Failure.emit(headline: "Cannot unpause \(c.name)",
+                                reason: error.description)
+            }
         }
+        try failures.throwIfFailed()
     }
 }
 
@@ -929,12 +951,23 @@ struct ComposeKillCommand: AsyncParsableCommand {
             (services.isEmpty || services.contains(c.labels["com.cocker.service"] ?? ""))
         }
 
+        let failures = FailureCode()
         for c in toKill {
             let payload = ContainerIDRequest(id: c.id, signal: signal)
             let req = try IPCRequest(type: .kill, payload: payload)
-            _ = try? await client.send(req)
-            print(c.name)
+            // Printing the name is docker-compose's success
+            // convention, and `try?` made a container that failed to
+            // kill print exactly like one that succeeded, exit 0.
+            do {
+                _ = try await client.send(req)
+                print(c.name)
+            } catch let error as CockerError {
+                failures.record(error)
+                UX.Failure.emit(headline: "Cannot kill \(c.name)",
+                                reason: error.description)
+            }
         }
+        try failures.throwIfFailed()
     }
 }
 
