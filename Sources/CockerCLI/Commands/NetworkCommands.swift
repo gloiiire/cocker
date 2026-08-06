@@ -61,10 +61,16 @@ struct NetworkCreateCommand: AsyncParsableCommand {
     @Option(name: .customShort("d"), help: "Driver (bridge|host|none)")
     var driver: String = "bridge"
 
-    @Option(name: .customLong("subnet"), help: "Subnet in CIDR format (e.g. 172.20.0.0/16)")
+    /// The runtime refuses this with exit 126. The help string described it
+    /// as an ordinary option, so `--help` and the generated man page
+    /// promised something the command rejects — the exact shape 1.0
+    /// commitment #1 forbids, in the direction the code had already fixed.
+    @Option(name: .customLong("subnet"),
+            help: "Not implemented: refused. Networks isolate, but take no custom range yet")
     var subnet: String?
 
-    @Option(name: .customLong("gateway"), help: "IPv4 or IPv6 gateway")
+    @Option(name: .customLong("gateway"),
+            help: "Not implemented: refused, same as --subnet")
     var gateway: String?
 
     @Option(name: .customLong("label"), help: "Set metadata on a network")
