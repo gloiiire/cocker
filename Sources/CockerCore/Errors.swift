@@ -53,6 +53,10 @@ public enum CockerError: Error, CustomStringConvertible {
     /// without it every remote failure collapsed to a plain 1.
     case daemon(String, Int32? = nil)
 
+    /// A `--restart` / compose `restart:` value we don't understand.
+    /// Refused rather than silently downgraded to "never restart".
+    case invalidRestartPolicy(String)
+
     // Config errors
     case invalidPortMapping(String)
     case invalidVolumeSpec(String)
@@ -110,6 +114,7 @@ public enum CockerError: Error, CustomStringConvertible {
         case .requestFailed(let msg): return "Request failed: \(msg)"
         case .responseDecodingFailed(let msg): return "Response decoding failed: \(msg)"
         case .daemon(let msg, _): return msg
+        case .invalidRestartPolicy(let s): return "Invalid restart policy: \(s)"
         case .invalidPortMapping(let s): return "Invalid port mapping: \(s) (expected format: host:container)"
         case .invalidVolumeSpec(let s): return "Invalid volume spec: \(s) (expected format: source:dest[:ro])"
         case .invalidEnvironmentVar(let s): return "Invalid environment variable: \(s)"
@@ -146,6 +151,10 @@ public enum CockerError: Error, CustomStringConvertible {
             return ("Failed to pull \(ref)", reason, nil)
         case .permissionDenied(let op):
             return ("Permission denied", op, nil)
+        case .invalidRestartPolicy(let s):
+            return ("Invalid restart policy: \(s)", nil,
+                    "expected `no`, `always`, `unless-stopped`, `on-failure` "
+                    + "or `on-failure:<max>`")
         case .invalidPortMapping(let s):
             return ("Invalid port mapping: \(s)", nil, "expected `host:container`")
         case .invalidVolumeSpec(let s):

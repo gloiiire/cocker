@@ -61,7 +61,8 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customShort("u"), help: "Username or UID")
     var user: String?
 
-    @Option(name: .customLong("restart"), help: "Restart policy (no|always|on-failure|unless-stopped)")
+    @Option(name: .customLong("restart"),
+            help: "Restart policy (no|always|on-failure[:max]|unless-stopped)")
     var restart: String = "no"
 
     @Option(name: .customLong("cap-add"), help: "Add Linux capabilities")
@@ -154,7 +155,12 @@ struct RunCommand: AsyncParsableCommand {
         config.hostname = hostname
         config.workdir = workdir
         config.user = user
-        config.restartPolicy = RestartPolicy(rawValue: restart) ?? .no
+        // `?? .no` used to swallow every value it didn't recognise —
+        // including the valid `on-failure:5` — so the container silently
+        // never restarted.
+        let restartSpec = try RestartPolicy.parse(restart)
+        config.restartPolicy = restartSpec.policy
+        config.restartMaxRetries = restartSpec.maxRetries
         config.capAdd = capAdd
         config.capDrop = capDrop
         config.privileged = privileged
