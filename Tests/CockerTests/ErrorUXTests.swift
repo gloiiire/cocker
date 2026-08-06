@@ -30,7 +30,12 @@ struct CockerErrorPresentationTests {
         #expect(CockerError.imagePullFailed("alpine", "no route").presentation.headline == "Failed to pull alpine")
         #expect(CockerError.imagePullFailed("alpine", "no route").presentation.reason == "no route")
         #expect(CockerError.permissionDenied("/etc").presentation.headline == "Permission denied")
-        #expect(CockerError.invalidPortMapping("80").presentation.hint == "expected `host:container`")
+        // The hint now names the `IP:host:container` form too — a bind
+        // address is honoured rather than dropped, so a typo in it is a
+        // refusal the user has to be able to act on.
+        let portHint = CockerError.invalidPortMapping("80").presentation.hint
+        #expect(portHint?.contains("expected `host:container`") == true)
+        #expect(portHint?.contains("127.0.0.1:8080:80") == true)
         #expect(CockerError.invalidVolumeSpec("a").presentation.hint == "expected `source:dest[:ro]`")
     }
 

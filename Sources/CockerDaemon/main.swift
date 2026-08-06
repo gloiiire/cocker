@@ -445,9 +445,17 @@ func main() async {
             "SIGHUP — rotating cockerd.log (live log-level swap not supported ; " +
             "current level=\(currentLevel.label), restart cockerd to change it)")
         try? LogRotator.rotate(file: logFile, keep: 5)
-        let pool = ContainerEngine.leasePoolCount()
-        let helper = ContainerEngine.leasePoolHelperInstalled() ? "yes" : "no"
-        log.info("vmnet", "lease pool=\(pool)/256, helper=\(helper)")
+        // Same guard as the watchdog above: with self-assigned eth0 addresses
+        // the pool depth is somebody else's number, and an operator who asked
+        // for an observability ping deserves a fact about cocker, not a
+        // host-wide counter that cocker neither fills nor drains.
+        if ContainerEngine.staticNATEnabled {
+            log.info("vmnet", "eth0 addresses are assigned by cocker — no DHCP lease pool in use")
+        } else {
+            let pool = ContainerEngine.leasePoolCount()
+            let helper = ContainerEngine.leasePoolHelperInstalled() ? "yes" : "no"
+            log.info("vmnet", "lease pool=\(pool)/256, helper=\(helper)")
+        }
     }
 
     sigintSrc.resume()
