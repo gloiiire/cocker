@@ -38,6 +38,7 @@ Each script exits 0 on success, non-zero on failure, and prints a one-line summa
 | `11-exit-codes.sh` | cocker reports failure when the container fails |
 | `12-exec-after-start.sh` | `exec` works immediately after start, and repeatedly |
 | `13-compose-override-and-exec-env.sh` | compose override files are merged, and `exec` sees the container's env |
+| `14-exec-capabilities.sh` | `cocker exec` runs under the container's capability policy, not the full kernel set |
 
 ## What's missing (and why)
 
