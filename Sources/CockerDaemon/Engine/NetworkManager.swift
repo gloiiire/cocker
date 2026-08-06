@@ -99,21 +99,94 @@ actor NetworkManager {
         try await store.removeNetwork(id: net.id)
     }
 
+    /// Move a container onto a network, for real.
+    ///
+    /// This used to append the caller's string to a JSON array and stop
+    /// there. It never touched `container.networkName` — the field
+    /// `VMRuntime` reads to key the container's L2 switch port at boot, and
+    /// which is never re-keyed afterwards. `L2Switch` drops frames between
+    /// ports on different networks, so `network connect` printed
+    /// "✓ Connected" while the container stayed exactly where it was.
+    /// Measured: a container on `bridge` still could not reach a container on
+    /// `probenet` after connecting to it.
+    ///
+    /// Note this *moves* rather than adds. A container has one switch port,
+    /// so it is on one network — unlike docker, where connect is additive.
     func connect(containerID: String, networkID: String) async throws {
-        guard var net = await store.network(id: networkID) else {
+        guard let net = await store.network(id: networkID) else {
             throw CockerError.networkNotFound(networkID)
         }
-        if !net.containers.contains(containerID) {
-            net.containers.append(containerID)
-            try await store.store(network: net)
+        guard let container = await store.container(id: containerID) else {
+            throw CockerError.containerNotFound(containerID)
+        }
+        guard !container.status.isLive else {
+            throw CockerError.containerMustBeStopped(container.name, "change the network of")
+        }
+
+        let canonical = container.id
+        let previous = container.networkName
+        guard previous != net.name else { return }
+
+        try await store.updateContainer(id: canonical) { $0.networkName = net.name }
+        try await addMembership(canonical, to: net.id)
+        // Leave the network it was on, so the two lists cannot disagree about
+        // where the container is.
+        if let previous, let old = await store.network(id: previous) {
+            try await removeMembership(canonical, from: old.id)
         }
     }
 
+    /// Take a container off a network, back to the default bridge.
     func disconnect(containerID: String, networkID: String) async throws {
-        guard var net = await store.network(id: networkID) else {
+        guard let net = await store.network(id: networkID) else {
             throw CockerError.networkNotFound(networkID)
         }
-        net.containers.removeAll { $0 == containerID }
+        guard let container = await store.container(id: containerID) else {
+            throw CockerError.containerNotFound(containerID)
+        }
+        guard !container.status.isLive else {
+            throw CockerError.containerMustBeStopped(container.name, "change the network of")
+        }
+
+        let canonical = container.id
+        try await removeMembership(canonical, from: net.id)
+        if container.networkName == net.name {
+            try await store.updateContainer(id: canonical) { $0.networkName = "bridge" }
+            try await addMembership(canonical, to: "bridge")
+        }
+    }
+
+    /// Record membership at creation time, when the switch port is being
+    /// wired with this network right now.
+    ///
+    /// The create path used to call `connect` with `try?`. That swallowed
+    /// every failure, and now that `connect` refuses a live container it
+    /// would swallow this one too — so a container started with
+    /// `--network foo` never appeared in `network inspect foo`, which is
+    /// exactly what we measured before the fix.
+    func recordMembershipAtCreate(containerID: String, networkID: String) async throws {
+        try await addMembership(containerID, to: networkID)
+    }
+
+    /// Membership is keyed by canonical container id, always.
+    ///
+    /// It used to store whatever string the caller typed, so `run --network`
+    /// recorded an id while `network connect` recorded a name, and the same
+    /// container appeared twice under two spellings — `["ceb5d2a652e6",
+    /// "netB"]`. `disconnect` by name then matched nothing, removed nothing,
+    /// and reported success.
+    private func addMembership(_ canonicalID: String, to networkID: String) async throws {
+        guard var net = await store.network(id: networkID) else { return }
+        guard !net.containers.contains(canonicalID) else { return }
+        net.containers.append(canonicalID)
+        try await store.store(network: net)
+    }
+
+    private func removeMembership(_ canonicalID: String, from networkID: String) async throws {
+        guard var net = await store.network(id: networkID) else { return }
+        let before = net.containers.count
+        net.containers.removeAll { $0 == canonicalID }
+        guard net.containers.count != before else { return }
         try await store.store(network: net)
     }
 
@@ -257,7 +330,7 @@ actor NetworkManager {
         // for outbound traffic. For inbound (host -> container), we'd set up pf rules.
         // This is a simplified implementation that logs the intent.
         for port in ports {
-            print("[network] Port forward: 0.0.0.0:\(port.hostPort) -> container:\(port.containerPort)/\(port.proto.rawValue)")
+            print("[network] Port forward: \(port.hostIP):\(port.hostPort) -> container:\(port.containerPort)/\(port.proto.rawValue)")
         }
     }
 
