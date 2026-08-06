@@ -34,8 +34,15 @@ public actor PortForwarder {
         await stop(containerID: containerID)
         var procs: [Process] = []
         for port in mappings {
+            // No UDP relay exists — the forwarder pipes TCP through
+            // /usr/bin/nc. This was a `debug` line, invisible at the default
+            // level, while `ps` went on advertising `0.0.0.0:53->53/udp`.
+            // `warn` so an operator reading the log finds out why their DNS
+            // container answers nobody.
             guard port.proto == .tcp else {
-                CockerLog.shared.debug("portfwd", "skip \(port.hostPort)/\(port.proto.rawValue) (TCP only)")
+                CockerLog.shared.warn("portfwd",
+                    "host port \(port.hostPort)/\(port.proto.rawValue) is NOT forwarded — "
+                    + "cocker forwards TCP only")
                 continue
             }
             do {
