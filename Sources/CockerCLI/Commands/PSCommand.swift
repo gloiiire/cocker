@@ -353,6 +353,44 @@ struct StatsCommand: AsyncParsableCommand {
         } while !noStream
     }
 
+    /// Parse the two /proc/stat snapshots out of one probe's output and
+    /// turn them into a percentage. Returns "--" when the sample can't
+    /// support an answer rather than inventing one.
+    static func cpuPercent(from output: String) -> String {
+        guard let marker = output.range(of: "__STAT2__") else { return "--" }
+        let first = String(output[output.startIndex..<marker.lowerBound])
+        let second = String(output[marker.upperBound...])
+
+        // `cpu  <user> <nice> <system> <idle> <iowait> …` — the aggregate
+        // line, distinguished from the per-core `cpu0`/`cpu1` lines by the
+        // double space the kernel writes after it.
+        func aggregate(_ text: String) -> (total: UInt64, idle: UInt64)? {
+            for line in text.split(separator: "\n") where line.hasPrefix("cpu ") {
+                let fields = line.split(separator: " ").dropFirst().compactMap { UInt64($0) }
+                guard fields.count >= 5 else { return nil }
+                let total = fields.reduce(0, &+)
+                let idle = fields[3] &+ fields[4]   // idle + iowait
+                return (total, idle)
+            }
+            return nil
+        }
+        func coreCount(_ text: String) -> Int {
+            let n = text.split(separator: "\n").filter {
+                $0.hasPrefix("cpu") && !$0.hasPrefix("cpu ")
+            }.count
+            return max(n, 1)
+        }
+
+        guard let a = aggregate(first), let b = aggregate(second),
+              b.total > a.total else { return "--" }
+
+        let totalDelta = b.total - a.total
+        let idleDelta = b.idle >= a.idle ? b.idle - a.idle : 0
+        let busy = totalDelta >= idleDelta ? totalDelta - idleDelta : 0
+        let pct = Double(busy) / Double(totalDelta) * 100 * Double(coreCount(second))
+        return String(format: "%.2f%%", pct)
+    }
+
     private struct StatsSnapshot {
         let cpuPct: String
         let memUsedFmt: String
@@ -369,7 +407,14 @@ struct StatsCommand: AsyncParsableCommand {
         let configuredBytes = configuredLimit * 1024 * 1024
         // Single exec that emits both files separated by a magic marker so
         // we can disentangle them without two round-trips.
-        let argv = ["sh", "-c", "cat /proc/meminfo; echo __STAT__; cat /proc/stat"]
+        // Two /proc/stat reads a fifth of a second apart, in one round-trip.
+        // CPU time in /proc/stat is cumulative since boot, so a single read
+        // says nothing about *now* — which is why the column used to be a
+        // permanent "--". Sampling both ends inside the guest keeps this to
+        // one exec and makes the first frame as correct as the hundredth.
+        let argv = ["sh", "-c",
+                    "cat /proc/meminfo; echo __STAT__; cat /proc/stat; "
+                    + "sleep 0.2; echo __STAT2__; cat /proc/stat"]
         let config = ExecConfig(containerID: containerID, command: argv)
         let request = try? IPCRequest(type: .exec, payload: ExecRequest(config: config))
         // Buffer behind a reference type so the `@Sendable` streaming
@@ -410,10 +455,21 @@ struct StatsCommand: AsyncParsableCommand {
         } else {
             memPct = "--"
         }
-        // CPU%: aggregate of all cores' non-idle ticks since boot. Without
-        // a previous sample we can't compute a delta-based percentage on
-        // the very first frame ; show "--" to signal "warming up".
-        let cpuPct = "--"
+        // CPU%: the share of the interval the container's vCPUs spent doing
+        // something. /proc/stat's `cpu` line is cumulative jiffies since
+        // boot, so the figure comes from the delta between the two samples:
+        //
+        //     busy = (total₂ − total₁) − (idle₂ − idle₁)
+        //     %    = busy / (total₂ − total₁) × 100 × ncpu
+        //
+        // idle covers `idle` + `iowait` — a core waiting on IO is not
+        // running anything. Scaling by ncpu matches docker, where a
+        // container saturating 4 cores reads 400%.
+        //
+        // "--" is kept for the cases where it is honest: no second sample
+        // (the image has no `sleep`), or an interval so short the two reads
+        // land on the same jiffy.
+        let cpuPct = Self.cpuPercent(from: output)
         return StatsSnapshot(
             cpuPct: cpuPct,
             memUsedFmt: formatBytes(memUsedBytes),
@@ -459,11 +515,11 @@ struct PortCommand: AsyncParsableCommand {
                 throw ExitCode.failure
             }
             for m in matches {
-                print("0.0.0.0:\(m.hostPort)")
+                print("\(m.hostIP):\(m.hostPort)")
             }
         } else {
             for m in c.ports {
-                print("\(m.containerPort)/\(m.proto.rawValue) -> 0.0.0.0:\(m.hostPort)")
+                print("\(m.containerPort)/\(m.proto.rawValue) -> \(m.hostIP):\(m.hostPort)")
             }
         }
     }

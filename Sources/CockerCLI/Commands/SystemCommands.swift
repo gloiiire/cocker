@@ -248,13 +248,21 @@ struct SystemDfCommand: AsyncParsableCommand {
 struct SystemEventsCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(commandName: "events", abstract: "Get real-time events from the server")
 
-    @Option(name: .customLong("since"), help: "Show events since timestamp")
+    /// Never read. The request sent is an `EmptyPayload`, so only live
+    /// events arrive — the sibling `--filter` is fully implemented, which
+    /// is what made the omission easy to miss.
+    @Option(name: .customLong("since"),
+            help: "Not honoured: only events from now on are streamed")
     var since: String?
 
     @Option(name: .customLong("filter"), help: "Filter events")
     var filter: [String] = []
 
     mutating func run() async throws {
+        if since != nil {
+            UX.IgnoredFlag.warn("--since",
+                "there is no event history to replay; streaming from now on")
+        }
         let client = IPCClient()
         let request = try IPCRequest(type: .events, payload: EmptyPayload())
 

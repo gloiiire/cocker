@@ -100,11 +100,56 @@ struct ComposeCompatibilityTests {
         #expect(mapped == [PortMapping(hostPort: 53, containerPort: 53, proto: .udp)])
     }
 
-    @Test func acceptsAndIgnoresAHostBindAddress() throws {
-        // cocker's forwarder binds all interfaces; dropping the mapping over
-        // an unsupported bind address would be worse than binding it wider.
+    /// This test used to assert the opposite — that the bind address was
+    /// parsed and dropped, on the reasoning that binding wider beat refusing.
+    /// Measured consequence: `-p 127.0.0.1:18082:80` left `cocker-portfwd`
+    /// listening on `*:18082`, publishing on the LAN a port the user had
+    /// deliberately confined to their machine.
+    @Test func honoursAHostBindAddress() throws {
         #expect(try PortMapping.parseSpec("127.0.0.1:8080:80")
-                == [PortMapping(hostPort: 8080, containerPort: 80)])
+                == [PortMapping(hostPort: 8080, containerPort: 80, hostIP: "127.0.0.1")])
+    }
+
+    /// `:8080:80` is docker's way of spelling "every interface" explicitly.
+    @Test func anEmptyBindAddressMeansEveryInterface() throws {
+        #expect(try PortMapping.parseSpec(":8080:80")
+                == [PortMapping(hostPort: 8080, containerPort: 80, hostIP: "0.0.0.0")])
+    }
+
+    @Test func aBindAddressWithoutOneDefaultsToEveryInterface() throws {
+        #expect(try PortMapping.parseSpec("8080:80").first?.hostIP == "0.0.0.0")
+        #expect(try PortMapping.parseSpec("3000").first?.hostIP == "0.0.0.0")
+    }
+
+    /// A hostname would have to be resolved, and resolving at parse time turns
+    /// a typo into a bind on whatever that name happens to point at. Refuse.
+    @Test func rejectsABindAddressThatIsNotALiteralIPv4() {
+        #expect(throws: CockerError.self) { try PortMapping.parseSpec("localhost:8080:80") }
+        #expect(throws: CockerError.self) { try PortMapping.parseSpec("999.1.1.1:8080:80") }
+        #expect(throws: CockerError.self) { try PortMapping.parseSpec("nope:8080:80") }
+    }
+
+    @Test func theBindAddressReachesEveryMappingInARange() throws {
+        let mapped = try PortMapping.parseSpec("127.0.0.1:8000-8002:9000-9002")
+        #expect(mapped.count == 3)
+        #expect(mapped.allSatisfy { $0.hostIP == "127.0.0.1" })
+    }
+
+    @Test func theDescriptionShowsTheRealBindAddress() {
+        #expect(PortMapping(hostPort: 8080, containerPort: 80, hostIP: "127.0.0.1").description
+                == "127.0.0.1:8080->80/tcp")
+        #expect(PortMapping(hostPort: 8080, containerPort: 80).description
+                == "0.0.0.0:8080->80/tcp")
+    }
+
+    /// Containers persisted before `hostIP` existed were all bound to every
+    /// interface. Their state must keep decoding, and must not claim loopback.
+    @Test func stateWrittenBeforeHostIPStillDecodes() throws {
+        let legacy = #"{"hostPort":8080,"containerPort":80,"proto":"tcp"}"#
+        let decoded = try JSONDecoder().decode(PortMapping.self, from: Data(legacy.utf8))
+        #expect(decoded.hostIP == "0.0.0.0")
+        #expect(decoded.hostPort == 8080)
+        #expect(decoded.containerPort == 80)
     }
 
     @Test func expandsAPortRange() throws {
