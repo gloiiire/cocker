@@ -307,6 +307,13 @@ final class ContainerEngine {
         // We use it later to look up the matching lease in
         // /var/db/dhcpd_leases when /cocker-ip polling times out.
         container.natMAC = nil
+
+        // Before anything is persisted or booted: can we actually take the
+        // host ports? The forwarder discovers this much later, in a detached
+        // child whose exit(1) nobody reads, so the run used to succeed and
+        // `ps` used to advertise a mapping that did not exist.
+        try PortForwarder.preflight(mappings: container.ports)
+
         try await state.store(container: container)
         CockerLog.shared.debug("eng", "state stored")
         emitEvent("container", action: "create", id: id)
@@ -762,6 +769,16 @@ final class ContainerEngine {
         guard container.status == .stopped || container.status == .created else {
             status = .error; span.setAttribute("error", "already_running")
             throw CockerError.containerAlreadyRunning(id)
+        }
+
+        // Same check as the create path: a container stopped while its host
+        // port got taken by something else must fail to start, not come back
+        // up advertising a mapping that will never be bound.
+        do {
+            try PortForwarder.preflight(mappings: container.ports)
+        } catch {
+            status = .error; span.setAttribute("error", "port_allocated")
+            throw error
         }
 
         // Réutilise le rootfs cloné du container (créé au run initial).
