@@ -131,7 +131,7 @@ static int run_request(const char *path,
             }
         }
         execvp(argv[0], argv);
-        _exit(127);
+        _exit(exec_failure_code(errno));
     }
 
     close(pipefd[1]);
