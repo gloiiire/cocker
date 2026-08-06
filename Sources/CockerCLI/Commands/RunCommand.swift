@@ -23,7 +23,8 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customLong("name"), help: "Assign a name to the container")
     var name: String?
 
-    @Option(name: [.short, .customLong("publish")], help: "Publish ports (host:container)")
+    @Option(name: [.short, .customLong("publish")],
+            help: "Publish ports (host:container). TCP only — /udp mappings are not forwarded")
     var portSpecs: [String] = []
 
     @Option(name: [.short, .customLong("volume")], help: "Bind mount a volume (src:dst[:ro])")
@@ -143,6 +144,17 @@ struct RunCommand: AsyncParsableCommand {
         }
         config.rm = rm
         config.ports = try portSpecs.map { try PortMapping.parse($0) }
+        // cocker's forwarder relays TCP through /usr/bin/nc; there is no UDP
+        // relay. The mapping was accepted, shown by `ps` and `cocker port`,
+        // and silently dropped by PortForwarder with only a `debug` log —
+        // so a DNS container looked published and answered nobody.
+        let udp = config.ports.filter { $0.proto == .udp }
+        if !udp.isEmpty {
+            let list = udp.map { "\($0.hostPort):\($0.containerPort)/udp" }
+                          .joined(separator: ", ")
+            UX.IgnoredFlag.warn("-p \(list)",
+                "cocker forwards TCP only; nothing will listen on the host for these")
+        }
         config.volumes = try volumeSpecs.map { try VolumeMount.parse($0) }
         config.env = try parseEnv(env)
         config.labels = try parseKV(labels)
@@ -206,7 +218,12 @@ struct RunCommand: AsyncParsableCommand {
             let name = config.name ?? String(result.containerID.prefix(12))
             var header = [" " + UX.TTY.paint("→ Running", .progress) + " " + UX.TTY.paint(name, .accent)]
             for p in config.ports {
-                header.append("   " + UX.TTY.paint("http://localhost:\(p.hostPort)", .accent))
+                // `localhost` is only where it actually answers when the bind
+                // is every-interface or loopback. Printing it for a mapping
+                // pinned to one LAN address sends the user to a closed port.
+                let host = (p.hostIP == "0.0.0.0" || p.hostIP == "127.0.0.1")
+                    ? "localhost" : p.hostIP
+                header.append("   " + UX.TTY.paint("http://\(host):\(p.hostPort)", .accent))
             }
             let cid = result.containerID
             // `-it` hands the terminal to the container, so the footer must

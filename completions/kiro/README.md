@@ -6,7 +6,7 @@ command line) get inline, descriptive suggestions when typing `cocker`
 commands in the terminal — the same kind of popup you see for `git`,
 `npm`, `pnpm`, `docker`, etc.
 
-Coverage : every subcommand of `cocker` v0.7+ (run, ps, compose up,
+Coverage : every subcommand of `cocker` 1.1+ (run, ps, compose up,
 daemon, build, network, volume, secret, config, plugin, buildx, swarm,
 stack, service, context, icloud, …) including their flags, repeatable
 options, and dynamic generators that query the running daemon for

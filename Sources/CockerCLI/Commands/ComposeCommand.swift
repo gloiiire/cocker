@@ -1031,7 +1031,7 @@ struct ComposePortCommand: AsyncParsableCommand {
         }
 
         if let mapping = container.ports.first(where: { $0.containerPort == port && $0.proto.rawValue == proto }) {
-            print("0.0.0.0:\(mapping.hostPort)")
+            print("\(mapping.hostIP):\(mapping.hostPort)")
         } else {
             UX.Failure.emit(
                 headline: "Port \(privatePort)/\(proto) not published for service \(service)",

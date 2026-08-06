@@ -3,7 +3,7 @@
 > The single source of truth for how every `cocker` command should look on screen.
 > If you're adding or refactoring a command, this is the document you read first.
 
-**Status** : draft — target release `0.7.0 "Polished"`
+**Status** : in force — shipped in `0.7.0 "Polished"`, applies to the 1.x line
 **Scope** : every CLI command without exception (~93 commands across 16 categories).
 
 ---
