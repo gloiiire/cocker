@@ -22,17 +22,21 @@ struct IgnoredFlagHelpTests {
         C.helpMessage(columns: 200)
     }
 
-    @Test func runDisclosesItsInertFlags() {
+    /// These five were the original disclosures. They are now implemented —
+    /// read-only root, tmpfs mounts, extra /etc/hosts entries and DNS all
+    /// reach the guest through the v7 spec — so the guarantee inverts: they
+    /// must still be offered, and must NOT claim to be inert.
+    ///
+    /// Asserting the absence matters as much as the presence did. Leaving a
+    /// "Not honoured" on a flag that works is the same defect pointed the
+    /// other way, and it is the easy one to forget.
+    @Test func runNoLongerDisclosesTheFlagsItNowHonours() {
         let text = help(RunCommand.self)
         for flag in ["--read-only", "--dns", "--dns-search", "--add-host", "--tmpfs"] {
-            // The flag is still offered — removing it would break scripts.
             #expect(text.contains(flag), "\(flag) disappeared from run --help")
         }
-        // One disclosure per inert flag. Counting rather than substring-matching
-        // each line keeps this honest if the wording changes.
-        let disclosures = text.components(separatedBy: "Not honoured").count - 1
-        #expect(disclosures >= 5,
-                "run --help discloses \(disclosures) inert flags, expected at least 5")
+        #expect(!text.contains("Not honoured"),
+                "run --help still calls a flag inert after it was implemented")
     }
 
     @Test func pullDisclosesPlatform() {

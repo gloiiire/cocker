@@ -1220,7 +1220,12 @@ final class VMRuntime: NSObject {
             stopSignal: container.stopSignal,
             tty: container.tty ?? false,
             rows: container.ttyRows ?? 0,
-            cols: container.ttyCols ?? 0
+            cols: container.ttyCols ?? 0,
+            readOnly: container.readOnlyRootfs ?? false,
+            tmpfsMounts: container.tmpfsMounts ?? [],
+            addHosts: container.addHosts ?? [],
+            dnsServers: container.dnsServers ?? [],
+            dnsSearch: container.dnsSearch ?? []
         )
     }
 

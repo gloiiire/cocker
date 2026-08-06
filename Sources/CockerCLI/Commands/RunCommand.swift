@@ -78,22 +78,22 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customLong("env-file"), help: "Read environment variables from a file")
     var envFile: [String] = []
 
-    @Option(name: .customLong("add-host"), help: "Not honoured: /etc/hosts is written by cocker-init and this entry is not added")
+    @Option(name: .customLong("add-host"), help: "Add an entry to /etc/hosts (name:ip)")
     var addHosts: [String] = []
 
-    @Option(name: .customLong("dns"), help: "Not honoured: resolv.conf is pinned to cocker's DNS proxy")
+    @Option(name: .customLong("dns"), help: "Extra DNS server, consulted after cocker's own resolver")
     var dns: [String] = []
 
-    @Option(name: .customLong("dns-search"), help: "Not honoured: the search domain is always `cocker`")
+    @Option(name: .customLong("dns-search"), help: "DNS search domain (`cocker` stays appended)")
     var dnsSearch: [String] = []
 
     @Option(name: .customLong("volumes-from"), help: "Mount volumes from another container")
     var volumesFrom: [String] = []
 
-    @Option(name: .customLong("tmpfs"), help: "Not honoured: no tmpfs is mounted beyond the fixed /tmp and /etc overlays")
+    @Option(name: .customLong("tmpfs"), help: "Mount a tmpfs (e.g. /run or /run:size=64m)")
     var tmpfs: [String] = []
 
-    @Flag(name: .customLong("read-only"), help: "Not honoured: the root filesystem stays writable")
+    @Flag(name: .customLong("read-only"), help: "Mount the container root read-only")
     var readOnly = false
 
     @Option(name: .customLong("health-cmd"), help: "Command to run to check health (CLI override)")
@@ -126,29 +126,6 @@ struct RunCommand: AsyncParsableCommand {
     var command: [String] = []
 
     mutating func run() async throws {
-        // Flags that reach RunConfig and are then read by nobody. Warned here
-        // rather than dropped in silence: `--read-only` in particular is a
-        // hardening flag, and a user who believes the root filesystem is
-        // unwritable makes different decisions than one who knows it is not.
-        if readOnly {
-            UX.IgnoredFlag.warn("--read-only", "the root filesystem stays writable")
-        }
-        if !dns.isEmpty {
-            UX.IgnoredFlag.warn("--dns",
-                "resolv.conf is pinned to cocker's DNS proxy on 127.0.0.1")
-        }
-        if !dnsSearch.isEmpty {
-            UX.IgnoredFlag.warn("--dns-search", "the search domain is always `cocker`")
-        }
-        if !addHosts.isEmpty {
-            UX.IgnoredFlag.warn("--add-host",
-                "/etc/hosts is written by cocker-init and gains no extra entry")
-        }
-        if !tmpfs.isEmpty {
-            UX.IgnoredFlag.warn("--tmpfs",
-                "no tmpfs is mounted beyond the fixed /tmp and /etc overlays")
-        }
-
         // `cocker run alpine -- sh -c '...'` : the POSIX terminator is a
         // separator, not argv[0]. Left in place it reached the guest and
         // cocker-init exited 127 with `execvp --`.
