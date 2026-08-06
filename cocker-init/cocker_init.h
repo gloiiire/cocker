@@ -165,6 +165,15 @@ extern int cap_add_spec_len;
 extern int cap_drop_spec[64];
 extern int cap_drop_spec_len;
 extern int privileged_spec;
+
+/* v7 spec trailers — `--read-only`, `--tmpfs`, `--add-host`, `--dns`.
+ * Pointers into spec.c's string arena, valid for the life of the process. */
+#define SPEC_LIST_MAX 32
+extern int read_only_spec;
+extern char *tmpfs_spec[SPEC_LIST_MAX];       extern int tmpfs_spec_len;
+extern char *add_host_spec[SPEC_LIST_MAX];    extern int add_host_spec_len;
+extern char *dns_spec[SPEC_LIST_MAX];         extern int dns_spec_len;
+extern char *dns_search_spec[SPEC_LIST_MAX];  extern int dns_search_spec_len;
 /// POSIX signal number (e.g. 3 = SIGQUIT). 0 = default (SIGTERM).
 /// Populated by spec_load() from the v5 spec format trailer. Consumed by
 /// init.c's SIGTERM handler : when the host issues `VZ requestStop` /

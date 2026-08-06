@@ -276,6 +276,13 @@ final class ContainerEngine {
             stopSignal: config.stopSignal ?? imageInfo?.stopSignal
         )
         container.shmSizeMB = config.shmSizeMB
+        // The four flags PRO-123 had to label as ignored. Persisted on the
+        // container so a restart keeps them, like tty and shmSize.
+        container.readOnlyRootfs = config.readOnly ? true : nil
+        container.tmpfsMounts = config.tmpfsMounts.isEmpty ? nil : config.tmpfsMounts
+        container.addHosts = config.addHosts.isEmpty ? nil : config.addHosts
+        container.dnsServers = config.dnsServers.isEmpty ? nil : config.dnsServers
+        container.dnsSearch = config.dnsSearch.isEmpty ? nil : config.dnsSearch
         // Persisted so the retry ceiling survives a daemon restart — the
         // watcher reads it from the container, not from the request.
         container.restartMaxRetries = config.restartMaxRetries
