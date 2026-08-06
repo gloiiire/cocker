@@ -53,6 +53,9 @@ public enum CockerError: Error, CustomStringConvertible {
     /// without it every remote failure collapsed to a plain 1.
     case daemon(String, Int32? = nil)
 
+    /// A `--restart` / compose `restart:` value we don't understand.
+    /// Refused rather than silently downgraded to "never restart".
+    case invalidRestartPolicy(String)
     /// A requested host port is already bound by something else.
     ///
     /// Payload is the `IP:port` we could not take. Raised before the VM boots
@@ -126,6 +129,7 @@ public enum CockerError: Error, CustomStringConvertible {
         case .requestFailed(let msg): return "Request failed: \(msg)"
         case .responseDecodingFailed(let msg): return "Response decoding failed: \(msg)"
         case .daemon(let msg, _): return msg
+        case .invalidRestartPolicy(let s): return "Invalid restart policy: \(s)"
         case .portAlreadyAllocated(let addr): return "Port \(addr) is already allocated"
         case .containerMustBeStopped(let id, let action):
             return "Cannot \(action) \(id) while it is running"
@@ -165,6 +169,10 @@ public enum CockerError: Error, CustomStringConvertible {
             return ("Failed to pull \(ref)", reason, nil)
         case .permissionDenied(let op):
             return ("Permission denied", op, nil)
+        case .invalidRestartPolicy(let s):
+            return ("Invalid restart policy: \(s)", nil,
+                    "expected `no`, `always`, `unless-stopped`, `on-failure` "
+                    + "or `on-failure:<max>`")
         case .portAlreadyAllocated(let addr):
             return ("Port \(addr) is already allocated",
                     "something else on this host is already listening there",
