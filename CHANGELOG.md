@@ -202,3 +202,7 @@ See [`docs/ROADMAP-1.0.md`](docs/ROADMAP-1.0.md). In short: healthchecks go
 through virtiofs rather than vsock; roughly 256 concurrent containers; a
 100 MiB cap on request bodies sent to the Docker socket; `COPY --chown`,
 `--chmod`, `ONBUILD` and `SHELL` are parsed but not applied (they warn).
+
+> **Superseded.** The ~256 figure was cumulative, not concurrent — macOS never
+> reclaimed the lease entries — and it stopped applying in 1.1.0.0, where
+> containers assign their own `eth0` address and take no lease at all.
