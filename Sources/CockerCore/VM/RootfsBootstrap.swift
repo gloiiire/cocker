@@ -37,15 +37,23 @@ public enum RootfsBootstrap {
     //   for each cap_drop : u32 BE cap number
     //   stop_signal:  u32 BE  (v5+ — POSIX signal number, e.g. 3 = SIGQUIT,
     //                  15 = SIGTERM. 0 = use init default SIGTERM.)
+    //   tty:          u8      (v6+) then rows u32 BE, cols u32 BE
+    //   read_only:    u8      (v7+ — 1 = remount / read-only before exec)
+    //   n_tmpfs:      u32 BE  (v7+) then each: u32 BE length + bytes
+    //   n_hosts:      u32 BE  (v7+) then each: u32 BE length + bytes
+    //   n_dns:        u32 BE  (v7+) then each: u32 BE length + bytes
+    //   n_dns_search: u32 BE  (v7+) then each: u32 BE length + bytes
     //
     // All length fields are unsigned big-endian 32-bit. Strings are UTF-8.
 
     /// Magic header for the v5 spec format. cocker-init's spec_load() reads
     /// these 7 bytes first and refuses to proceed on mismatch.
     /// v6 adds the tty flag and terminal geometry, so `cocker run -it` can
-    /// give the container's *main* process a controlling terminal. The guest
-    /// still accepts v2–v5 and treats the missing trailer as "no tty".
-    public static let specMagic: [UInt8] = Array("COCKER\u{06}".utf8)
+    /// give the container's *main* process a controlling terminal. v7 adds
+    /// read-only root, tmpfs mounts, extra /etc/hosts entries and DNS —
+    /// four flags that had been accepted and ignored. The guest still
+    /// accepts v2–v6 and treats each missing trailer as empty.
+    public static let specMagic: [UInt8] = Array("COCKER\u{07}".utf8)
 
     /// Resolve a Dockerfile `STOPSIGNAL` value (`"SIGQUIT"`, `"SIGTERM"`,
     /// `"3"`, …) into a POSIX signal number. Returns 0 ("use default") on
@@ -128,7 +136,12 @@ public enum RootfsBootstrap {
                                   stopSignal: String? = nil,
                                   tty: Bool = false,
                                   rows: Int = 0,
-                                  cols: Int = 0) -> Data {
+                                  cols: Int = 0,
+                                  readOnly: Bool = false,
+                                  tmpfsMounts: [String] = [],
+                                  addHosts: [String] = [],
+                                  dnsServers: [String] = [],
+                                  dnsSearch: [String] = []) -> Data {
         var data = Data()
         data.append(contentsOf: specMagic)
 
@@ -190,6 +203,23 @@ public enum RootfsBootstrap {
         data.appendUInt32BE(UInt32(max(0, min(rows, Int(UInt16.max)))))
         data.appendUInt32BE(UInt32(max(0, min(cols, Int(UInt16.max)))))
 
+        // v7 : the four flags that used to be parsed and dropped. Each list
+        // is length-prefixed so a v6 guest reading a v7 spec simply stops at
+        // the tty trailer and behaves exactly as it did before.
+        data.append(readOnly ? 1 : 0)
+        func appendList(_ items: [String]) {
+            data.appendUInt32BE(UInt32(items.count))
+            for item in items {
+                let bytes = Array(item.utf8)
+                data.appendUInt32BE(UInt32(bytes.count))
+                data.append(contentsOf: bytes)
+            }
+        }
+        appendList(tmpfsMounts)
+        appendList(addHosts)
+        appendList(dnsServers)
+        appendList(dnsSearch)
+
         return data
     }
 
@@ -205,12 +235,20 @@ public enum RootfsBootstrap {
                                  stopSignal: String? = nil,
                                  tty: Bool = false,
                                  rows: Int = 0,
-                                 cols: Int = 0) throws {
+                                 cols: Int = 0,
+                                 readOnly: Bool = false,
+                                 tmpfsMounts: [String] = [],
+                                 addHosts: [String] = [],
+                                 dnsServers: [String] = [],
+                                 dnsSearch: [String] = []) throws {
         let data = encodeSpec(command: command, env: env, workdir: workdir,
                               user: user, privileged: privileged,
                               capAdd: capAdd, capDrop: capDrop,
                               stopSignal: stopSignal,
-                              tty: tty, rows: rows, cols: cols)
+                              tty: tty, rows: rows, cols: cols,
+                              readOnly: readOnly, tmpfsMounts: tmpfsMounts,
+                              addHosts: addHosts, dnsServers: dnsServers,
+                              dnsSearch: dnsSearch)
         try data.write(to: rootfsPath.appendingPathComponent("cocker-spec"), options: .atomic)
     }
 

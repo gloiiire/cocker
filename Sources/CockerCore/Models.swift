@@ -52,6 +52,18 @@ public struct Container: Codable, Sendable, Identifiable {
     /// non-zero exit. Persisted so `cocker inspect` and the Docker API's
     /// RestartCount field match across daemon restarts.
     public var restartCount: Int
+    /// `--add-host name:ip` entries appended to /etc/hosts by cocker-init.
+    public var addHosts: [String]?
+    /// `--dns` servers. Used as the DNS proxy's upstream rather than
+    /// replacing 127.0.0.1, so container-name resolution keeps working.
+    public var dnsServers: [String]?
+    /// `--dns-search` domains written into resolv.conf's `search` line.
+    public var dnsSearch: [String]?
+    /// `--tmpfs /path[:opts]` mounts made inside the container.
+    public var tmpfsMounts: [String]?
+    /// `--read-only`: remount the container root read-only just before the
+    /// user command execs, once cocker-init has finished writing to it.
+    public var readOnlyRootfs: Bool?
     public var privileged: Bool
     public var capAdd: [String]
     public var capDrop: [String]
@@ -176,6 +188,11 @@ public struct Container: Codable, Sendable, Identifiable {
         self.healthFailingStreak = try c.decodeIfPresent(Int.self, forKey: .healthFailingStreak) ?? 0
         self.healthLog = try c.decodeIfPresent([HealthLogEntry].self, forKey: .healthLog) ?? []
         self.restartCount = try c.decodeIfPresent(Int.self, forKey: .restartCount) ?? 0
+        self.addHosts = try c.decodeIfPresent([String].self, forKey: .addHosts)
+        self.dnsServers = try c.decodeIfPresent([String].self, forKey: .dnsServers)
+        self.dnsSearch = try c.decodeIfPresent([String].self, forKey: .dnsSearch)
+        self.tmpfsMounts = try c.decodeIfPresent([String].self, forKey: .tmpfsMounts)
+        self.readOnlyRootfs = try c.decodeIfPresent(Bool.self, forKey: .readOnlyRootfs)
         self.privileged = try c.decodeIfPresent(Bool.self, forKey: .privileged) ?? false
         self.capAdd = try c.decodeIfPresent([String].self, forKey: .capAdd) ?? []
         self.capDrop = try c.decodeIfPresent([String].self, forKey: .capDrop) ?? []
