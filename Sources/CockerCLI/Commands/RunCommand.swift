@@ -230,7 +230,12 @@ struct RunCommand: AsyncParsableCommand {
             let name = config.name ?? String(result.containerID.prefix(12))
             var header = [" " + UX.TTY.paint("→ Running", .progress) + " " + UX.TTY.paint(name, .accent)]
             for p in config.ports {
-                header.append("   " + UX.TTY.paint("http://localhost:\(p.hostPort)", .accent))
+                // `localhost` is only where it actually answers when the bind
+                // is every-interface or loopback. Printing it for a mapping
+                // pinned to one LAN address sends the user to a closed port.
+                let host = (p.hostIP == "0.0.0.0" || p.hostIP == "127.0.0.1")
+                    ? "localhost" : p.hostIP
+                header.append("   " + UX.TTY.paint("http://\(host):\(p.hostPort)", .accent))
             }
             let cid = result.containerID
             // `-it` hands the terminal to the container, so the footer must

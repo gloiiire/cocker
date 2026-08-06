@@ -173,7 +173,12 @@ struct CockerEnvTests {
         // CaseIterable conformance gives us a compile-time safety net : if
         // someone adds a new env var they need to wire it into one of the
         // call sites, and this count ratchet flags the addition.
-        #expect(CockerEnv.allCases.count == 8)
+        //
+        // 9 since COCKER_STATIC_ETH0 moved here from a string literal inside
+        // ContainerEngine — the CLI needs the same answer as the daemon, and
+        // while they read it separately `cocker daemon status` kept
+        // advertising a DHCP lease pool that nothing draws from.
+        #expect(CockerEnv.allCases.count == 9)
     }
 
     @Test func stringValueReadsProcessEnv() {

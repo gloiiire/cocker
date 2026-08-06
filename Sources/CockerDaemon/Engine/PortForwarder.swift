@@ -36,6 +36,7 @@ public actor PortForwarder {
         for port in mappings {
             do {
                 let proc = try spawnForwarder(
+                    hostIP: port.hostIP,
                     hostPort: port.hostPort,
                     containerIP: containerIP,
                     containerPort: port.containerPort,
@@ -43,7 +44,7 @@ public actor PortForwarder {
                 )
                 procs.append(proc)
                 CockerLog.shared.info("portfwd",
-                    "0.0.0.0:\(port.hostPort)/\(port.proto.rawValue) → "
+                    "\(port.hostIP):\(port.hostPort)/\(port.proto.rawValue) → "
                     + "\(containerIP):\(port.containerPort) " +
                     "(pid \(proc.processIdentifier), container \(String(containerID.prefix(12))))")
             } catch {
@@ -88,6 +89,7 @@ public actor PortForwarder {
     // MARK: - Spawn helper
 
     private func spawnForwarder(
+        hostIP: String,
         hostPort: UInt16,
         containerIP: String,
         containerPort: UInt16,
@@ -100,9 +102,10 @@ public actor PortForwarder {
         let proc = Process()
         proc.executableURL = portFwdBinary
         // UDP mappings used to be skipped entirely — accepted, shown by
-        // `ps`, forwarded nowhere. cocker-portfwd relays datagrams now.
+        // `ps`, forwarded nowhere. cocker-portfwd relays datagrams now, on
+        // the address the user actually asked for.
         var argv = [
-            "--listen", "0.0.0.0:\(hostPort)",
+            "--listen", "\(hostIP):\(hostPort)",
             "--target", "\(containerIP):\(containerPort)",
         ]
         if udp { argv.append("--udp") }
