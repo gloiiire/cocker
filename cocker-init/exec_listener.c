@@ -495,6 +495,24 @@ static void handle_one(int client_fd) {
             fprintf(stderr, "[cocker-init] chdir %s: %s\n", workdir, strerror(errno));
             _exit(126);
         }
+
+        /* Same capability policy as the container's main process.
+         *
+         * This was missing, so `cocker exec` handed out the FULL kernel
+         * bounding set while the main process ran with Docker's restricted
+         * default — measured on one container: a80425fb for the main
+         * process, 1ffffffffff through exec. A container deliberately
+         * started with --cap-drop gave every one of them back to anyone who
+         * exec'd into it.
+         *
+         * Caps before setgid/setuid, exactly as init.c orders it: with
+         * SECBIT_NOROOT off, root keeps its capabilities across a uid
+         * change, so narrowing the bounding set first is what bounds
+         * whatever survives. */
+        caps_apply(privileged_spec,
+                   cap_add_spec, cap_add_spec_len,
+                   cap_drop_spec, cap_drop_spec_len);
+
         if (user[0]) {
             unsigned int uid = 0, gid = 0;
             if (spec_resolve_user(user, &uid, &gid) != 0

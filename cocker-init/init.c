@@ -605,20 +605,25 @@ int main(int argc, char **argv) {
     mount_qemu_share();
     qemu_register_binfmt(cmdline);
 
-    /* Spawn the in-VM vsock listener that serves `cocker exec` requests.
-     * Runs in a separate subprocess so it survives independently of the
-     * main container command. */
-    exec_listener_spawn();
-
     /* Load the container spec (argv + env + workdir + user + caps). MUST
-     * happen before health_poll_spawn — the worker forks off this process
+     * happen before BOTH workers are spawned — each forks off this process
      * and inherits a copy of the user_spec / cap arrays. Inverting the
      * order leaves the worker with empty defaults and Dockerfile USER
-     * silently goes ignored for healthchecks. */
+     * silently goes ignored for healthchecks.
+     *
+     * exec_listener_spawn() used to sit one line ABOVE this, which is
+     * exactly the trap this comment describes: every `cocker exec` session
+     * inherited empty cap arrays, so --privileged and --cap-drop were
+     * invisible to it. */
     char *child_argv[128];
     int argc_count = spec_load(child_argv, 128);
     if (argc_count == 0 || child_argv[0] == NULL)
         die("empty command in /cocker-spec");
+
+    /* Spawn the in-VM vsock listener that serves `cocker exec` requests.
+     * Runs in a separate subprocess so it survives independently of the
+     * main container command. */
+    exec_listener_spawn();
 
     /* Spawn the healthcheck polling worker. cockerd writes one cmd file
      * per probe via virtiofs ; the worker runs it and writes the result
