@@ -34,27 +34,18 @@ public actor PortForwarder {
         await stop(containerID: containerID)
         var procs: [Process] = []
         for port in mappings {
-            // No UDP relay exists — the forwarder pipes TCP through
-            // /usr/bin/nc. This was a `debug` line, invisible at the default
-            // level, while `ps` went on advertising `0.0.0.0:53->53/udp`.
-            // `warn` so an operator reading the log finds out why their DNS
-            // container answers nobody.
-            guard port.proto == .tcp else {
-                CockerLog.shared.warn("portfwd",
-                    "host port \(port.hostPort)/\(port.proto.rawValue) is NOT forwarded — "
-                    + "cocker forwards TCP only")
-                continue
-            }
             do {
                 let proc = try spawnForwarder(
                     hostIP: port.hostIP,
                     hostPort: port.hostPort,
                     containerIP: containerIP,
-                    containerPort: port.containerPort
+                    containerPort: port.containerPort,
+                    udp: port.proto == .udp
                 )
                 procs.append(proc)
                 CockerLog.shared.info("portfwd",
-                    "\(port.hostIP):\(port.hostPort) → \(containerIP):\(port.containerPort) " +
+                    "\(port.hostIP):\(port.hostPort)/\(port.proto.rawValue) → "
+                    + "\(containerIP):\(port.containerPort) " +
                     "(pid \(proc.processIdentifier), container \(String(containerID.prefix(12))))")
             } catch {
                 CockerLog.shared.error("portfwd", "error spawning forwarder for \(port.hostPort): \(error)")
@@ -154,7 +145,8 @@ public actor PortForwarder {
         hostIP: String,
         hostPort: UInt16,
         containerIP: String,
-        containerPort: UInt16
+        containerPort: UInt16,
+        udp: Bool = false
     ) throws -> Process {
         guard FileManager.default.fileExists(atPath: portFwdBinary.path) else {
             throw CockerError.internalError("cocker-portfwd binary not found: \(portFwdBinary.path)")
@@ -162,10 +154,15 @@ public actor PortForwarder {
 
         let proc = Process()
         proc.executableURL = portFwdBinary
-        proc.arguments = [
+        // UDP mappings used to be skipped entirely — accepted, shown by
+        // `ps`, forwarded nowhere. cocker-portfwd relays datagrams now, on
+        // the address the user actually asked for.
+        var argv = [
             "--listen", "\(hostIP):\(hostPort)",
             "--target", "\(containerIP):\(containerPort)",
         ]
+        if udp { argv.append("--udp") }
+        proc.arguments = argv
         // Pipe stderr du forwarder dans celui du daemon (logs centralisés)
         proc.standardError = FileHandle.standardError
         proc.standardOutput = FileHandle.standardError
