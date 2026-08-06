@@ -681,10 +681,16 @@ final class DockerAPIServer {
 
                     for binding in hostBindings {
                         let hostPort = UInt16(binding.HostPort ?? "") ?? containerPort
+                        // Docker's HostIp: empty means every interface. A
+                        // client asking for 127.0.0.1 over the API socket has
+                        // the same right to be obeyed as one using our CLI.
+                        let hostIP = (binding.HostIp?.isEmpty == false)
+                            ? binding.HostIp! : "0.0.0.0"
                         config.ports.append(PortMapping(
                             hostPort: hostPort,
                             containerPort: containerPort,
-                            proto: TransportProto(rawValue: proto) ?? .tcp
+                            proto: TransportProto(rawValue: proto) ?? .tcp,
+                            hostIP: hostIP
                         ))
                     }
                 }
@@ -1468,7 +1474,7 @@ final class DockerAPIServer {
     private func dockerInspect(from c: Container) -> DockerContainerInspect {
         let portBindings = Dictionary(uniqueKeysWithValues: c.ports.map { port -> (String, [DockerPortBinding]) in
             let key = "\(port.containerPort)/\(port.proto.rawValue)"
-            let binding = DockerPortBinding(HostIp: "0.0.0.0", HostPort: String(port.hostPort))
+            let binding = DockerPortBinding(HostIp: port.hostIP, HostPort: String(port.hostPort))
             return (key, [binding])
         })
 

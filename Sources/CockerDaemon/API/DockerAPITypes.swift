@@ -538,7 +538,7 @@ extension DockerContainerSummary {
         Created = Int64(container.createdAt.timeIntervalSince1970)
         Ports = container.ports.map { port in
             DockerPort(
-                IP: "0.0.0.0",
+                IP: port.hostIP,
                 PrivatePort: port.containerPort,
                 PublicPort: port.hostPort,
                 portType: port.proto.rawValue
