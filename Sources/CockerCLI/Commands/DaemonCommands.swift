@@ -514,6 +514,35 @@ struct DaemonSetupCommand: AsyncParsableCommand {
 /// `cocker daemon init` — single command that walks through every
 /// post-`brew install` step with a TUX-style checklist and fixes
 /// whatever needs fixing. Idempotent ; safe to re-run any time.
+/// Is a daemon actually listening on this socket?
+///
+/// A real `connect()`, not `fileExists`. A SIGKILLed daemon leaves its
+/// socket inode behind, so the file test reports a dead daemon as healthy —
+/// which `daemon status` did, in green, on the command you run precisely to
+/// find that out. This lived as a private helper on DaemonInitCommand, so
+/// `status` could not reach it and grew its own weaker version.
+enum DaemonLiveness {
+    static func isAlive(socketPath: String) -> Bool {
+        guard FileManager.default.fileExists(atPath: socketPath) else { return false }
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        defer { close(fd) }
+        guard fd >= 0 else { return false }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dst in
+                _ = socketPath.withCString { strncpy(dst, $0, 103) }
+            }
+        }
+        let rc = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        return rc == 0
+    }
+}
+
 struct DaemonInitCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "init",
@@ -624,7 +653,7 @@ struct DaemonInitCommand: AsyncParsableCommand {
 
         // 4. Start the daemon if not running
         let socketPath = cockerRoot + "/cocker.sock"
-        if Self.isDaemonAlive(socketPath: socketPath) {
+        if DaemonLiveness.isAlive(socketPath: socketPath) {
             print("\(s.ok) cockerd already running")
         } else {
             print("\(s.arrow) starting daemon via launchd (brew services)…")
@@ -726,25 +755,6 @@ struct DaemonInitCommand: AsyncParsableCommand {
         }
     }
 
-    private static func isDaemonAlive(socketPath: String) -> Bool {
-        guard FileManager.default.fileExists(atPath: socketPath) else { return false }
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        defer { close(fd) }
-        guard fd >= 0 else { return false }
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            ptr.withMemoryRebound(to: CChar.self, capacity: 104) { dst in
-                _ = socketPath.withCString { strncpy(dst, $0, 103) }
-            }
-        }
-        let rc = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
-            }
-        }
-        return rc == 0
-    }
 }
 
 extension DaemonSetupCommand {
@@ -1557,9 +1567,19 @@ struct DaemonStatusCommand: AsyncParsableCommand {
             print("   " + UX.TTY.paint("launchd :", .dim) + " " + plist.path)
         }
         print("   " + UX.TTY.paint("log     :", .dim) + " " + paths.logFile.path)
-        let socketState = FileManager.default.fileExists(atPath: paths.ipcSock.path)
-            ? UX.TTY.paint("reachable", .success)
-            : UX.TTY.paint("MISSING (daemon may still be booting)", .warn)
+        // "reachable" used to mean the socket inode exists. A SIGKILLed
+        // daemon leaves it behind, so a dead daemon reported reachable, in
+        // green, on the command you run to find out whether it is up.
+        // isDaemonAlive — in this same file, twenty lines up — does a real
+        // connect(). Ask it.
+        let socketState: String
+        if !FileManager.default.fileExists(atPath: paths.ipcSock.path) {
+            socketState = UX.TTY.paint("MISSING (daemon may still be booting)", .warn)
+        } else if DaemonLiveness.isAlive(socketPath: paths.ipcSock.path) {
+            socketState = UX.TTY.paint("reachable", .success)
+        } else {
+            socketState = UX.TTY.paint("stale — nothing is listening", .failure)
+        }
         print("   " + UX.TTY.paint("ipc     :", .dim) + " " + paths.ipcSock.path + " — " + socketState)
 
         // Lease pool + helper status (vmnet bootpd caps at ~256). Operator
