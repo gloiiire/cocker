@@ -207,7 +207,12 @@ struct BuildxBuildCommand: AsyncParsableCommand {
         for plat in platforms where plat != hostArch {
             UX.Warning.emit(
                 "cross-arch build (\(plat)) needs qemu-user-static",
-                note: "place the binary at /opt/cocker/qemu/qemu-<arch>-static — cocker doesn't bundle these yet ; native arch (\(hostArch)) always works"
+                // The old note told the user to place a binary at
+                // /opt/cocker/qemu/ — a path *inside the guest*, which they
+                // cannot write to — and said cocker doesn't bundle these,
+                // while `cocker buildx install-qemu` in this same file
+                // downloads and installs them into ~/.cocker/qemu/.
+                note: "run `cocker buildx install-qemu` once ; native arch (\(hostArch)) always works"
             )
         }
 
@@ -259,26 +264,60 @@ struct BuildxBuildCommand: AsyncParsableCommand {
             }
         }
 
-        // Tag the first built image as the final imageTag (multi-arch manifest is future work)
+        // Only the first platform gets the final tag. A `try?` here meant a
+        // failed tag was invisible and "✓ image built" printed anyway — the
+        // user then pushed or ran a tag that names nothing.
         if let first = builtImageIDs.first {
             struct TagPayload: Codable, Sendable { let source, target: String }
             let tagReq = try IPCRequest(type: .tag, payload: TagPayload(source: first.imageID, target: imageTag))
-            _ = try? await client.send(tagReq)
+            do {
+                _ = try await client.send(tagReq)
+            } catch let error as CockerError {
+                UX.Failure.emit(
+                    headline: "Cannot tag \(imageTag)",
+                    reason: error.description,
+                    hint: "the image was built; only the tag failed"
+                )
+                throw ExitCode(error.exitCode)
+            }
         }
 
+        // This used to print "multi-platform manifest written for <tag>".
+        // No manifest list is created anywhere — the line above tags exactly
+        // one image — so pushing that tag published a single-arch image while
+        // the output said otherwise. Say what actually happened instead.
         if builtImageIDs.count > 1 {
+            let others = builtImageIDs.dropFirst().map(\.platform).joined(separator: ", ")
             print("")
-            print(" " + UX.TTY.paint("→", .progress) + " multi-platform manifest written for " + UX.TTY.paint(imageTag, .accent))
+            UX.Warning.emit(
+                "no manifest list is written",
+                note: "\(imageTag) points at \(builtImageIDs[0].platform) only ; "
+                    + "\(others) built but left unreferenced"
+            )
         }
 
         print("")
         UX.printResult(.image, imageTag, verb: .build)
 
+        // A `try?` here swallowed authentication failures, unreachable
+        // registries, everything — `buildx build --push` reported success and
+        // exited 0 having published nothing. Same streaming shape as
+        // `cocker push`, which gets this right.
         if push {
             print(" " + UX.TTY.paint("→ Pushing", .progress) + " " + UX.TTY.paint(imageTag, .accent))
             let payload = PullRequest(reference: imageTag)
             let req = try IPCRequest(type: .push, payload: payload)
-            _ = try? await client.send(req)
+            let fail = UX.FailFlag()
+            try await client.sendStreaming(req) { event in
+                switch event.stream {
+                case .stdout: print(event.data, terminator: "")
+                case .stderr: UX.writeStderr(event.data)
+                case .status: print(UX.TTY.paint(event.data, .progress))
+                case .error:  fail.trip(); UX.Failure.emit(headline: event.data)
+                }
+            }
+            try fail.throwIfTripped()
+            UX.printResult(.image, imageTag, verb: .push)
         }
     }
 }
