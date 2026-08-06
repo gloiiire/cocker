@@ -1589,11 +1589,12 @@ final class ContainerEngine {
     /// self-assignment would collide.
     ///
     /// See `docs/DESIGN-network-without-vmnet.md` for the measurements.
+    ///
+    /// The switch itself lives in `CockerEnv` so the CLI reads the same answer
+    /// — when it was a string literal here, `cocker daemon status` couldn't
+    /// consult it and kept printing a lease gauge for a pool nothing uses.
     static var staticNATEnabled: Bool {
-        switch ProcessInfo.processInfo.environment["COCKER_STATIC_ETH0"]?.lowercased() {
-        case "0", "false", "no", "off": return false
-        default: return true
-        }
+        CockerEnv.staticETH0Enabled
     }
 
     static func maybeTriggerLeasePoolClear() {

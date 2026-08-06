@@ -30,15 +30,22 @@ also used elsewhere, assume a local attacker with your uid can read it.
 `post_install` uses `sudo` to install `/Library/LaunchDaemons/com.cocker.leases-helper.plist`,
 a root job that truncates `/var/db/dhcpd_leases` — the workaround for macOS
 `bootpd` refusing new leases past a ceiling Apple doesn't expose. It runs as root,
-for as long as it is installed. Remove it with:
+for as long as it is installed.
+
+**Since 1.1.0.0 it earns nothing on the default path.** Containers assign their
+own `eth0` address and never request a lease, so the ceiling gates nothing and
+`cockerd` does not watch the pool. The job is only useful if you set
+`COCKER_STATIC_ETH0=0` in `cockerd`'s environment to go back to DHCP.
+
+If you don't, remove it — a permanently resident root job with no remaining
+purpose is exactly the kind of thing to take off a machine:
 
 ```bash
 sudo launchctl bootout system/com.cocker.leases-helper
 sudo rm /Library/LaunchDaemons/com.cocker.leases-helper.plist
 ```
 
-Cocker still works without it; you may hit the lease ceiling after a few hundred
-containers.
+Cocker works the same without it.
 
 ### Containers are VMs, but not a security boundary you should lean on
 

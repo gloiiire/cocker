@@ -98,8 +98,9 @@ something else on your machine owns that subnet.
 If you do switch back to DHCP and hit the ceiling, `cocker daemon
 helper-install` installs a small root LaunchDaemon that truncates the pool
 automatically (one sudo prompt, once per machine), and `cocker daemon
-clear-leases` is the one-shot equivalent. `cocker daemon status` shows the
-live count. Neither is needed on the default path.
+clear-leases` is the one-shot equivalent, and `cocker daemon status` shows the
+live count on that path. Neither is needed on the default path — where
+`daemon status` says so instead of printing a count that gates nothing.
 
 ## Requirements
 
