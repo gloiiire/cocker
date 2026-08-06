@@ -337,18 +337,34 @@ extension ContainerEngine {
 
     // MARK: - image history
 
-    /// `docker history` synthesises a fake record per stored layer plus a
-    /// final FROM line. We don't track layer-build metadata so this is
-    /// approximative.
+    /// `docker history`, one entry per stored layer.
+    ///
+    /// cocker does not keep per-instruction build metadata, and this used to
+    /// paper over that with three fabrications: timestamps staggered a
+    /// minute apart, a `createdBy` reading `/bin/sh -c layer 3`, and a size
+    /// of `img.size / layers.count` — equal-sized layers, which no image
+    /// has. The comment called it "approximative"; the output did not.
+    ///
+    /// Sizes are now the real blob on disk. For the metadata cocker doesn't
+    /// have, `<missing>` is docker's own marker for a layer whose build
+    /// record is absent — an answer the reader can act on, unlike a
+    /// plausible command that was never run.
     func imageHistory(_ reference: String) async throws -> [ImageHistoryEntry] {
         let img = try await images.find(reference)
+        let fm = FileManager.default
         var entries: [ImageHistoryEntry] = []
         for (i, layer) in img.layers.enumerated() {
+            let blob = await images.store.blobPath(for: layer)
+            let onDisk = (try? fm.attributesOfItem(atPath: blob.path)[.size] as? UInt64) ?? nil
             entries.append(ImageHistoryEntry(
                 id: String(layer.prefix(19)),
-                createdAt: img.createdAt.addingTimeInterval(TimeInterval(-i * 60)),
-                createdBy: i == 0 ? "/bin/sh -c #(nop) FROM \(img.repository):\(img.tag)" : "/bin/sh -c layer \(i)",
-                size: img.size / UInt64(max(1, img.layers.count)),
+                // One timestamp, the image's. The stagger implied cocker
+                // knew when each layer was built. It doesn't.
+                createdAt: img.createdAt,
+                createdBy: i == 0
+                    ? "/bin/sh -c #(nop) FROM \(img.repository):\(img.tag)"
+                    : "<missing>",
+                size: onDisk ?? 0,
                 comment: ""
             ))
         }
@@ -378,34 +394,55 @@ extension ContainerEngine {
             .filter { !usedImages.contains($0.reference) && !usedImages.contains($0.id) }
             .reduce(UInt64(0)) { $0 + $1.size }
 
-        // Container size (approximation via rootfs)
+        // Container and volume sizes.
+        //
+        // These used to list ONE directory level and add up `.fileSizeKey`.
+        // That key on a directory is not the size of its contents, so a
+        // container rootfs tree and any nested volume contributed roughly
+        // zero — `system df` reported `Containers 1  0 B` next to a running
+        // container. The container walk also pointed at images/rootfs, the
+        // image store, rather than containers/<id>/rootfs.
+        //
+        // Allocated size rather than logical: container rootfs directories
+        // are APFS clonefile copies of the image, so the logical sum would
+        // count bytes that share blocks with the image and report disk that
+        // freeing the container would not give back.
         let fm = FileManager.default
-        let rootfsBase = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".cocker/images/rootfs")
-        var containerSize: UInt64 = 0
-        if let items = try? fm.contentsOfDirectory(at: rootfsBase, includingPropertiesForKeys: [.fileSizeKey]) {
-            for item in items {
-                if let res = try? item.resourceValues(forKeys: [.fileSizeKey]) {
-                    containerSize += UInt64(res.fileSize ?? 0)
-                }
+        func allocatedSize(of directory: URL) -> UInt64 {
+            guard let e = fm.enumerator(at: directory,
+                                        includingPropertiesForKeys: [.totalFileAllocatedSizeKey,
+                                                                     .isRegularFileKey],
+                                        options: [.skipsHiddenFiles]) else { return 0 }
+            var total: UInt64 = 0
+            for case let url as URL in e {
+                guard let v = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey,
+                                                               .isRegularFileKey]),
+                      v.isRegularFile == true else { continue }
+                total += UInt64(v.totalFileAllocatedSize ?? 0)
             }
+            return total
         }
+
+        // Per container, so "reclaimable" can be a sum of the stopped ones
+        // rather than a proportional guess.
+        var sizeByContainer: [String: UInt64] = [:]
+        for c in allContainers {
+            let dir = await images.store.containerRootfsDirectory(containerID: c.id)
+            sizeByContainer[c.id] = allocatedSize(of: dir)
+        }
+        let containerSize = sizeByContainer.values.reduce(0, &+)
 
         var totalVolSize: UInt64 = 0
         for vol in allVolumes {
-            if let items = try? fm.contentsOfDirectory(at: URL(fileURLWithPath: vol.mountpoint), includingPropertiesForKeys: [.fileSizeKey]) {
-                for item in items {
-                    if let res = try? item.resourceValues(forKeys: [.fileSizeKey]) {
-                        totalVolSize += UInt64(res.fileSize ?? 0)
-                    }
-                }
-            }
+            totalVolSize += allocatedSize(of: URL(fileURLWithPath: vol.mountpoint))
         }
 
         let stoppedContainers = allContainers.filter { $0.status == .stopped || $0.status == .dead }
         let entries: [SystemDfResponse.DfEntry] = [
             SystemDfResponse.DfEntry(type: "Images", total: allImages.count, active: usedImages.count, size: totalImageSize, reclaimable: unusedImageSize),
-            SystemDfResponse.DfEntry(type: "Containers", total: allContainers.count, active: runningContainers.count, size: containerSize, reclaimable: stoppedContainers.isEmpty ? 0 : containerSize / UInt64(max(1, allContainers.count)) * UInt64(stoppedContainers.count)),
+            SystemDfResponse.DfEntry(type: "Containers", total: allContainers.count, active: runningContainers.count, size: containerSize, // Was `containerSize / count * stoppedCount` — a proportional
+            // split invented from a total, not a measurement of anything.
+            reclaimable: stoppedContainers.reduce(UInt64(0)) { $0 &+ (sizeByContainer[$1.id] ?? 0) }),
             SystemDfResponse.DfEntry(type: "Volumes", total: allVolumes.count, active: allVolumes.count, size: totalVolSize, reclaimable: 0),
         ]
         return SystemDfResponse(entries: entries)
