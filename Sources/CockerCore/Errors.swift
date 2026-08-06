@@ -147,7 +147,9 @@ public enum CockerError: Error, CustomStringConvertible {
         case .permissionDenied(let op):
             return ("Permission denied", op, nil)
         case .invalidPortMapping(let s):
-            return ("Invalid port mapping: \(s)", nil, "expected `host:container`")
+            return ("Invalid port mapping: \(s)", nil,
+                    "expected `host:container`, optionally `IP:host:container` "
+                    + "with a literal IPv4 address (e.g. `127.0.0.1:8080:80`)")
         case .invalidVolumeSpec(let s):
             return ("Invalid volume spec: \(s)", nil, "expected `source:dest[:ro]`")
         case .daemon(let msg, _):

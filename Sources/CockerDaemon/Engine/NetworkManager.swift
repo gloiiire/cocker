@@ -257,7 +257,7 @@ actor NetworkManager {
         // for outbound traffic. For inbound (host -> container), we'd set up pf rules.
         // This is a simplified implementation that logs the intent.
         for port in ports {
-            print("[network] Port forward: 0.0.0.0:\(port.hostPort) -> container:\(port.containerPort)/\(port.proto.rawValue)")
+            print("[network] Port forward: \(port.hostIP):\(port.hostPort) -> container:\(port.containerPort)/\(port.proto.rawValue)")
         }
     }
 

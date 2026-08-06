@@ -459,11 +459,11 @@ struct PortCommand: AsyncParsableCommand {
                 throw ExitCode.failure
             }
             for m in matches {
-                print("0.0.0.0:\(m.hostPort)")
+                print("\(m.hostIP):\(m.hostPort)")
             }
         } else {
             for m in c.ports {
-                print("\(m.containerPort)/\(m.proto.rawValue) -> 0.0.0.0:\(m.hostPort)")
+                print("\(m.containerPort)/\(m.proto.rawValue) -> \(m.hostIP):\(m.hostPort)")
             }
         }
     }
