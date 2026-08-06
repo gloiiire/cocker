@@ -53,6 +53,13 @@ public enum CockerError: Error, CustomStringConvertible {
     /// without it every remote failure collapsed to a plain 1.
     case daemon(String, Int32? = nil)
 
+    /// A requested host port is already bound by something else.
+    ///
+    /// Payload is the `IP:port` we could not take. Raised before the VM boots
+    /// so the run fails instead of producing a container whose published port
+    /// exists only in `ps` — the forwarder used to lose this race silently,
+    /// inside a detached child nobody waited on.
+    case portAlreadyAllocated(String)
     /// An operation that only makes sense on a container that is not
     /// currently running. Payload is (container, what was attempted).
     ///
@@ -119,6 +126,7 @@ public enum CockerError: Error, CustomStringConvertible {
         case .requestFailed(let msg): return "Request failed: \(msg)"
         case .responseDecodingFailed(let msg): return "Response decoding failed: \(msg)"
         case .daemon(let msg, _): return msg
+        case .portAlreadyAllocated(let addr): return "Port \(addr) is already allocated"
         case .containerMustBeStopped(let id, let action):
             return "Cannot \(action) \(id) while it is running"
         case .invalidPortMapping(let s): return "Invalid port mapping: \(s) (expected format: host:container)"
@@ -157,6 +165,10 @@ public enum CockerError: Error, CustomStringConvertible {
             return ("Failed to pull \(ref)", reason, nil)
         case .permissionDenied(let op):
             return ("Permission denied", op, nil)
+        case .portAlreadyAllocated(let addr):
+            return ("Port \(addr) is already allocated",
+                    "something else on this host is already listening there",
+                    "stop it, or publish on a different host port")
         case .containerMustBeStopped(let id, let action):
             return ("Cannot \(action) \(id) while it is running",
                     "the network is wired when the VM boots and cannot be re-keyed live",
@@ -199,7 +211,7 @@ public enum CockerError: Error, CustomStringConvertible {
             return code ?? 1
         case .daemonNotRunning, .connectionFailed, .responseDecodingFailed,
              .kernelNotFound, .initrdNotFound, .vmStartFailed, .vmStopFailed,
-             .vmCommunicationFailed:
+             .vmCommunicationFailed, .portAlreadyAllocated:
             return 125  // cocker itself failed
         default:
             return 1
