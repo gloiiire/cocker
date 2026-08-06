@@ -200,7 +200,20 @@ struct NetworkInspectCommand: AsyncParsableCommand {
 }
 
 struct NetworkConnectCommand: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "connect", abstract: "Connect a container to a network")
+    static let configuration = CommandConfiguration(
+        commandName: "connect",
+        abstract: "Move a stopped container onto a network",
+        discussion: """
+        A container has one L2 switch port, so it is on exactly one network:
+        this MOVES it rather than adding a second attachment, which is where
+        it differs from docker.
+
+        The port is keyed from the container's network when its VM boots and
+        is never re-keyed, so the change applies at the next start. A running
+        container is refused rather than reported as connected — stop it, run
+        this, start it again.
+        """
+    )
 
     @Argument(help: "Network name")
     var network: String
@@ -216,16 +229,33 @@ struct NetworkConnectCommand: AsyncParsableCommand {
             let request = try IPCRequest(type: .networkConnect, payload: Payload(network: network, container: container))
             _ = try await client.send(request)
             if UX.TTY.current.isInteractive {
-                let trailing = "→ " + UX.TTY.paint(network, .accent) + " · " + UX.formatElapsed(Date().timeIntervalSince(start))
+                // "Moved", not "Connected": a container has one L2 switch
+                // port, so this replaces its network rather than adding one.
+                // And the port is keyed when the VM boots, so a container
+                // that is already up would have to be restarted — which is
+                // why the daemon refuses that case outright instead of
+                // reporting a connection that never happened.
+                let trailing = "→ " + UX.TTY.paint(network, .accent)
+                    + " · applies at next start · "
+                    + UX.formatElapsed(Date().timeIntervalSince(start))
                 print(UX.ActionLine(
                     icon: .success, type: .container, name: container,
-                    status: "Connected", trailing: trailing
+                    status: "Moved", trailing: trailing
                 ).render())
             }
         } catch let error as CockerError {
+            // Carry the error's own hint through — rebuilding the block here
+            // used to drop it, so "stop the container first" never reached
+            // the person who needed it.
             UX.Failure.emit(
                 headline: "Cannot connect \(container) to \(network)",
-                reason: error.description
+                reason: error.description,
+                // The error crosses the socket as `.daemon(msg, code)`, which
+                // carries the message and the exit code but not the hint —
+                // so supply the one that is always right here rather than
+                // letting it arrive empty.
+                hint: error.presentation.hint
+                    ?? "stop the container, connect it, then start it again"
             )
             throw ExitCode(error.exitCode)
         }
@@ -233,7 +263,16 @@ struct NetworkConnectCommand: AsyncParsableCommand {
 }
 
 struct NetworkDisconnectCommand: AsyncParsableCommand {
-    static let configuration = CommandConfiguration(commandName: "disconnect", abstract: "Disconnect a container from a network")
+    static let configuration = CommandConfiguration(
+        commandName: "disconnect",
+        abstract: "Move a stopped container back to the default bridge",
+        discussion: """
+        A container is always on some network, so leaving one means returning
+        to `bridge`. Applies at the next start, for the same reason `connect`
+        does: the switch port is wired when the VM boots. A running container
+        is refused rather than reported as disconnected.
+        """
+    )
 
     /// The payload has no force field; this only picks a hint string.
     @Flag(name: [.short, .customLong("force")],
@@ -254,7 +293,9 @@ struct NetworkDisconnectCommand: AsyncParsableCommand {
             let request = try IPCRequest(type: .networkDisconnect, payload: Payload(network: network, container: container))
             _ = try await client.send(request)
             if UX.TTY.current.isInteractive {
-                let trailing = "from " + UX.TTY.paint(network, .accent) + " · " + UX.formatElapsed(Date().timeIntervalSince(start))
+                let trailing = "from " + UX.TTY.paint(network, .accent)
+                    + " · back on bridge at next start · "
+                    + UX.formatElapsed(Date().timeIntervalSince(start))
                 print(UX.ActionLine(
                     icon: .success, type: .container, name: container,
                     status: "Disconnected", trailing: trailing
@@ -264,7 +305,8 @@ struct NetworkDisconnectCommand: AsyncParsableCommand {
             UX.Failure.emit(
                 headline: "Cannot disconnect \(container) from \(network)",
                 reason: error.description,
-                hint: force ? nil : "use `--force` (-f) if the container is unresponsive"
+                hint: error.presentation.hint
+                    ?? "stop the container, disconnect it, then start it again"
             )
             throw ExitCode(error.exitCode)
         }

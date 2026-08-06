@@ -340,9 +340,21 @@ final class ContainerEngine {
             c.startedAt = Date()
         }
 
-        // Connect to network
+        // Record network membership. NOT via `connect`: the container is
+        // already live here, and `connect` refuses a live container because
+        // its switch port cannot be re-keyed. The port is being wired with
+        // this network right now, so the membership is simply a fact to
+        // record. The old `try? connect` swallowed the refusal, which is why
+        // `network inspect <net>` never listed containers started with
+        // `--network <net>`.
         if let networkName = config.network {
-            try? await networks.connect(containerID: id, networkID: networkName)
+            do {
+                try await networks.recordMembershipAtCreate(
+                    containerID: id, networkID: networkName)
+            } catch {
+                CockerLog.shared.warn("eng",
+                    "could not record \(id) as a member of \(networkName): \(error)")
+            }
         }
 
         // Démarre le port forwarding TCP (host port → container IP:port)
