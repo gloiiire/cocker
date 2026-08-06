@@ -56,6 +56,14 @@ public enum CockerError: Error, CustomStringConvertible {
     /// A `--restart` / compose `restart:` value we don't understand.
     /// Refused rather than silently downgraded to "never restart".
     case invalidRestartPolicy(String)
+    /// An operation that only makes sense on a container that is not
+    /// currently running. Payload is (container, what was attempted).
+    ///
+    /// `network connect`/`disconnect` re-key the L2 switch port, which is
+    /// created when the VM boots and never re-keyed afterwards. They used to
+    /// append to a JSON array and print success while the container stayed
+    /// exactly where it was.
+    case containerMustBeStopped(String, String)
 
     // Config errors
     case invalidPortMapping(String)
@@ -115,6 +123,8 @@ public enum CockerError: Error, CustomStringConvertible {
         case .responseDecodingFailed(let msg): return "Response decoding failed: \(msg)"
         case .daemon(let msg, _): return msg
         case .invalidRestartPolicy(let s): return "Invalid restart policy: \(s)"
+        case .containerMustBeStopped(let id, let action):
+            return "Cannot \(action) \(id) while it is running"
         case .invalidPortMapping(let s): return "Invalid port mapping: \(s) (expected format: host:container)"
         case .invalidVolumeSpec(let s): return "Invalid volume spec: \(s) (expected format: source:dest[:ro])"
         case .invalidEnvironmentVar(let s): return "Invalid environment variable: \(s)"
@@ -155,8 +165,14 @@ public enum CockerError: Error, CustomStringConvertible {
             return ("Invalid restart policy: \(s)", nil,
                     "expected `no`, `always`, `unless-stopped`, `on-failure` "
                     + "or `on-failure:<max>`")
+        case .containerMustBeStopped(let id, let action):
+            return ("Cannot \(action) \(id) while it is running",
+                    "the network is wired when the VM boots and cannot be re-keyed live",
+                    "stop the container, run the command, then start it again")
         case .invalidPortMapping(let s):
-            return ("Invalid port mapping: \(s)", nil, "expected `host:container`")
+            return ("Invalid port mapping: \(s)", nil,
+                    "expected `host:container`, optionally `IP:host:container` "
+                    + "with a literal IPv4 address (e.g. `127.0.0.1:8080:80`)")
         case .invalidVolumeSpec(let s):
             return ("Invalid volume spec: \(s)", nil, "expected `source:dest[:ro]`")
         case .daemon(let msg, _):
@@ -183,7 +199,7 @@ public enum CockerError: Error, CustomStringConvertible {
         case .containerNotFound, .imageNotFound, .networkNotFound, .volumeNotFound,
              .manifestNotFound, .dockerfileNotFound:
             return 127  // no such object
-        case .permissionDenied, .notImplemented:
+        case .permissionDenied, .notImplemented, .containerMustBeStopped:
             return 126  // found but not runnable
         case .daemon(_, let code):
             // The daemon told us what kind of failure this was ; keep it.

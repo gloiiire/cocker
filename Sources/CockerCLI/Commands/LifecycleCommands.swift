@@ -329,13 +329,20 @@ struct LogsCommand: AsyncParsableCommand {
     @Flag(name: [.short, .customLong("timestamps")], help: "Show timestamps")
     var timestamps = false
 
-    @Option(name: .customLong("since"), help: "Show logs since timestamp (RFC3339)")
+    /// Parsed, sent, and never read: `ContainerEngine.logs` consults only
+    /// `tail` and `follow`.
+    @Option(name: .customLong("since"),
+            help: "Not honoured: the whole retained buffer is returned")
     var since: String?
 
     @Argument(help: "Container ID or name")
     var container: String
 
     mutating func run() async throws {
+        if since != nil {
+            UX.IgnoredFlag.warn("--since",
+                "logs are not filtered by time; the whole retained buffer is returned")
+        }
         let client = IPCClient()
         let sinceDate = since.flatMap { ISO8601DateFormatter().date(from: $0) }
         let payload = LogsRequest(id: container, follow: follow, tail: tail, timestamps: timestamps, since: sinceDate)

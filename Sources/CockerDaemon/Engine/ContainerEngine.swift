@@ -343,9 +343,21 @@ final class ContainerEngine {
             c.startedAt = Date()
         }
 
-        // Connect to network
+        // Record network membership. NOT via `connect`: the container is
+        // already live here, and `connect` refuses a live container because
+        // its switch port cannot be re-keyed. The port is being wired with
+        // this network right now, so the membership is simply a fact to
+        // record. The old `try? connect` swallowed the refusal, which is why
+        // `network inspect <net>` never listed containers started with
+        // `--network <net>`.
         if let networkName = config.network {
-            try? await networks.connect(containerID: id, networkID: networkName)
+            do {
+                try await networks.recordMembershipAtCreate(
+                    containerID: id, networkID: networkName)
+            } catch {
+                CockerLog.shared.warn("eng",
+                    "could not record \(id) as a member of \(networkName): \(error)")
+            }
         }
 
         // Démarre le port forwarding TCP (host port → container IP:port)
@@ -1595,11 +1607,12 @@ final class ContainerEngine {
     /// self-assignment would collide.
     ///
     /// See `docs/DESIGN-network-without-vmnet.md` for the measurements.
+    ///
+    /// The switch itself lives in `CockerEnv` so the CLI reads the same answer
+    /// — when it was a string literal here, `cocker daemon status` couldn't
+    /// consult it and kept printing a lease gauge for a pool nothing uses.
     static var staticNATEnabled: Bool {
-        switch ProcessInfo.processInfo.environment["COCKER_STATIC_ETH0"]?.lowercased() {
-        case "0", "false", "no", "off": return false
-        default: return true
-        }
+        CockerEnv.staticETH0Enabled
     }
 
     static func maybeTriggerLeasePoolClear() {
