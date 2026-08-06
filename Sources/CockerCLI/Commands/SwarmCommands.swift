@@ -81,7 +81,9 @@ struct StackDeployCommand: AsyncParsableCommand {
     @Option(name: [.short, .customLong("compose-file")], help: "Compose file path")
     var composeFile: String = "docker-compose.yml"
 
-    @Flag(name: .customLong("with-registry-auth"), help: "Send registry auth to agents")
+    /// Never read. There are no agents to send credentials to.
+    @Flag(name: .customLong("with-registry-auth"),
+          help: "Not honoured: single-node, there are no agents")
     var withRegistryAuth = false
 
     @Argument
@@ -411,10 +413,16 @@ struct ServiceCreateCommand: AsyncParsableCommand {
     @Option(name: .customLong("network"), help: "Network to attach service to")
     var network: String?
 
-    @Option(name: .customLong("mount"), help: "Attach a volume")
+    /// Never read: `run()` builds a RunConfig with ports, env, network and
+    /// labels, and never sets `config.volumes`.
+    @Option(name: .customLong("mount"),
+            help: "Not honoured: no volume is attached")
     var mounts: [String] = []
 
-    @Option(name: .customLong("constraint"), help: "Placement constraints")
+    /// Never read. There is one node, so there is nothing to place — but
+    /// the sibling `--replicas` says so in its help and this did not.
+    @Option(name: .customLong("constraint"),
+            help: "Not honoured: single-node, nothing to place")
     var constraints: [String] = []
 
     @Argument
@@ -424,6 +432,12 @@ struct ServiceCreateCommand: AsyncParsableCommand {
     var command: [String] = []
 
     mutating func run() async throws {
+        if !mounts.isEmpty {
+            UX.IgnoredFlag.warn("--mount", "the service starts with no volume attached")
+        }
+        if !constraints.isEmpty {
+            UX.IgnoredFlag.warn("--constraint", "single-node: there is nothing to place")
+        }
         var config = RunConfig(image: image, command: command)
         config.name = name
         config.detach = true

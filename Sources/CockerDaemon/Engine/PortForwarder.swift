@@ -40,13 +40,14 @@ public actor PortForwarder {
             }
             do {
                 let proc = try spawnForwarder(
+                    hostIP: port.hostIP,
                     hostPort: port.hostPort,
                     containerIP: containerIP,
                     containerPort: port.containerPort
                 )
                 procs.append(proc)
                 CockerLog.shared.info("portfwd",
-                    "0.0.0.0:\(port.hostPort) → \(containerIP):\(port.containerPort) " +
+                    "\(port.hostIP):\(port.hostPort) → \(containerIP):\(port.containerPort) " +
                     "(pid \(proc.processIdentifier), container \(String(containerID.prefix(12))))")
             } catch {
                 CockerLog.shared.error("portfwd", "error spawning forwarder for \(port.hostPort): \(error)")
@@ -90,6 +91,7 @@ public actor PortForwarder {
     // MARK: - Spawn helper
 
     private func spawnForwarder(
+        hostIP: String,
         hostPort: UInt16,
         containerIP: String,
         containerPort: UInt16
@@ -101,7 +103,7 @@ public actor PortForwarder {
         let proc = Process()
         proc.executableURL = portFwdBinary
         proc.arguments = [
-            "--listen", "0.0.0.0:\(hostPort)",
+            "--listen", "\(hostIP):\(hostPort)",
             "--target", "\(containerIP):\(containerPort)",
         ]
         // Pipe stderr du forwarder dans celui du daemon (logs centralisés)
