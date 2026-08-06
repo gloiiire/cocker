@@ -577,8 +577,23 @@ struct UpdateCommand: AsyncParsableCommand {
             let start = Date()
             do {
                 let request = try IPCRequest(type: .update, payload: UpdateRequest(containerID: id, cpus: cpus, memoryMB: memory))
-                _ = try await client.send(request)
+                let live = try await client.send(request)
                 UX.printResult(.container, id, verb: .update, elapsed: Date().timeIntervalSince(start))
+                // Docker applies --cpus / -m to a running container. cocker
+                // can't: VMRuntime reads cpuCount/memoryMB when it builds the
+                // VM configuration, so a running container keeps what it
+                // booted with. Measured: update --cpus 4 -m 1024 recorded 4
+                // and 1024 while the VM still reported `nproc` 2 and
+                // MemTotal 501344 kB. The record changed; the container
+                // didn't, and nothing said so.
+                let status = (try? live.decode(Container.self))?.status
+                if status == .running || status == .paused {
+                    UX.Warning.emit(
+                        "resource limits apply at the next start",
+                        note: "\(id) is running with the values it booted with; "
+                            + "`cocker restart \(id)` to pick these up"
+                    )
+                }
             } catch let error as CockerError {
                 failures.record(error)
                 UX.Failure.emit(
