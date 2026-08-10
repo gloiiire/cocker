@@ -64,7 +64,7 @@ struct Args {
 
 func printUsage() {
     print("""
-    Usage: cocker-portfwd --listen ADDR:PORT --target IP:PORT
+    Usage: cocker-portfwd --listen ADDR:PORT --target IP:PORT [--udp]
 
     For each incoming TCP connection on ADDR:PORT, spawns /usr/bin/nc to
     forward bidirectionally to IP:PORT. /usr/bin/nc is an Apple system
@@ -148,24 +148,63 @@ func runUDPRelay(addr: String, port: UInt16, targetIP: String, targetPort: UInt1
 
     log("listening on \(addr):\(port)/udp → \(targetIP):\(targetPort)")
 
-    /// One upstream socket per client address. `connect()`ing it means the
-    /// kernel filters replies to this peer for us, and recv() needs no
-    /// source check of our own.
+    /// One `/usr/bin/nc -u` per client address.
+    ///
+    /// NOT a socket of our own, which is what shipped in 1.2.0.0 and did not
+    /// work: macOS Sequoia sandboxes `connect()` to private vmnet bridges
+    /// from user-signed binaries, so the relay bound its listener fine and
+    /// every upstream datagram was dropped. `lsof` showed it listening, the
+    /// container showed it listening, and nothing crossed. The TCP path in
+    /// this same file already delegates to `/usr/bin/nc` — an Apple system
+    /// binary that traverses the restriction — and says so in its own help
+    /// text. UDP now does the same.
+    ///
+    /// Datagram boundaries: nc reads its stdin and writes one datagram per
+    /// read, so writing one datagram per write preserves them in practice.
+    /// A sender that fragments a message across several writes would see it
+    /// arrive as several datagrams — acceptable for the protocols that use
+    /// published UDP ports, and the honest limit of this approach.
     struct Session {
-        let fd: Int32
+        let proc: Process
+        let toContainer: FileHandle
+        let fromContainer: FileHandle
         var lastSeen: time_t
     }
     var sessions: [String: Session] = [:]
     let idleTimeout: time_t = 60
-    // Each session costs a descriptor. Past this the oldest is reaped rather
-    // than refusing new clients outright.
-    let maxSessions = 128
+    // Each session costs a process and two pipes. Past this the oldest is
+    // reaped rather than refusing new clients outright.
+    let maxSessions = 64
 
     func key(_ sa: sockaddr_in) -> String {
         var a = sa
         var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
         inet_ntop(AF_INET, &a.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
         return "\(String(cString: buf)):\(UInt16(bigEndian: a.sin_port))"
+    }
+
+    func openSession() -> Session? {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/nc")
+        proc.arguments = ["-u", targetIP, String(targetPort)]
+        let inPipe = Pipe(), outPipe = Pipe()
+        proc.standardInput = inPipe
+        proc.standardOutput = outPipe
+        proc.standardError = FileHandle.nullDevice
+        do { try proc.run() } catch {
+            log("nc -u \(targetIP) \(targetPort): \(error)")
+            return nil
+        }
+        return Session(proc: proc,
+                       toContainer: inPipe.fileHandleForWriting,
+                       fromContainer: outPipe.fileHandleForReading,
+                       lastSeen: time(nil))
+    }
+
+    func closeSession(_ s: Session) {
+        if s.proc.isRunning { s.proc.terminate() }
+        try? s.toContainer.close()
+        try? s.fromContainer.close()
     }
 
     var buf = [UInt8](repeating: 0, count: 65535)
@@ -176,8 +215,9 @@ func runUDPRelay(addr: String, port: UInt16, targetIP: String, targetPort: UInt1
         fdSet(listenFD, &readSet)
         var maxFD = listenFD
         for (_, s) in sessions {
-            fdSet(s.fd, &readSet)
-            if s.fd > maxFD { maxFD = s.fd }
+            let fd = s.fromContainer.fileDescriptor
+            fdSet(fd, &readSet)
+            if fd > maxFD { maxFD = fd }
         }
         var tv = timeval(tv_sec: 10, tv_usec: 0)
         let ready = select(maxFD + 1, &readSet, nil, nil, &tv)
@@ -198,27 +238,17 @@ func runUDPRelay(addr: String, port: UInt16, targetIP: String, targetPort: UInt1
                     if sessions[k] == nil {
                         if sessions.count >= maxSessions,
                            let oldest = sessions.min(by: { $0.value.lastSeen < $1.value.lastSeen }) {
-                            close(oldest.value.fd)
+                            closeSession(oldest.value)
                             sessions.removeValue(forKey: oldest.key)
                         }
-                        let up = socket(AF_INET, SOCK_DGRAM, 0)
-                        if up >= 0 {
-                            let ok = withUnsafePointer(to: &target) { ptr in
-                                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                                    connect(up, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-                                }
-                            }
-                            if ok == 0 {
-                                sessions[k] = Session(fd: up, lastSeen: now)
-                            } else {
-                                close(up)
-                            }
-                        }
+                        if let s = openSession() { sessions[k] = s }
                     }
                     if var s = sessions[k] {
-                        _ = send(s.fd, buf, n, 0)
-                        s.lastSeen = now
-                        sessions[k] = s
+                        // One write per datagram — see the boundary note above.
+                        let payload = Data(buf[0..<n])
+                        do { try s.toContainer.write(contentsOf: payload) }
+                        catch { closeSession(s); sessions.removeValue(forKey: k) }
+                        if sessions[k] != nil { s.lastSeen = now; sessions[k] = s }
                     }
                 }
             }
@@ -226,8 +256,8 @@ func runUDPRelay(addr: String, port: UInt16, targetIP: String, targetPort: UInt1
             // Container → host. The reply goes back to the client whose
             // datagram opened this session, which is the whole reason the
             // table is keyed that way.
-            for (k, s) in sessions where fdIsSet(s.fd, &readSet) {
-                let n = recv(s.fd, &buf, buf.count, 0)
+            for (k, s) in sessions where fdIsSet(s.fromContainer.fileDescriptor, &readSet) {
+                let n = read(s.fromContainer.fileDescriptor, &buf, buf.count)
                 if n > 0 {
                     var to = parseClientKey(k)
                     _ = withUnsafePointer(to: &to) { ptr in
@@ -239,6 +269,11 @@ func runUDPRelay(addr: String, port: UInt16, targetIP: String, targetPort: UInt1
                     var updated = s
                     updated.lastSeen = now
                     sessions[k] = updated
+                } else {
+                    // nc exited or the pipe closed — drop the session so the
+                    // next datagram from this client opens a fresh one.
+                    closeSession(s)
+                    sessions.removeValue(forKey: k)
                 }
             }
         }
@@ -246,7 +281,7 @@ func runUDPRelay(addr: String, port: UInt16, targetIP: String, targetPort: UInt1
         // Reap idle sessions. UDP gives no close, so this is the only thing
         // that bounds the table.
         for (k, s) in sessions where now - s.lastSeen > idleTimeout {
-            close(s.fd)
+            closeSession(s)
             sessions.removeValue(forKey: k)
         }
     }

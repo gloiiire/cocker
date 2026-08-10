@@ -7,6 +7,22 @@ Notable changes per release. Versions are `MAJOR.MINOR.PATCH.BUILD` — see
 Entries describe what changed for *you*, not what moved in the code. A user
 should be able to read one line and know whether it affects them.
 
+## 1.2.0.1 — 2026-08-10
+
+### Fixed
+
+- **UDP port forwarding did not work on an installed cocker.** 1.2.0.0
+  announced it; on a Homebrew install the relay bound its listener and no
+  datagram ever reached the container. macOS Sequoia sandboxes `connect()`
+  to private vmnet bridges from user-signed binaries, and `cocker-portfwd`
+  ships ad-hoc signed — so its own sockets could not get through. It now
+  relays through `/usr/bin/nc -u`, the same Apple system binary the TCP path
+  has always used for exactly this reason.
+
+  Verified this time on the installed binary rather than a development
+  build: the difference between the two *is* the signature, which is the
+  thing the sandbox checks.
+
 ## 1.2.0.0 — 2026-08-10
 
 A correctness pass over what cocker already claimed to do. Every item below
