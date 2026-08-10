@@ -435,20 +435,26 @@ struct DockerfileARGBeforeFROMTests {
 @Suite("/cocker-spec trailers")
 struct CockerSpecTrailerTests {
 
-    /// Bumped to v6 with the tty trailer. The guest keys its parse off this
-    /// byte, so a mismatch here means older/newer sides disagree about the
-    /// layout — exactly the class of bug the magic exists to catch.
-    @Test func magicByteIsV6() {
+    /// An empty v7 trailer: read_only(1) + four zero list counts (4×4).
+    /// Named rather than baked into every offset below, because the last
+    /// time this layout grew, six tests broke on arithmetic instead of on
+    /// the thing they were guarding.
+    private static let emptyV7Trailer = 1 + 4 * 4
+
+    /// v7 adds read-only root, tmpfs, extra hosts and DNS. The guest keys
+    /// its parse off this byte, so a mismatch means the two sides disagree
+    /// about the layout — exactly what the magic exists to catch.
+    @Test func magicByteIsV7() {
         let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil)
-        #expect(data.starts(with: Array("COCKER\u{06}".utf8)))
+        #expect(data.starts(with: Array("COCKER\u{07}".utf8)))
     }
 
-    /// v6 layout: … stop_signal(4) tty(1) rows(4) cols(4).
+    /// v7 layout: … stop_signal(4) tty(1) rows(4) cols(4) ‖ read_only(1)
+    /// n_tmpfs(4) n_hosts(4) n_dns(4) n_dns_search(4).
     @Test func stopSignalPrecedesTheTTYTrailer() {
         let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil,
                                               stopSignal: "SIGQUIT")
-        let n = data.count
-        // 9 bytes of tty trailer follow the 4-byte stop signal.
+        let n = data.count - Self.emptyV7Trailer
         #expect(data[n - 13] == 0)
         #expect(data[n - 12] == 0)
         #expect(data[n - 11] == 0)
@@ -457,18 +463,15 @@ struct CockerSpecTrailerTests {
 
     @Test func defaultStopSignalIsZero() {
         let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil)
-        let n = data.count
-        #expect(data[n - 13] == 0)
-        #expect(data[n - 12] == 0)
-        #expect(data[n - 11] == 0)
+        let n = data.count - Self.emptyV7Trailer
         #expect(data[n - 10] == 0)   // no STOPSIGNAL → init's default
     }
 
     @Test func ttyTrailerDefaultsToOff() {
         let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil)
-        let n = data.count
-        #expect(data[n - 9] == 0)                    // tty flag
-        #expect(Array(data[(n - 8)...]) == [0, 0, 0, 0, 0, 0, 0, 0])  // rows + cols
+        let n = data.count - Self.emptyV7Trailer
+        #expect(data[n - 9] == 0)                                     // tty flag
+        #expect(Array(data[(n - 8)..<n]) == [0, 0, 0, 0, 0, 0, 0, 0])  // rows + cols
     }
 
     /// `run -it` : the flag and the caller's real window size have to reach
@@ -477,10 +480,10 @@ struct CockerSpecTrailerTests {
     @Test func ttyTrailerCarriesTheGeometry() {
         let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil,
                                               tty: true, rows: 40, cols: 120)
-        let n = data.count
+        let n = data.count - Self.emptyV7Trailer
         #expect(data[n - 9] == 1)
         #expect(Array(data[(n - 8)..<(n - 4)]) == [0, 0, 0, 40])
-        #expect(Array(data[(n - 4)...]) == [0, 0, 0, 120])
+        #expect(Array(data[(n - 4)..<n]) == [0, 0, 0, 120])
     }
 
     /// A geometry that wouldn't fit a UInt16 would truncate into nonsense
@@ -488,11 +491,56 @@ struct CockerSpecTrailerTests {
     @Test func absurdGeometryIsClamped() {
         let data = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil,
                                               tty: true, rows: 999_999, cols: -5)
-        let n = data.count
+        let n = data.count - Self.emptyV7Trailer
         #expect(Array(data[(n - 8)..<(n - 4)]) == [0, 0, 255, 255])  // clamped to 65535
-        #expect(Array(data[(n - 4)...]) == [0, 0, 0, 0])             // negative → 0
+        #expect(Array(data[(n - 4)..<n]) == [0, 0, 0, 0])            // negative → 0
+    }
+
+    // MARK: - v7 : the four flags that used to be accepted and ignored
+
+    @Test func readOnlyDefaultsToOffAndSetsWhenAsked() {
+        let off = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil)
+        #expect(off[off.count - Self.emptyV7Trailer] == 0)
+        let on = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil,
+                                            readOnly: true)
+        #expect(on[on.count - Self.emptyV7Trailer] == 1)
+    }
+
+    /// Each list is length-prefixed, so a v6 guest reading a v7 spec stops
+    /// at the tty trailer and behaves exactly as it did before.
+    @Test func theListsAreLengthPrefixedInOrder() {
+        let data = RootfsBootstrap.encodeSpec(
+            command: ["true"], env: [:], workdir: nil,
+            readOnly: true,
+            tmpfsMounts: ["/run:size=64m"],
+            addHosts: ["db:10.0.0.5"],
+            dnsServers: ["1.1.1.1"],
+            dnsSearch: ["example.com"])
+        let bytes = Array(data)
+        // Order matters: tmpfs, hosts, dns, dns-search. Reading them in the
+        // wrong order on the guest would mount a hostname.
+        let text = String(decoding: bytes, as: UTF8.self)
+        let iTmpfs = text.range(of: "/run:size=64m")
+        let iHosts = text.range(of: "db:10.0.0.5")
+        let iDNS = text.range(of: "1.1.1.1")
+        let iSearch = text.range(of: "example.com")
+        #expect(iTmpfs != nil && iHosts != nil && iDNS != nil && iSearch != nil)
+        if let a = iTmpfs, let b = iHosts, let c = iDNS, let d = iSearch {
+            #expect(a.lowerBound < b.lowerBound)
+            #expect(b.lowerBound < c.lowerBound)
+            #expect(c.lowerBound < d.lowerBound)
+        }
+    }
+
+    @Test func emptyListsCostFiveWordsAndNothingElse() {
+        let bare = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil)
+        let withOne = RootfsBootstrap.encodeSpec(command: ["true"], env: [:], workdir: nil,
+                                                 dnsServers: ["1.1.1.1"])
+        // 4-byte length prefix + the 7 bytes of "1.1.1.1".
+        #expect(withOne.count == bare.count + 4 + 7)
     }
 }
+
 
 // Bug #52 — IP discovery race. `/cocker-ip` from the previous container
 // (cloned through APFS clonefile from the image rootfs) lingered, so

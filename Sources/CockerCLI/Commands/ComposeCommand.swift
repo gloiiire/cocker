@@ -822,12 +822,23 @@ struct ComposePauseCommand: AsyncParsableCommand {
             (svcNames == nil || svcNames!.contains(c.labels["com.cocker.service"] ?? ""))
         }
 
+        let failures = FailureCode()
         for c in toProcess {
             let payload = ContainerIDRequest(id: c.id)
             let req = try IPCRequest(type: .pause, payload: payload)
-            _ = try? await client.send(req)
-            print(c.name)
+            // Printing the name is docker-compose's success
+            // convention, and `try?` made a container that failed to
+            // pause print exactly like one that succeeded, exit 0.
+            do {
+                _ = try await client.send(req)
+                print(c.name)
+            } catch let error as CockerError {
+                failures.record(error)
+                UX.Failure.emit(headline: "Cannot pause \(c.name)",
+                                reason: error.description)
+            }
         }
+        try failures.throwIfFailed()
     }
 }
 
@@ -860,12 +871,23 @@ struct ComposeUnpauseCommand: AsyncParsableCommand {
             (svcNames == nil || svcNames!.contains(c.labels["com.cocker.service"] ?? ""))
         }
 
+        let failures = FailureCode()
         for c in toProcess {
             let payload = ContainerIDRequest(id: c.id)
             let req = try IPCRequest(type: .unpause, payload: payload)
-            _ = try? await client.send(req)
-            print(c.name)
+            // Printing the name is docker-compose's success
+            // convention, and `try?` made a container that failed to
+            // unpause print exactly like one that succeeded, exit 0.
+            do {
+                _ = try await client.send(req)
+                print(c.name)
+            } catch let error as CockerError {
+                failures.record(error)
+                UX.Failure.emit(headline: "Cannot unpause \(c.name)",
+                                reason: error.description)
+            }
         }
+        try failures.throwIfFailed()
     }
 }
 
@@ -875,10 +897,18 @@ struct ComposeConfigCommand: AsyncParsableCommand {
     @Option(name: [.short, .customLong("file")], help: "Compose file path")
     var file: String = "cocker-compose.yml"
 
-    @Option(name: [.short, .customLong("project-name")], help: "Project name")
+    /// Never read: `config` resolves the file, substitutes ${VAR} and
+    /// prints. Every other compose subcommand feeds this into
+    /// `ProjectName.normalize`.
+    @Option(name: [.short, .customLong("project-name")],
+            help: "Not honoured: `config` only renders the file")
     var projectName: String?
 
     mutating func run() async throws {
+        if projectName != nil {
+            UX.IgnoredFlag.warn("--project-name",
+                "`config` renders the file as written; no project name is applied")
+        }
         let composePath = resolvePath(file)
         guard FileManager.default.fileExists(atPath: composePath) else {
             UX.Failure.emit(
@@ -929,12 +959,23 @@ struct ComposeKillCommand: AsyncParsableCommand {
             (services.isEmpty || services.contains(c.labels["com.cocker.service"] ?? ""))
         }
 
+        let failures = FailureCode()
         for c in toKill {
             let payload = ContainerIDRequest(id: c.id, signal: signal)
             let req = try IPCRequest(type: .kill, payload: payload)
-            _ = try? await client.send(req)
-            print(c.name)
+            // Printing the name is docker-compose's success
+            // convention, and `try?` made a container that failed to
+            // kill print exactly like one that succeeded, exit 0.
+            do {
+                _ = try await client.send(req)
+                print(c.name)
+            } catch let error as CockerError {
+                failures.record(error)
+                UX.Failure.emit(headline: "Cannot kill \(c.name)",
+                                reason: error.description)
+            }
         }
+        try failures.throwIfFailed()
     }
 }
 
@@ -1023,7 +1064,7 @@ struct ComposePortCommand: AsyncParsableCommand {
         }
 
         if let mapping = container.ports.first(where: { $0.containerPort == port && $0.proto.rawValue == proto }) {
-            print("0.0.0.0:\(mapping.hostPort)")
+            print("\(mapping.hostIP):\(mapping.hostPort)")
         } else {
             UX.Failure.emit(
                 headline: "Port \(privatePort)/\(proto) not published for service \(service)",

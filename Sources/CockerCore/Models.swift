@@ -52,6 +52,21 @@ public struct Container: Codable, Sendable, Identifiable {
     /// non-zero exit. Persisted so `cocker inspect` and the Docker API's
     /// RestartCount field match across daemon restarts.
     public var restartCount: Int
+    /// `--add-host name:ip` entries appended to /etc/hosts by cocker-init.
+    public var addHosts: [String]?
+    /// `--dns` servers. Used as the DNS proxy's upstream rather than
+    /// replacing 127.0.0.1, so container-name resolution keeps working.
+    public var dnsServers: [String]?
+    /// `--dns-search` domains written into resolv.conf's `search` line.
+    public var dnsSearch: [String]?
+    /// `--tmpfs /path[:opts]` mounts made inside the container.
+    public var tmpfsMounts: [String]?
+    /// `--read-only`: remount the container root read-only just before the
+    /// user command execs, once cocker-init has finished writing to it.
+    public var readOnlyRootfs: Bool?
+    /// Retry ceiling from `--restart on-failure:<max>`. nil means the
+    /// engine's default. Optional so containers written before it decode.
+    public var restartMaxRetries: Int?
     public var privileged: Bool
     public var capAdd: [String]
     public var capDrop: [String]
@@ -176,6 +191,12 @@ public struct Container: Codable, Sendable, Identifiable {
         self.healthFailingStreak = try c.decodeIfPresent(Int.self, forKey: .healthFailingStreak) ?? 0
         self.healthLog = try c.decodeIfPresent([HealthLogEntry].self, forKey: .healthLog) ?? []
         self.restartCount = try c.decodeIfPresent(Int.self, forKey: .restartCount) ?? 0
+        self.addHosts = try c.decodeIfPresent([String].self, forKey: .addHosts)
+        self.dnsServers = try c.decodeIfPresent([String].self, forKey: .dnsServers)
+        self.dnsSearch = try c.decodeIfPresent([String].self, forKey: .dnsSearch)
+        self.tmpfsMounts = try c.decodeIfPresent([String].self, forKey: .tmpfsMounts)
+        self.readOnlyRootfs = try c.decodeIfPresent(Bool.self, forKey: .readOnlyRootfs)
+        self.restartMaxRetries = try c.decodeIfPresent(Int.self, forKey: .restartMaxRetries)
         self.privileged = try c.decodeIfPresent(Bool.self, forKey: .privileged) ?? false
         self.capAdd = try c.decodeIfPresent([String].self, forKey: .capAdd) ?? []
         self.capDrop = try c.decodeIfPresent([String].self, forKey: .capDrop) ?? []
@@ -287,6 +308,19 @@ public enum ContainerStatus: String, Codable, Sendable {
     case dead
 
     public var description: String { rawValue }
+
+    /// A VM exists for this container and its L2 switch port is already
+    /// wired. The port is keyed from `networkName` when the VM boots and is
+    /// never re-keyed, so anything that changes which network the container
+    /// is on has to wait for the next start.
+    ///
+    /// `.created` is not live: the record exists, the VM does not.
+    public var isLive: Bool {
+        switch self {
+        case .running, .paused, .restarting: return true
+        case .created, .stopped, .dead:      return false
+        }
+    }
 }
 
 public struct PortMapping: Codable, Sendable, Equatable, CustomStringConvertible {
@@ -294,13 +328,34 @@ public struct PortMapping: Codable, Sendable, Equatable, CustomStringConvertible
     public let containerPort: UInt16
     public let proto: TransportProto
 
-    public init(hostPort: UInt16, containerPort: UInt16, proto: TransportProto = .tcp) {
+    /// Host interface to bind, from the `IP:HOST:CONTAINER` form of `-p`.
+    ///
+    /// `0.0.0.0` (every interface) when the user didn't say. This used to be
+    /// hardcoded everywhere the mapping was rendered or spawned, so
+    /// `-p 127.0.0.1:5432:5432` published a database on the LAN — the one
+    /// direction a user cannot afford to be wrong about.
+    public let hostIP: String
+
+    public init(hostPort: UInt16, containerPort: UInt16,
+                proto: TransportProto = .tcp, hostIP: String = "0.0.0.0") {
         self.hostPort = hostPort
         self.containerPort = containerPort
         self.proto = proto
+        self.hostIP = hostIP
     }
 
-    public var description: String { "0.0.0.0:\(hostPort)->\(containerPort)/\(proto.rawValue)" }
+    /// Hand-rolled so containers written before `hostIP` existed still decode.
+    /// A missing key means the mapping was created when every bind was
+    /// implicitly `0.0.0.0`, which is exactly what it got.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        hostPort = try c.decode(UInt16.self, forKey: .hostPort)
+        containerPort = try c.decode(UInt16.self, forKey: .containerPort)
+        proto = try c.decodeIfPresent(TransportProto.self, forKey: .proto) ?? .tcp
+        hostIP = try c.decodeIfPresent(String.self, forKey: .hostIP) ?? "0.0.0.0"
+    }
+
+    public var description: String { "\(hostIP):\(hostPort)->\(containerPort)/\(proto.rawValue)" }
 
     public static func parse(_ s: String) throws -> PortMapping {
         guard let first = try parseSpec(s).first else {
@@ -316,9 +371,13 @@ public struct PortMapping: Codable, Sendable, Equatable, CustomStringConvertible
     /// and compose `compactMap`'d the throw away, so the port was simply
     /// never published and nothing said so.
     ///
-    /// A host IP is accepted and ignored: cocker's forwarder binds all
-    /// interfaces, and dropping the whole mapping over an unsupported bind
-    /// address is worse than binding it more widely than asked.
+    /// A host IP is honoured. It used to be parsed and thrown away, on the
+    /// reasoning that binding more widely than asked beat refusing the
+    /// mapping. That trade is only defensible in one direction: widening
+    /// `0.0.0.0` costs nothing, while widening `127.0.0.1` publishes on every
+    /// interface a service the user deliberately confined to this machine,
+    /// and says nothing. `cocker-portfwd` has always accepted
+    /// `--listen ADDR:PORT`; only the caller was dropping the address.
     public static func parseSpec(_ s: String) throws -> [PortMapping] {
         var body = s
         var proto: TransportProto = .tcp
@@ -332,8 +391,22 @@ public struct PortMapping: Codable, Sendable, Equatable, CustomStringConvertible
         }
 
         var fields = body.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
-        // `IP:HOST:CONTAINER` — drop the bind address (see above).
-        if fields.count == 3 { fields.removeFirst() }
+        // `IP:HOST:CONTAINER` — keep the bind address (see above).
+        var hostIP = "0.0.0.0"
+        if fields.count == 3 {
+            let candidate = fields.removeFirst()
+            // An empty field (`:8080:80`) is the documented way to say "every
+            // interface". Anything else has to be a literal IPv4 address: a
+            // hostname would need resolving, and resolving at parse time turns
+            // a typo into a bind on whatever that name happens to point at.
+            if !candidate.isEmpty {
+                var probe = in_addr()
+                guard inet_pton(AF_INET, candidate, &probe) == 1 else {
+                    throw CockerError.invalidPortMapping(s)
+                }
+                hostIP = candidate
+            }
+        }
         guard fields.count == 1 || fields.count == 2 else {
             throw CockerError.invalidPortMapping(s)
         }
@@ -344,7 +417,7 @@ public struct PortMapping: Codable, Sendable, Equatable, CustomStringConvertible
             throw CockerError.invalidPortMapping(s)
         }
         return zip(hostRange, containerRange).map {
-            PortMapping(hostPort: $0, containerPort: $1, proto: proto)
+            PortMapping(hostPort: $0, containerPort: $1, proto: proto, hostIP: hostIP)
         }
     }
 
@@ -579,6 +652,8 @@ public struct RunConfig: Codable, Sendable {
     public var workdir: String?
     public var user: String?
     public var restartPolicy: RestartPolicy
+    /// Retry ceiling from `on-failure:<max>`; nil = engine default.
+    public var restartMaxRetries: Int?
     public var capAdd: [String]
     public var capDrop: [String]
     public var privileged: Bool
@@ -658,6 +733,39 @@ public enum RestartPolicy: String, Codable, Sendable {
     case always = "always"
     case onFailure = "on-failure"
     case unlessStopped = "unless-stopped"
+
+    /// Parse a `--restart` / compose `restart:` value, including docker's
+    /// `on-failure:<max>` form.
+    ///
+    /// Every call site used to be `RestartPolicy(rawValue: raw) ?? .no`.
+    /// `on-failure:5` is valid compose and valid docker, and there is no
+    /// such rawValue — so it became `.no` and the service never restarted,
+    /// silently. So did `--restart alwyas`. A policy that quietly becomes
+    /// "never restart" is the failure mode you find out about during an
+    /// outage.
+    ///
+    /// - Returns: the policy, and the retry ceiling if one was given.
+    /// - Throws: `invalidRestartPolicy` on anything unrecognised, rather
+    ///   than downgrading it.
+    public static func parse(_ raw: String) throws -> (policy: RestartPolicy, maxRetries: Int?) {
+        let value = raw.trimmingCharacters(in: .whitespaces)
+        if value.isEmpty { return (.no, nil) }
+
+        if let colon = value.firstIndex(of: ":") {
+            let head = String(value[value.startIndex..<colon])
+            let tail = String(value[value.index(after: colon)...])
+            // Only on-failure takes a count; `always:3` is not a thing.
+            guard head == RestartPolicy.onFailure.rawValue,
+                  let max = Int(tail), max >= 0 else {
+                throw CockerError.invalidRestartPolicy(raw)
+            }
+            return (.onFailure, max)
+        }
+        guard let policy = RestartPolicy(rawValue: value) else {
+            throw CockerError.invalidRestartPolicy(raw)
+        }
+        return (policy, nil)
+    }
 }
 
 // MARK: - Build Config

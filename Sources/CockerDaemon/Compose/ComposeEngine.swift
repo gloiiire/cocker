@@ -109,6 +109,21 @@ struct ComposeFile: Decodable {
         var env_file: EnvFileSpec?
         var extra_hosts: [String]?
         var profiles: [String]?
+        // Unmodelled keys were dropped by Decodable without a word, so a
+        // compose file asking for privileged, dropped capabilities or a
+        // read-only root got none of it and no warning. These four map onto
+        // run flags that work.
+        var privileged: Bool?
+        var cap_add: [String]?
+        var cap_drop: [String]?
+        var read_only: Bool?
+        var tmpfs: StringOrArray?
+        var dns: StringOrArray?
+        var dns_search: StringOrArray?
+        // Modelled so they can be *refused* rather than ignored: cocker has
+        // no seccomp/apparmor plumbing and no device passthrough.
+        var security_opt: [String]?
+        var devices: [String]?
     }
 
     /// `ports:` entries are either the short string form (`"8080:80/udp"`)
@@ -1123,7 +1138,11 @@ actor ComposeEngine {
         config.labels["com.cocker.project"] = projectName
         config.labels["com.cocker.service"] = serviceName
 
-        config.restartPolicy = RestartPolicy(rawValue: service.restart ?? "no") ?? .no
+        // Same trap as the CLI: `restart: on-failure:5` is valid compose,
+        // has no rawValue, and became `.no` — the service never restarted.
+        let restartSpec = try RestartPolicy.parse(service.restart ?? "no")
+        config.restartPolicy = restartSpec.policy
+        config.restartMaxRetries = restartSpec.maxRetries
 
         // Network
         if let netSpec = service.networks {
@@ -1138,9 +1157,52 @@ actor ComposeEngine {
             }
         }
 
-        // extra_hosts → stored in labels for the VM to use
+        // extra_hosts. This used to go into a label nothing read, so the
+        // entries never reached /etc/hosts. --add-host carries them now.
         if let extraHosts = service.extra_hosts, !extraHosts.isEmpty {
-            config.labels["com.cocker.extra_hosts"] = extraHosts.joined(separator: ";")
+            config.addHosts = extraHosts
+        }
+
+        config.privileged = service.privileged ?? false
+        config.capAdd = service.cap_add ?? []
+        config.capDrop = service.cap_drop ?? []
+        config.readOnly = service.read_only ?? false
+        config.tmpfsMounts = service.tmpfs?.array ?? []
+        config.dnsServers = service.dns?.array ?? []
+        config.dnsSearch = service.dns_search?.array ?? []
+
+        // Keys cocker models only so it can say no. Silently dropping
+        // `security_opt` is the worse failure: the file asks for a
+        // confinement that never happens.
+        if let opts = service.security_opt, !opts.isEmpty {
+            CockerLog.shared.warn("compose",
+                "\(serviceName): `security_opt` is not applied "
+                + "(\(opts.joined(separator: ", "))) — cocker has no seccomp "
+                + "or apparmor plumbing")
+        }
+        if let devices = service.devices, !devices.isEmpty {
+            CockerLog.shared.warn("compose",
+                "\(serviceName): `devices` is not applied "
+                + "(\(devices.joined(separator: ", "))) — cocker does not pass "
+                + "host devices into a container")
+        }
+        if let deploy = service.deploy {
+            if let replicas = deploy.replicas, replicas != 1 {
+                CockerLog.shared.warn("compose",
+                    "\(serviceName): `deploy.replicas: \(replicas)` — cocker is "
+                    + "single-node and starts exactly one container")
+            }
+            // deploy.resources.limits is the modern spelling of mem_limit /
+            // cpus. It was decoded and referenced nowhere.
+            if let limits = deploy.resources?.limits {
+                if let mem = limits.memory, service.mem_limit == nil,
+                   true {
+                    config.memoryMB = parseMemory(mem)
+                }
+                if let c = limits.cpus, service.cpus == nil, let n = Double(c) {
+                    config.cpuCount = max(1, Int(n.rounded()))
+                }
+            }
         }
 
         config.workdir = service.working_dir

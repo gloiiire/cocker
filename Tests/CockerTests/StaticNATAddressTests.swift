@@ -147,4 +147,25 @@ struct StaticNATDefaultTests {
             #expect(enabled(with: on), "'\(on)' should leave it enabled")
         }
     }
+
+    /// The daemon and the CLI must reach the same verdict.
+    ///
+    /// They didn't: the switch was a string literal inside `ContainerEngine`,
+    /// so `cocker daemon status` — in a module that can't see it — went on
+    /// printing `leases : n/256` and offering `helper-install`, while the
+    /// daemon had already logged that it no longer watches that pool. Anyone
+    /// re-introducing a second reading of the variable trips this.
+    @MainActor
+    @Test func theCLIAndTheDaemonAgree() {
+        let key = "COCKER_STATIC_ETH0"
+        let previous = ProcessInfo.processInfo.environment[key]
+        defer {
+            if let previous { setenv(key, previous, 1) } else { unsetenv(key) }
+        }
+        for value in [nil, "0", "false", "off", "1", "true", "wat", ""] as [String?] {
+            if let value { setenv(key, value, 1) } else { unsetenv(key) }
+            #expect(ContainerEngine.staticNATEnabled == CockerEnv.staticETH0Enabled,
+                    "disagreement on COCKER_STATIC_ETH0=\(value ?? "<unset>")")
+        }
+    }
 }

@@ -8,13 +8,21 @@ struct PullCommand: AsyncParsableCommand {
         abstract: "Pull an image from a registry"
     )
 
-    @Option(name: .customLong("platform"), help: "Platform (e.g. linux/arm64)")
+    /// Forwarded in `PullRequest` and dropped: the daemon's `.pull` handler
+    /// calls `images.pull(reference:)` without it, and the architecture is
+    /// fixed at compile time in `Registry.swift` (`#if arch(arm64)`).
+    @Option(name: .customLong("platform"),
+            help: "Not honoured: cocker always pulls the host architecture")
     var platform: String?
 
     @Argument(help: "Image reference (name[:tag][@digest])")
     var image: String
 
     mutating func run() async throws {
+        if let platform, !platform.isEmpty {
+            UX.IgnoredFlag.warn("--platform",
+                "cocker always pulls the host architecture, not \(platform)")
+        }
         print(" " + UX.TTY.paint("→ Pulling", .progress) + " " + UX.TTY.paint(image, .accent) + " " + UX.TTY.paint("from registry", .dim))
 
         let client = IPCClient()

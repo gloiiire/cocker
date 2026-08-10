@@ -7,6 +7,77 @@ Notable changes per release. Versions are `MAJOR.MINOR.PATCH.BUILD` — see
 Entries describe what changed for *you*, not what moved in the code. A user
 should be able to read one line and know whether it affects them.
 
+## 1.2.0.0 — 2026-08-10
+
+A correctness pass over what cocker already claimed to do. Every item below
+was found by trying to prove a feature worked, and measured before and after
+on real containers.
+
+### Fixed — security
+
+- **`cocker exec` handed out every kernel capability.** A container's main
+  process ran under docker's restricted default; an exec session into the
+  *same* container got the full set — so a container started with
+  `--cap-drop` gave `CAP_SYS_ADMIN` back to anyone who exec'd in.
+- **`-p 127.0.0.1:5432:5432` published on every interface.** The bind address
+  was parsed and thrown away. A database you confined to your own machine was
+  on the LAN, and nothing said so.
+- **`cocker network connect` connected nothing.** It appended an id to a JSON
+  array and printed "✓ Connected" while the container stayed where it was.
+  `disconnect` was the mirror image. Both now move a stopped container for
+  real and refuse a running one instead of pretending.
+
+### Fixed — cocker reported success for failures
+
+- **`buildx build --push` exited 0 after publishing nothing** — a 401 from the
+  registry was swallowed whole.
+- **Publishing a port already in use succeeded.** `ps` showed the mapping;
+  nothing listened. The run is refused now, like docker's.
+- **`plugin rm` / `context rm` / `service rm` confirmed removals of things
+  that did not exist**, exit 0.
+- **`compose pause` / `unpause` / `kill`, `stack rm`, `service ps`** printed
+  success over swallowed errors.
+- **`cocker update --cpus/-m` changed the record, not the container.** It says
+  so now, and only when the container is running.
+- **`icloud prefetch` printed a green ✓ on a failed `brctl`.**
+
+### Fixed — numbers that were not measured
+
+- **`cocker stats` never showed CPU** — the probe read `/proc/stat` and threw
+  it away, so the column read `--` forever.
+- **The Docker API's `/stats` answered hardcoded zeros**, and `/images/prune`
+  deleted nothing while reporting success.
+- **`system df` reported 0 B of containers**; `image history` split an image's
+  size equally across layers and invented `/bin/sh -c layer 3` commands.
+
+### Fixed — flags and keys that were accepted and ignored
+
+- **`--read-only`, `--tmpfs`, `--add-host`, `--dns`, `--dns-search` now work.**
+  They reach the guest through a new spec trailer. `--read-only` applies in the
+  container's own mount namespace, so cocker-init can still report the exit
+  code.
+- **UDP port mappings are forwarded.** `-p 53:53/udp` was accepted, shown by
+  `ps`, and relayed nowhere.
+- **compose honours `read_only`, `privileged`, `cap_add`, `cap_drop`, `tmpfs`,
+  `dns`, `dns_search` and `extra_hosts`**, and refuses `security_opt`,
+  `devices` and `deploy.replicas > 1` out loud rather than dropping them.
+- **`restart: on-failure:5` meant "never restart".** Every unrecognised value
+  became `no`, silently — including typos.
+- Nine other flags that could not be honoured now say so in `--help` and when
+  used.
+
+### Fixed — exit codes and daemon reporting
+
+- **126 vs 127.** A command found but not executable reported "not found".
+- **`daemon status` advertised a DHCP lease pool** that nothing has drawn from
+  since 1.1.0.0, and pointed at a root LaunchDaemon to fix a problem you do not
+  have. `ipc : reachable` meant only that the socket file existed.
+
+### Documentation
+
+The README declared TTY allocation and `--privileged` broken. Both work, and
+have for some time.
+
 ## 1.1.0.1 — 2026-08-05
 
 ### Fixed
@@ -202,3 +273,7 @@ See [`docs/ROADMAP-1.0.md`](docs/ROADMAP-1.0.md). In short: healthchecks go
 through virtiofs rather than vsock; roughly 256 concurrent containers; a
 100 MiB cap on request bodies sent to the Docker socket; `COPY --chown`,
 `--chmod`, `ONBUILD` and `SHELL` are parsed but not applied (they warn).
+
+> **Superseded.** The ~256 figure was cumulative, not concurrent — macOS never
+> reclaimed the lease entries — and it stopped applying in 1.1.0.0, where
+> containers assign their own `eth0` address and take no lease at all.

@@ -66,13 +66,24 @@ struct RmiCommand: AsyncParsableCommand {
         abstract: "Remove one or more images"
     )
 
-    @Flag(name: [.short, .customLong("force")], help: "Force removal")
+    /// Declared, never plumbed. The payload carries no force field, the
+    /// daemon calls `remove(_:)` with the default, and `ImageManager.remove`
+    /// takes a `force` it does not read. It was worse than inert: the hint
+    /// promised `-f` would remove a referenced image, and passing it
+    /// swallowed the error, so the command printed a failure block and then
+    /// exited 0 with the image still there.
+    @Flag(name: [.short, .customLong("force")],
+          help: "Not honoured: an image referenced by a container is never force-removed")
     var force = false
 
     @Argument(help: "Image ID(s) or reference(s)")
     var images: [String]
 
     mutating func run() async throws {
+        if force {
+            UX.IgnoredFlag.warn("--force",
+                "an image referenced by a container is still refused")
+        }
         let client = IPCClient()
         for image in images {
             let start = Date()
@@ -84,9 +95,12 @@ struct RmiCommand: AsyncParsableCommand {
                 UX.Failure.emit(
                     headline: "Cannot remove image \(image)",
                     reason: error.description,
-                    hint: force ? nil : "use `--force` (-f) to remove an image referenced by stopped containers"
+                    hint: "remove the containers referencing it first, then retry"
                 )
-                if !force { throw error }
+                // Always. Suppressing the throw under `--force` turned a
+                // failure the user could see into an exit status that said
+                // it had worked.
+                throw error
             }
         }
     }
@@ -577,8 +591,23 @@ struct UpdateCommand: AsyncParsableCommand {
             let start = Date()
             do {
                 let request = try IPCRequest(type: .update, payload: UpdateRequest(containerID: id, cpus: cpus, memoryMB: memory))
-                _ = try await client.send(request)
+                let live = try await client.send(request)
                 UX.printResult(.container, id, verb: .update, elapsed: Date().timeIntervalSince(start))
+                // Docker applies --cpus / -m to a running container. cocker
+                // can't: VMRuntime reads cpuCount/memoryMB when it builds the
+                // VM configuration, so a running container keeps what it
+                // booted with. Measured: update --cpus 4 -m 1024 recorded 4
+                // and 1024 while the VM still reported `nproc` 2 and
+                // MemTotal 501344 kB. The record changed; the container
+                // didn't, and nothing said so.
+                let status = (try? live.decode(Container.self))?.status
+                if status == .running || status == .paused {
+                    UX.Warning.emit(
+                        "resource limits apply at the next start",
+                        note: "\(id) is running with the values it booted with; "
+                            + "`cocker restart \(id)` to pick these up"
+                    )
+                }
             } catch let error as CockerError {
                 failures.record(error)
                 UX.Failure.emit(

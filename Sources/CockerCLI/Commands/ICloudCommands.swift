@@ -143,9 +143,23 @@ struct ICloudPrefetchCommand: AsyncParsableCommand {
         proc.arguments = ["download", resolved]
         try proc.run()
         proc.waitUntilExit()
+        // The count below is honestly measured, so the number was always
+        // right — but a total brctl failure still printed a green ✓ and
+        // exited 0, which is the wrong signal for "nothing was fetched".
+        let brctlFailed = proc.terminationStatus != 0
 
         let after = await ICloudInspector.inspect(dir: resolved)
         let materialized = before.notDownloaded - after.notDownloaded
+        guard !brctlFailed else {
+            UX.Failure.emit(
+                headline: "brctl download failed (exit \(proc.terminationStatus))",
+                reason: "materialized \(materialized) file(s); "
+                    + "\(after.notDownloaded) still dataless",
+                hint: "check that the path is inside iCloud Drive and that "
+                    + "iCloud is signed in"
+            )
+            throw ExitCode.failure
+        }
         print("✓ Materialized \(materialized) file(s). \(after.notDownloaded) still dataless.")
     }
 }

@@ -23,7 +23,8 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customLong("name"), help: "Assign a name to the container")
     var name: String?
 
-    @Option(name: [.short, .customLong("publish")], help: "Publish ports (host:container)")
+    @Option(name: [.short, .customLong("publish")],
+            help: "Publish ports (host:container[/tcp|/udp])")
     var portSpecs: [String] = []
 
     @Option(name: [.short, .customLong("volume")], help: "Bind mount a volume (src:dst[:ro])")
@@ -61,7 +62,8 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customShort("u"), help: "Username or UID")
     var user: String?
 
-    @Option(name: .customLong("restart"), help: "Restart policy (no|always|on-failure|unless-stopped)")
+    @Option(name: .customLong("restart"),
+            help: "Restart policy (no|always|on-failure[:max]|unless-stopped)")
     var restart: String = "no"
 
     @Option(name: .customLong("cap-add"), help: "Add Linux capabilities")
@@ -76,22 +78,22 @@ struct RunCommand: AsyncParsableCommand {
     @Option(name: .customLong("env-file"), help: "Read environment variables from a file")
     var envFile: [String] = []
 
-    @Option(name: .customLong("add-host"), help: "Add an entry to /etc/hosts (host:ip)")
+    @Option(name: .customLong("add-host"), help: "Add an entry to /etc/hosts (name:ip)")
     var addHosts: [String] = []
 
-    @Option(name: .customLong("dns"), help: "Custom DNS server")
+    @Option(name: .customLong("dns"), help: "Extra DNS server, consulted after cocker's own resolver")
     var dns: [String] = []
 
-    @Option(name: .customLong("dns-search"), help: "Custom DNS search domain")
+    @Option(name: .customLong("dns-search"), help: "DNS search domain (`cocker` stays appended)")
     var dnsSearch: [String] = []
 
     @Option(name: .customLong("volumes-from"), help: "Mount volumes from another container")
     var volumesFrom: [String] = []
 
-    @Option(name: .customLong("tmpfs"), help: "Mount a tmpfs directory (e.g. /run:size=64m)")
+    @Option(name: .customLong("tmpfs"), help: "Mount a tmpfs (e.g. /run or /run:size=64m)")
     var tmpfs: [String] = []
 
-    @Flag(name: .customLong("read-only"), help: "Mount root filesystem as read-only")
+    @Flag(name: .customLong("read-only"), help: "Mount the container root read-only")
     var readOnly = false
 
     @Option(name: .customLong("health-cmd"), help: "Command to run to check health (CLI override)")
@@ -154,7 +156,12 @@ struct RunCommand: AsyncParsableCommand {
         config.hostname = hostname
         config.workdir = workdir
         config.user = user
-        config.restartPolicy = RestartPolicy(rawValue: restart) ?? .no
+        // `?? .no` used to swallow every value it didn't recognise —
+        // including the valid `on-failure:5` — so the container silently
+        // never restarted.
+        let restartSpec = try RestartPolicy.parse(restart)
+        config.restartPolicy = restartSpec.policy
+        config.restartMaxRetries = restartSpec.maxRetries
         config.capAdd = capAdd
         config.capDrop = capDrop
         config.privileged = privileged
@@ -206,7 +213,12 @@ struct RunCommand: AsyncParsableCommand {
             let name = config.name ?? String(result.containerID.prefix(12))
             var header = [" " + UX.TTY.paint("→ Running", .progress) + " " + UX.TTY.paint(name, .accent)]
             for p in config.ports {
-                header.append("   " + UX.TTY.paint("http://localhost:\(p.hostPort)", .accent))
+                // `localhost` is only where it actually answers when the bind
+                // is every-interface or loopback. Printing it for a mapping
+                // pinned to one LAN address sends the user to a closed port.
+                let host = (p.hostIP == "0.0.0.0" || p.hostIP == "127.0.0.1")
+                    ? "localhost" : p.hostIP
+                header.append("   " + UX.TTY.paint("http://\(host):\(p.hostPort)", .accent))
             }
             let cid = result.containerID
             // `-it` hands the terminal to the container, so the footer must

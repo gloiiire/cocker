@@ -81,7 +81,9 @@ struct StackDeployCommand: AsyncParsableCommand {
     @Option(name: [.short, .customLong("compose-file")], help: "Compose file path")
     var composeFile: String = "docker-compose.yml"
 
-    @Flag(name: .customLong("with-registry-auth"), help: "Send registry auth to agents")
+    /// Never read. There are no agents to send credentials to.
+    @Flag(name: .customLong("with-registry-auth"),
+          help: "Not honoured: single-node, there are no agents")
     var withRegistryAuth = false
 
     @Argument
@@ -141,6 +143,7 @@ struct StackRmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        let failures = FailureCode()
         for stack in stacks {
             // Try common compose file locations
             let composePaths = [
@@ -153,10 +156,24 @@ struct StackRmCommand: AsyncParsableCommand {
 
             let payload = ComposeRequest(composePath: composePath, projectName: stack)
             let request = try IPCRequest(type: .composeDown, payload: payload)
-            _ = try? await client.send(request)
-            print("Removing service \(stack)_web")
-            print("Removing network \(stack)_default")
+            // `_ = try?` then two unconditional lines — and `_web` was
+            // invented: it printed for every stack whatever the services
+            // were called, including when the compose file was never found
+            // and the path fell back to ./docker-compose.yml. The daemon
+            // reports what it actually tore down; print that.
+            do {
+                _ = try await client.send(request)
+                UX.printResult(.service, stack, verb: .remove)
+            } catch let error as CockerError {
+                failures.record(error)
+                UX.Failure.emit(
+                    headline: "Cannot remove stack \(stack)",
+                    reason: error.description,
+                    hint: "no compose file found for this stack at \(composePath)"
+                )
+            }
         }
+        try failures.throwIfFailed()
     }
 }
 
@@ -186,7 +203,7 @@ struct StackServicesCommand: AsyncParsableCommand {
                 String(c.id.prefix(12)),
                 "\(stack)_\(c.labels["com.cocker.service"] ?? c.name)",
                 "replicated",
-                "1/1",
+                c.status == .running ? "1/1" : "0/1",
                 c.image,
                 c.ports.map { $0.description }.joined(separator: ", "),
             ]
@@ -314,8 +331,11 @@ struct ServiceLsCommand: AsyncParsableCommand {
             [
                 String(c.id.prefix(12)),
                 c.name,
+                // Literal "replicated" / "1/1" for every row, derived from
+                // nothing. cocker is single-node, so a service IS one
+                // container: report whether that container is actually up.
                 "replicated",
-                "1/1",
+                c.status == .running ? "1/1" : "0/1",
                 c.image,
                 c.ports.map { $0.description }.joined(separator: ", "),
             ]
@@ -332,14 +352,24 @@ struct ServicePsCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        let failures = FailureCode()
         for svc in services {
             let request = try IPCRequest(type: .inspect, payload: ContainerIDRequest(id: svc))
-            if let response = try? await client.send(request),
-               let c = try? response.decode(Container.self)
-            {
-                print("\(String(c.id.prefix(12)))   \(c.name).1   \(c.image)   Running")
+            // "Running" was printed for every row whatever c.status said,
+            // and a service that doesn't exist printed nothing at all and
+            // exited 0 — two `try?` in a row.
+            do {
+                let response = try await client.send(request)
+                let c = try response.decode(Container.self)
+                print("\(String(c.id.prefix(12)))   \(c.name).1   \(c.image)   "
+                      + "\(c.status.rawValue.capitalized)")
+            } catch let error as CockerError {
+                failures.record(error)
+                UX.Failure.emit(headline: "No such service: \(svc)",
+                                reason: error.description)
             }
         }
+        try failures.throwIfFailed()
     }
 }
 
@@ -383,10 +413,16 @@ struct ServiceCreateCommand: AsyncParsableCommand {
     @Option(name: .customLong("network"), help: "Network to attach service to")
     var network: String?
 
-    @Option(name: .customLong("mount"), help: "Attach a volume")
+    /// Never read: `run()` builds a RunConfig with ports, env, network and
+    /// labels, and never sets `config.volumes`.
+    @Option(name: .customLong("mount"),
+            help: "Not honoured: no volume is attached")
     var mounts: [String] = []
 
-    @Option(name: .customLong("constraint"), help: "Placement constraints")
+    /// Never read. There is one node, so there is nothing to place — but
+    /// the sibling `--replicas` says so in its help and this did not.
+    @Option(name: .customLong("constraint"),
+            help: "Not honoured: single-node, nothing to place")
     var constraints: [String] = []
 
     @Argument
@@ -396,6 +432,12 @@ struct ServiceCreateCommand: AsyncParsableCommand {
     var command: [String] = []
 
     mutating func run() async throws {
+        if !mounts.isEmpty {
+            UX.IgnoredFlag.warn("--mount", "the service starts with no volume attached")
+        }
+        if !constraints.isEmpty {
+            UX.IgnoredFlag.warn("--constraint", "single-node: there is nothing to place")
+        }
         var config = RunConfig(image: image, command: command)
         config.name = name
         config.detach = true
@@ -430,11 +472,21 @@ struct ServiceRmCommand: AsyncParsableCommand {
 
     mutating func run() async throws {
         let client = IPCClient()
+        // `_ = try?` meant removing a service that doesn't exist printed
+        // "✓ removed" and exited 0.
+        let failures = FailureCode()
         for svc in services {
             let request = try IPCRequest(type: .rm, payload: ContainerIDRequest(id: svc))
-            _ = try? await client.send(request)
-            UX.printResult(.service, svc, verb: .remove)
+            do {
+                _ = try await client.send(request)
+                UX.printResult(.service, svc, verb: .remove)
+            } catch let error as CockerError {
+                failures.record(error)
+                UX.Failure.emit(headline: "Cannot remove service \(svc)",
+                                reason: error.description)
+            }
         }
+        try failures.throwIfFailed()
     }
 }
 

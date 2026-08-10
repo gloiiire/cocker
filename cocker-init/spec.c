@@ -75,6 +75,7 @@ int spec_resolve_user(const char *spec, unsigned int *uid, unsigned int *gid) {
 #define SPEC_MAGIC_V4 "COCKER\x04"
 #define SPEC_MAGIC_V5 "COCKER\x05"
 #define SPEC_MAGIC_V6 "COCKER\x06"
+#define SPEC_MAGIC_V7 "COCKER\x07"
 #define SPEC_MAGIC_LEN 7
 #define SPEC_BUF_SIZE  (256 * 1024)
 
@@ -90,6 +91,11 @@ int cap_add_spec_len = 0;
 int cap_drop_spec[64];
 int cap_drop_spec_len = 0;
 int privileged_spec = 0;
+int read_only_spec = 0;
+char *tmpfs_spec[SPEC_LIST_MAX];       int tmpfs_spec_len = 0;
+char *add_host_spec[SPEC_LIST_MAX];    int add_host_spec_len = 0;
+char *dns_spec[SPEC_LIST_MAX];         int dns_spec_len = 0;
+char *dns_search_spec[SPEC_LIST_MAX];  int dns_search_spec_len = 0;
 
 /* v5 stop-signal trailer. POSIX signal number (e.g. 3 = SIGQUIT,
  * 15 = SIGTERM). 0 = init's default SIGTERM. Forwarded by init.c's
@@ -130,8 +136,10 @@ int spec_load(char **argv, int max) {
     const unsigned char *p = (const unsigned char *)spec_buf;
     const unsigned char *end = (const unsigned char *)spec_buf + spec_len;
 
-    int has_user = 0, has_caps = 0, has_stop = 0, has_tty = 0;
-    if (memcmp(p, SPEC_MAGIC_V6, SPEC_MAGIC_LEN) == 0) {
+    int has_user = 0, has_caps = 0, has_stop = 0, has_tty = 0, has_v7 = 0;
+    if (memcmp(p, SPEC_MAGIC_V7, SPEC_MAGIC_LEN) == 0) {
+        has_user = 1; has_caps = 1; has_stop = 1; has_tty = 1; has_v7 = 1;
+    } else if (memcmp(p, SPEC_MAGIC_V6, SPEC_MAGIC_LEN) == 0) {
         has_user = 1; has_caps = 1; has_stop = 1; has_tty = 1;
     } else if (memcmp(p, SPEC_MAGIC_V5, SPEC_MAGIC_LEN) == 0) {
         has_user = 1; has_caps = 1; has_stop = 1;
@@ -244,6 +252,37 @@ int spec_load(char **argv, int max) {
         if (p + 8 <= end) {
             tty_rows_spec = (int)read_u32_be(p); p += 4;
             tty_cols_spec = (int)read_u32_be(p); p += 4;
+        }
+    }
+
+    /* v7 : read-only root, tmpfs mounts, extra hosts, DNS. Four flags the
+     * CLI accepted and nothing honoured. Each list is length-prefixed, and
+     * `out`/`strings` is the same arena argv and env already point into, so
+     * these survive for the life of the process. */
+    if (has_v7 && p + 1 <= end) {
+        read_only_spec = (*p != 0); p += 1;
+
+        struct { char **arr; int *len; int max; } lists[] = {
+            { tmpfs_spec,      &tmpfs_spec_len,      SPEC_LIST_MAX },
+            { add_host_spec,   &add_host_spec_len,   SPEC_LIST_MAX },
+            { dns_spec,        &dns_spec_len,        SPEC_LIST_MAX },
+            { dns_search_spec, &dns_search_spec_len, SPEC_LIST_MAX },
+        };
+        for (unsigned int li = 0; li < sizeof(lists) / sizeof(lists[0]); li++) {
+            if (p + 4 > end) break;
+            unsigned int count = read_u32_be(p); p += 4;
+            for (unsigned int i = 0; i < count; i++) {
+                if (p + 4 > end) break;
+                unsigned int len = read_u32_be(p); p += 4;
+                if (p + len > end) break;
+                if (out + len + 1 > sizeof(strings)) break;
+                memcpy(strings + out, p, len);
+                strings[out + len] = '\0';
+                if (*lists[li].len < lists[li].max)
+                    lists[li].arr[(*lists[li].len)++] = strings + out;
+                out += len + 1;
+                p += len;
+            }
         }
     }
 
