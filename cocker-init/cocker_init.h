@@ -16,6 +16,7 @@
 #ifndef COCKER_INIT_H
 #define COCKER_INIT_H
 
+#include <errno.h>      /* exec_failure_code() reads ENOENT / ENOTDIR */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -130,6 +131,25 @@ int spec_resolve_user(const char *spec, unsigned int *uid, unsigned int *gid);
 /* Resolve a cap name (with or without "CAP_" prefix) to its kernel cap
  * number. Returns -1 on unknown. */
 int cap_resolve_name(const char *name);
+
+/* Exit code for a failed execvp(), from errno.
+ *
+ * POSIX shells and docker distinguish two failures: 127 the command was not
+ * found, 126 it was found and could not be run. All three exec sites here
+ * hardcoded 127, so `cocker run alpine /etc` — a directory, which exists and
+ * is not executable — reported "not found". A script branching on the code
+ * to tell a typo from a permissions problem could not.
+ *
+ * ENOENT is the plain miss. ENOTDIR is one too: it means a path component
+ * isn't a directory, so the file named cannot exist. Everything else —
+ * EACCES, EISDIR, ELOOP, ENOEXEC, EPERM, ETXTBSY — means we found something
+ * and could not execute it.
+ *
+ * Inline in the header so all three sites share one answer instead of three
+ * copies that drift. */
+static inline int exec_failure_code(int err) {
+    return (err == ENOENT || err == ENOTDIR) ? 127 : 126;
+}
 
 /* Apply the cap policy : narrow the bounded set to (defaults ∪ cap_add) −
  * cap_drop. Privileged mode skips the dropping entirely. Must be called

@@ -81,4 +81,16 @@ check "rmi: no such image"        127 "$(status_of $COCKER rmi cocker-e2e-nosuch
 check "volume rm: no such volume" 127 "$(status_of $COCKER volume rm cocker-e2e-nosuch-$$)"
 check "unimplemented command"     126 "$(status_of $COCKER node ls)"
 
+# --- the guest half of the same taxonomy ----------------------------------
+# POSIX shells and docker separate "command not found" (127) from "found and
+# not executable" (126). cocker-init hardcoded 127 at all three of its exec
+# sites, so a directory or a non-executable file reported "not found" and a
+# script could not tell a typo from a permissions problem.
+check "run: no such command"      127 "$(status_of $COCKER run --rm alpine:latest -- /nosuchcommand)"
+check "run: a directory"          126 "$(status_of $COCKER run --rm alpine:latest -- /etc)"
+check "run: not executable"       126 "$(status_of $COCKER run --rm alpine:latest -- /etc/hostname)"
+check "exec: no such command"     127 "$(status_of $COCKER exec "$name" /nosuchcommand)"
+check "exec: a directory"         126 "$(status_of $COCKER exec "$name" /etc)"
+check "exec: not executable"      126 "$(status_of $COCKER exec "$name" /etc/hostname)"
+
 exit $fail

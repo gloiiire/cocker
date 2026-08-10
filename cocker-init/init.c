@@ -892,7 +892,7 @@ int main(int argc, char **argv) {
         execvp(child_argv[0], child_argv);
         fprintf(stderr, "[cocker-init] execvp %s: %s\n",
                 child_argv[0], strerror(errno));
-        _exit(127);
+        _exit(exec_failure_code(errno));
     }
 
     int status = 0;

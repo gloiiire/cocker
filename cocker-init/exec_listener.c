@@ -529,7 +529,7 @@ static void handle_one(int client_fd) {
 
         execvp(argv[0], argv);
         fprintf(stderr, "[cocker-init] exec %s: %s\n", argv[0], strerror(errno));
-        _exit(127);
+        _exit(exec_failure_code(errno));
     }
 
     /* Parent in pty mode : relay master_fd <-> client_fd. We dup the
