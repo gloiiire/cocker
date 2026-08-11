@@ -103,7 +103,12 @@ open(sys.argv[1], "w").write(str(os.getpid()))
 for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
     signal.signal(signum, signal.SIG_DFL)
 os.chdir(sys.argv[2])
-os.execv(sys.argv[3], sys.argv[3:])
+# execvp, not execv: COCKER defaults to the bare name "cocker", and execv does
+# not search PATH. Against an installed cocker this raised FileNotFoundError
+# before the test had run a single assertion, and the failure it printed —
+# "compose watch never reached its interactive footer" — pointed at the
+# product rather than at this line.
+os.execvp(sys.argv[3], sys.argv[3:])
 ' "$tmp/watch.pid" "$project" "$COCKER" compose watch --project-name "$proj" --debounce-ms 100 \
     >"$tmp/watch.outer" 2>&1 &
 script_pid=$!

@@ -463,6 +463,37 @@ static void handle_one(int client_fd) {
     if (pid == 0) {
         /* Child. Two paths : pty mode hooks up the slave as controlling
          * terminal ; non-pty mode just dups the raw socket as before. */
+        /* Filesystem and capability policy for BOTH paths, before either
+         * branch touches the descriptors.
+         *
+         * It used to sit in the `else` branch only, so `cocker exec -it` —
+         * the tty path — skipped the capability policy entirely and kept the
+         * full kernel bounding set. Same defect the exec path had before
+         * #420, surviving in the half of it nobody measured.
+         *
+         * Before the dup2s in either branch, because both of these log and
+         * once client_fd is stdout that log lands in the caller's stream:
+         * `cocker exec c echo ping` once returned "[cocker-init] caps:
+         * bounded set narrowed (…)ping" instead of "ping".
+         *
+         * Read-only first, then caps, then setuid below — the order init.c
+         * uses for the container's main process. Mount changes need the
+         * privileges being dropped, and with SECBIT_NOROOT off root keeps
+         * its capabilities across a uid change, so narrowing the bounding
+         * set is what bounds whatever survives.
+         *
+         * An exec that cannot honour --read-only must not run: a session
+         * that believes the filesystem is read-only and finds it writable
+         * is worse than one that failed to start. */
+        if (read_only_spec && enter_read_only_root() != 0) {
+            fprintf(stderr, "[cocker-init] exec: --read-only could not be "
+                            "applied; refusing to run with a writable root\n");
+            _exit(126);
+        }
+        caps_apply(privileged_spec,
+                   cap_add_spec, cap_add_spec_len,
+                   cap_drop_spec, cap_drop_spec_len);
+
         if (tty) {
             if (master_fd >= 0) close(master_fd);
             setsid();
@@ -483,27 +514,6 @@ static void handle_one(int client_fd) {
              * read had drained the request line. Adding STDIN_FILENO
              * here lets the child block on more input until the host
              * shutdown(SHUT_WR)'s the socket. */
-            /* Capability policy BEFORE the dup2 below.
-             *
-             * Same policy as the container's main process — this was
-             * missing, so `cocker exec` handed out the FULL kernel bounding
-             * set while the main process ran with docker's restricted
-             * default (a80425fb vs 1ffffffffff, measured on one container).
-             *
-             * Before the dup2 because caps_apply logs, and once client_fd is
-             * stdout that log lands in the caller's stream: `cocker exec c
-             * echo ping` returned "[cocker-init] caps: bounded set narrowed
-             * (…)ping" instead of "ping" — a broken contract for every
-             * script that parses exec output, and caught only by merging
-             * this branch with the others and running 12-exec-after-start.
-             *
-             * Still before setgid/setuid, as init.c orders it: with
-             * SECBIT_NOROOT off root keeps its capabilities across a uid
-             * change, so narrowing the bounding set first is what bounds
-             * whatever survives. */
-            caps_apply(privileged_spec,
-                       cap_add_spec, cap_add_spec_len,
-                       cap_drop_spec, cap_drop_spec_len);
 
             dup2(client_fd, STDIN_FILENO);
             dup2(client_fd, STDOUT_FILENO);

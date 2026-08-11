@@ -36,9 +36,20 @@ clean() { tr -d '\r'; }
 # naive capture picks up "[cocker-init] …" lines and every extraction below
 # reads them instead of the answer. One filter, applied once.
 say() {  # say <run args…> — container stdout, init chatter removed
-    $COCKER run --rm "$@" 2>/dev/null \
-        | grep -v '^\[' | tr -d '\r' || true
+    $COCKER run --rm "$@" 2>/dev/null | tr -d '\r' | grep -v '^\[' || true
 }
+
+# Filter by what an answer LOOKS like, not by what noise looks like.
+#
+# `say` excludes lines starting with "[cocker-init]", which fails the moment
+# the guest console splits one of those lines: the tail of it arrives with no
+# prefix and sails through. That is not hypothetical — a fragment of
+# cocker-init's own resolv.conf message, ") + --dns servers", was parsed as a
+# container's DNS answer and failed this suite on an installed 1.2.0.1.
+#
+# An exclusion filter over a stream you do not control is fragile by
+# construction. These match the shape of the expected answer instead.
+first_ip_line() { grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[[:space:]]' | head -1; }
 
 # --- --read-only -----------------------------------------------------------
 probe='touch /probe 2>/dev/null && echo writable || echo readonly'
@@ -72,7 +83,7 @@ check "--tmpfs mounts with its options" "size=16384k" \
 # getent rather than grepping the file: what matters is that it resolves.
 check "--add-host resolves" "10.9.9.9" \
       "$(say --add-host db:10.9.9.9 alpine:latest -- getent hosts db \
-         | awk 'NF {print $1; exit}')"
+         | first_ip_line | awk '{print $1}')"
 
 # --- --dns -----------------------------------------------------------------
 check "--dns reaches resolv.conf" "nameserver 1.1.1.1" \
@@ -91,6 +102,6 @@ mk_container --name "$peer" alpine:latest -- /bin/sleep 120 >/dev/null
 wait_running "$peer"
 check "container DNS survives --dns" "$peer" \
       "$(say --dns 1.1.1.1 alpine:latest -- getent hosts "$peer" \
-         | awk 'NF {print $2; exit}')"
+         | first_ip_line | awk '{print $2}')"
 
 exit $fail
