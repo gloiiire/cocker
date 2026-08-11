@@ -485,6 +485,8 @@ static void mount_qemu_share(void) {
  * where --dns first exists — the first pin happens earlier in boot. */
 static unsigned int g_dns_vsock_port = 5353;
 
+static int already_pinned = 0;
+
 static void pin_resolv_conf(unsigned int vsock_port) {
     int fd = open("/etc/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) return;
@@ -518,8 +520,20 @@ static void pin_resolv_conf(unsigned int vsock_port) {
                           "options ndots:0 timeout:1 attempts:2\n");
     write(fd, buf, n);
     close(fd);
-    info("pinned /etc/resolv.conf to 127.0.0.1 (proxy → vsock CID=2 port=%u)"
-         "%s", vsock_port, dns_spec_len ? " + --dns servers" : "");
+    /* Logged once, on the call that produces the final file.
+     *
+     * With --dns this runs twice: early in boot, then again after spec_load
+     * when the requested servers first exist. Logging both times printed the
+     * same line twice and doubled the chance of it interleaving with other
+     * console writes — which is how a fragment of it, ") + --dns servers",
+     * ended up being parsed as a container's DNS answer by an e2e check. */
+    if (!dns_spec_len && !dns_search_spec_len) {
+        info("pinned /etc/resolv.conf to 127.0.0.1 (proxy → vsock CID=2 port=%u)",
+             vsock_port);
+    } else if (already_pinned) {
+        info("re-pinned /etc/resolv.conf with the --dns servers requested");
+    }
+    already_pinned = 1;
 }
 
 /* Apply the v7 spec trailers that need the filesystem: extra /etc/hosts
@@ -598,7 +612,7 @@ static void apply_spec_mounts_and_hosts(void) {
  * Returns 0 on success. On failure the caller must NOT exec: a container
  * that asked for a read-only root and silently got a writable one is the
  * class of lie this whole pass has been removing. */
-static int enter_read_only_root(void) {
+int enter_read_only_root(void) {
     if (unshare(CLONE_NEWNS) < 0) {
         fprintf(stderr, "[cocker-init] --read-only: unshare: %s\n", strerror(errno));
         return -1;
