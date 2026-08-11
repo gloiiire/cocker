@@ -170,6 +170,13 @@ extern int privileged_spec;
  * Pointers into spec.c's string arena, valid for the life of the process. */
 #define SPEC_LIST_MAX 32
 extern int read_only_spec;
+
+/* Enter a private mount namespace with / read-only. Used by the container's
+ * child in init.c and by every `cocker exec` worker, so both see the same
+ * filesystem — exec is forked from PID 1, which deliberately keeps a
+ * writable view so it can still write /cocker-exit-code. Returns 0 on
+ * success; the caller must not exec on failure. */
+int enter_read_only_root(void);
 extern char *tmpfs_spec[SPEC_LIST_MAX];       extern int tmpfs_spec_len;
 extern char *add_host_spec[SPEC_LIST_MAX];    extern int add_host_spec_len;
 extern char *dns_spec[SPEC_LIST_MAX];         extern int dns_spec_len;
