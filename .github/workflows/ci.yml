@@ -16,13 +16,13 @@ jobs:
     name: Swift tests
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
       - name: Swift version
         run: swift --version
       - name: Cache SwiftPM
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             .build
@@ -156,11 +156,11 @@ jobs:
     name: Swift build release
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
       - name: Cache SwiftPM
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             .build
@@ -186,7 +186,7 @@ jobs:
     name: cocker-init (Linux ARM64)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install zig
         run: brew install zig
       - name: Cross-compile cocker-init
@@ -230,7 +230,7 @@ jobs:
     # maintainer ships a regression that quietly fails at run time.
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Lint shell scripts
         working-directory: Tests/e2e
         run: |
@@ -245,7 +245,7 @@ jobs:
     name: SwiftPM dependency audit
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
       - name: Resolve dependencies
@@ -268,7 +268,7 @@ jobs:
     name: Swift lint (formatting)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install swift-format
         # swift-format est intégré à Xcode 16+, on l'invoque directement.
         run: which swift-format || brew install swift-format
@@ -283,7 +283,7 @@ jobs:
     name: Software Bill of Materials (syft)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install syft
         run: |
           if ! command -v syft >/dev/null 2>&1; then
@@ -298,7 +298,7 @@ jobs:
           syft scan dir:. -o table | head -30 >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
       - name: Upload SBOM artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: |
@@ -310,7 +310,7 @@ jobs:
     runs-on: macos-15
     needs: sbom
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install trivy
         run: |
           if ! command -v trivy >/dev/null 2>&1; then
@@ -334,7 +334,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload trivy report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trivy
           path: trivy.txt
@@ -370,7 +370,7 @@ jobs:
     runs-on: macos-15
     needs: [swift-tests, swift-build-release, cocker-init-build]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
       - name: Install zig (for cocker-init)
@@ -452,7 +452,7 @@ jobs:
     # still be tested by pushing the branch to this repository.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Confirm this host can actually virtualise
         # Fail loudly rather than silently skipping, which is exactly the
         # trap the old hosted "smoke" job fell into.
