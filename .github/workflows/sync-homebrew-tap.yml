@@ -112,7 +112,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout source (for source-of-truth Formula)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Explicitly main HEAD — workflow_run defaults to default
           # branch, but bottle.yml just pushed sha256 patches to main,
